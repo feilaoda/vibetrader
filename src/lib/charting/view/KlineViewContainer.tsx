@@ -339,17 +339,22 @@ class KlineViewContainer extends Component<Props, State> {
             .then(pines => {
                 this.predefinedPines = new Map(pines.map(p => [p.pineName, p.pine]))
             })
-            .then(() => {
-                this.symbol = 'BTCUSDT'
+            .then(async () => {
+                // 根据市场类型设置默认 symbol
+                const { getMarket } = await import("../../domain/DataFecther");
+                const { getDefaultSymbol } = await import("../../domain/Watchlist");
+                const market = getMarket();
+
+                this.symbol = getDefaultSymbol(market);
                 this.tframe = TFrame.DAILY
                 this.tzone = Intl.DateTimeFormat().resolvedOptions().timeZone;
                 //this. tzone = "America/Vancouver" 
 
-                this.baseSer = new DefaultTSer(this.tframe, this.tzone, 1000);
+                this.baseSer = new DefaultTSer(this.tframe, this.tzone, 365);
                 this.kvar = this.baseSer.varOf(KVAR_NAME) as TVar<Kline>;
                 this.xc = new ChartXControl(this.baseSer, this.width - ChartView.AXISY_WIDTH);
 
-                this.fetchData_calcPines(undefined, 1000).then(() => {
+                this.fetchData_calcPines(undefined, 365).then(() => {
                     this.globalKeyboardListener = this.onGlobalKeyDown;
                     document.addEventListener("keydown", this.onGlobalKeyDown);
 
@@ -839,10 +844,11 @@ class KlineViewContainer extends Component<Props, State> {
             clearTimeout(this.reloadDataTimeoutId);
         }
 
+        this.symbol = symbol;  // 更新当前 symbol
         this.tframe = timeframe === undefined ? this.tframe : TFrame.ofName(timeframe)
         this.tzone = tzone === undefined ? this.tzone : tzone
 
-        this.baseSer = new DefaultTSer(this.tframe, this.tzone, 1000);
+        this.baseSer = new DefaultTSer(this.tframe, this.tzone, 365);
         this.kvar = this.baseSer.varOf(KVAR_NAME) as TVar<Kline>;
         this.xc = new ChartXControl(this.baseSer, this.width - ChartView.AXISY_WIDTH);
 
@@ -855,7 +861,7 @@ class KlineViewContainer extends Component<Props, State> {
                 {
                     isLoaded: false,
                 }, () =>
-                this.fetchData_calcPines(undefined, 1000).then(() => {
+                this.fetchData_calcPines(undefined, 365).then(() => {
                     resolve();
                 }))
         })

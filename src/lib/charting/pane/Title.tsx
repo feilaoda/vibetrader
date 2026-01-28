@@ -1,5 +1,5 @@
 import { ChartXControl } from "../view/ChartXControl";
-import { Component, useState } from "react";
+import { Component, useState, useEffect } from "react";
 import type { UpdateEvent } from "../view/ChartView";
 import type { TVar } from "../../timeseris/TVar";
 import type { Kline } from "../../domain/Kline";
@@ -7,7 +7,10 @@ import { Button, useFilter } from 'react-aria-components';
 import { ActionButtonGroup, Autocomplete, useAsyncList, Menu, MenuItem, MenuTrigger, Popover, SearchField, TooltipTrigger, Tooltip } from "@react-spectrum/s2";
 import { style } from '@react-spectrum/s2/style' with {type: 'macro'};
 import { TFrame } from "../../timeseris/TFrame";
-import { fetchSymbolList } from "../../domain/BinanaceData";
+import { fetchSymbolList as fetchBinanceSymbols } from "../../domain/BinanaceData";
+import { fetchSymbolList as fetchAShareSymbols, type AShareSymbol } from "../../domain/AShareData";
+import { getMarket, setMarket, type MarketType } from "../../domain/DataFecther";
+import { isInWatchlist, toggleWatchlist, getWatchlistByMarket, type WatchlistItem } from "../../domain/Watchlist";
 
 type Props = {
     xc: ChartXControl,
@@ -36,15 +39,67 @@ type Snapshot = {
 
 const L_SNAPSHOTS = 6;
 
+function NoDataStatus() {
+    const [status, setStatus] = useState<{ visible: boolean, message: string }>({ visible: false, message: '' });
+
+    useEffect(() => {
+        const handleNoData = (e: Event) => {
+            const detail = (e as CustomEvent).detail;
+            setStatus({ visible: true, message: `暂无 ${detail.period} 数据` });
+
+            // 3秒后自动消失
+            setTimeout(() => {
+                setStatus({ visible: false, message: '' });
+            }, 3000);
+        };
+
+        window.addEventListener('ashare-no-minute-data', handleNoData);
+        return () => window.removeEventListener('ashare-no-minute-data', handleNoData);
+    }, []);
+
+    if (!status.visible) return null;
+
+    return (
+        <div style={{
+            fontSize: '12px',
+            color: 'red',
+            marginLeft: '12px',
+            display: 'flex',
+            alignItems: 'center'
+        }}>
+            {status.message}
+        </div>
+    );
+}
+
 export function ChooseSymbol(props: { symbol: string, handleSymbolTimeframeChanged: (symbol: string, timeframe?: string) => void }) {
     const { startsWith } = useFilter({ sensitivity: 'base' });
 
-    const list = useAsyncList<{ symbol: string }>({
+    const list = useAsyncList<{ symbol: string; name?: string }>({
         async load({ signal, filterText }) {
-            const items = await fetchSymbolList(filterText, { signal });
-            return { items };
+            const market = getMarket();
+            if (market === 'ashare') {
+                const items = await fetchAShareSymbols(filterText, { signal });
+                return { items };
+            } else {
+                const items = await fetchBinanceSymbols(filterText, { signal });
+                return { items };
+            }
         }
     });
+
+    const handleSelection = (keys: unknown) => {
+        const selectedSymbol = (keys as Set<string>).values().next().value;
+        if (selectedSymbol) {
+            // 找到选中的股票获取名称
+            const selectedItem = list.items.find(item => item.symbol === selectedSymbol);
+            // 保存股票名称到 localStorage (供显示使用)
+            if (selectedItem?.name) {
+                localStorage.setItem(`stock_name_${selectedSymbol}`, selectedItem.name);
+            }
+            props.handleSymbolTimeframeChanged(selectedSymbol);
+        }
+    };
 
     return (
         <MenuTrigger>
@@ -71,12 +126,192 @@ export function ChooseSymbol(props: { symbol: string, handleSymbolTimeframeChang
                         <Menu
                             items={list.items}
                             selectionMode="single"
-                            onSelectionChange={(keys) => props.handleSymbolTimeframeChanged((keys as Set<string>).values().next().value)}
+                            onSelectionChange={handleSelection}
                         >
-                            {(item) => <MenuItem id={item.symbol}>{item.symbol}</MenuItem>}
+                            {(item) => <MenuItem id={item.symbol}>{item.name ? `${item.symbol} ${item.name}` : item.symbol}</MenuItem>}
                         </Menu>
                     </Autocomplete>
                 </div>
+            </Popover>
+        </MenuTrigger>
+    );
+}
+
+/**
+ * 市场切换组件
+ */
+export function ChooseMarket(props: { onMarketChange: (newSymbol: string) => void }) {
+    const [market, setMarketState] = useState<MarketType>(getMarket());
+
+    const marketOptions: { id: MarketType; label: string }[] = [
+        { id: 'ashare', label: 'A股' },
+        { id: 'crypto', label: 'Crypto' },
+    ];
+
+    const handleMarketChange = async (keys: Selection) => {
+        const selected = (keys as Set<MarketType>).values().next().value;
+        if (selected && selected !== market) {
+            setMarket(selected);
+            setMarketState(selected);
+            // 导入并获取新市场的默认 symbol
+            const { getDefaultSymbol } = await import("../../domain/Watchlist");
+            const newSymbol = getDefaultSymbol(selected);
+            props.onMarketChange(newSymbol);
+        }
+    };
+
+    const currentLabel = marketOptions.find(m => m.id === market)?.label || 'A股';
+
+    return (
+        <MenuTrigger>
+            <TooltipTrigger delay={500} placement="top">
+                <Button style={{
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    padding: '2px 6px',
+                    border: '1px solid var(--spectrum-gray-400)',
+                    borderRadius: 4,
+                    background: 'var(--spectrum-gray-100)',
+                    cursor: 'pointer'
+                }}>
+                    {currentLabel}
+                </Button>
+                <Tooltip>
+                    切换市场
+                </Tooltip>
+            </TooltipTrigger>
+
+            <Popover>
+                <Menu
+                    items={marketOptions}
+                    selectionMode="single"
+                    selectedKeys={new Set([market])}
+                    onSelectionChange={handleMarketChange}
+                >
+                    {(item) => <MenuItem id={item.id}>{item.label}</MenuItem>}
+                </Menu>
+            </Popover>
+        </MenuTrigger>
+    );
+}
+
+type Selection = 'all' | Set<MarketType>;
+
+/**
+ * 获取股票名称
+ */
+function getStockName(symbol: string): string | null {
+    return localStorage.getItem(`stock_name_${symbol}`);
+}
+
+/**
+ * 股票名称显示组件
+ */
+export function StockNameDisplay(props: { symbol: string }) {
+    const [name, setName] = useState<string | null>(() => getStockName(props.symbol));
+
+    // 当 symbol 变化时更新
+    if (getStockName(props.symbol) !== name) {
+        setName(getStockName(props.symbol));
+    }
+
+    if (!name) return null;
+
+    return (
+        <span style={{
+            fontFamily: 'monospace',
+            fontSize: 12,
+            color: 'var(--spectrum-gray-600)',
+            marginLeft: 4
+        }}>
+            {name}
+        </span>
+    );
+}
+
+/**
+ * 自选股星标按钮
+ */
+export function WatchlistButton(props: { symbol: string }) {
+    const [isWatched, setIsWatched] = useState(() => isInWatchlist(props.symbol, getMarket()));
+
+    const handleToggle = () => {
+        const stockName = getStockName(props.symbol) || undefined;
+        const newState = toggleWatchlist(props.symbol, getMarket(), stockName);
+        setIsWatched(newState);
+    };
+
+    return (
+        <TooltipTrigger delay={500} placement="top">
+            <Button
+                onPress={handleToggle}
+                style={{
+                    fontFamily: 'monospace',
+                    fontSize: 14,
+                    padding: '2px 4px',
+                    border: 'none',
+                    background: 'transparent',
+                    cursor: 'pointer',
+                    color: isWatched ? '#FFD700' : 'var(--spectrum-gray-500)'
+                }}
+            >
+                {isWatched ? '★' : '☆'}
+            </Button>
+            <Tooltip>
+                {isWatched ? '从自选移除' : '添加到自选'}
+            </Tooltip>
+        </TooltipTrigger>
+    );
+}
+
+/**
+ * 自选股列表面板
+ */
+export function WatchlistPanel(props: { handleSymbolTimeframeChanged: (symbol: string, timeframe?: string) => void }) {
+    const [watchlist, setWatchlist] = useState<WatchlistItem[]>(() => getWatchlistByMarket(getMarket()));
+
+    const refreshList = () => {
+        setWatchlist(getWatchlistByMarket(getMarket()));
+    };
+
+    if (watchlist.length === 0) {
+        return null;
+    }
+
+    return (
+        <MenuTrigger>
+            <TooltipTrigger delay={500} placement="top">
+                <Button style={{
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    padding: '2px 6px',
+                    border: '1px solid var(--spectrum-gray-400)',
+                    borderRadius: 4,
+                    background: 'var(--spectrum-gray-100)',
+                    cursor: 'pointer'
+                }}>
+                    自选 ({watchlist.length})
+                </Button>
+                <Tooltip>自选股列表</Tooltip>
+            </TooltipTrigger>
+
+            <Popover>
+                <Menu
+                    items={watchlist}
+                    selectionMode="single"
+                    onSelectionChange={(keys) => {
+                        const symbol = (keys as Set<string>).values().next().value;
+                        if (symbol) {
+                            props.handleSymbolTimeframeChanged(symbol);
+                        }
+                    }}
+                >
+                    {(item) => (
+                        <MenuItem id={item.symbol}>
+                            {item.name ? `${item.symbol} ${item.name}` : item.symbol}
+                        </MenuItem>
+                    )}
+                </Menu>
             </Popover>
         </MenuTrigger>
     );
@@ -325,10 +560,16 @@ class Title extends Component<Props, State> {
             <>
                 <div style={{ display: 'flex', justifyContent: 'flex-start', padding: '0px 8px', fontFamily: 'monospace', fontSize: '12px' }}>
                     <ActionButtonGroup>
+                        <ChooseMarket onMarketChange={(newSymbol) => this.props.handleSymbolTimeframeChanged(newSymbol)} />
+                        &nbsp;&middot;&nbsp;
+                        <WatchlistPanel handleSymbolTimeframeChanged={this.props.handleSymbolTimeframeChanged} />
+                        &nbsp;&middot;&nbsp;
+                        <WatchlistButton symbol={this.props.symbol} />
                         <ChooseSymbol
                             symbol={this.props.symbol}
                             handleSymbolTimeframeChanged={this.props.handleSymbolTimeframeChanged} />
-                        &nbsp;&middot;&nbsp;
+                        <StockNameDisplay symbol={this.props.symbol} />
+                        <NoDataStatus />
                         <ChooseTimeframe
                             symbol={this.props.symbol}
                             timeframe={this.props.xc.baseSer.timeframe}

@@ -19,7 +19,9 @@
         "react": "^19.2.0",
         "react-aria-components": "^1.14.0",
         "react-dom": "^19.2.0",
+        "react-markdown": "^10.1.0",
         "react-router": "^7.11.0",
+        "remark-gfm": "^4.0.1",
         "temporal-polyfill": "^0.3.0"
     },
     "devDependencies": {
@@ -28,6 +30,7 @@
         "@types/react": "^19.2.2",
         "@types/react-dom": "^19.2.2",
         "@vitejs/plugin-react": "^5.1.0",
+        "baseline-browser-mapping": "^2.9.18",
         "eslint": "^9.39.1",
         "eslint-plugin-react-hooks": "^7.0.1",
         "eslint-plugin-react-refresh": "^0.4.24",

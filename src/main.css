@@ -41,6 +41,10 @@
 
 }
 
+html, body, #root {
+    overscroll-behavior-x: none;
+}
+
 body {
     font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
     line-height: 1.5;

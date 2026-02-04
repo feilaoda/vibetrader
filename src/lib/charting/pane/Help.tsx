@@ -71,15 +71,19 @@ export const Help = () => {
                     <span className='label-refer'>Select it</span>
                 </div>
                 <div>
-                    <span className='label-mouse'>CTRL + Click: </span>
+                    <span className='label-mouse'>CTRL/CMD + Click: </span>
                     <span className='label-refer'>Complete variable-handle drawing</span>
                 </div>
                 <div>
-                    <span className='label-mouse'>CTRL + Click on variable-handle drawing's handle: </span>
+                    <span className='label-mouse'>Double click: </span>
+                    <span className='label-refer'>Complete variable-handle drawing</span>
+                </div>
+                <div>
+                    <span className='label-mouse'>CTRL/CMD + Click on variable-handle drawing's handle: </span>
                     <span className='label-refer'>Remove this handle</span>
                 </div>
                 <div>
-                    <span className='label-mouse'>CTRL + Drag on variable-handle drawing's segment: </span>
+                    <span className='label-mouse'>CTRL/CMD + Drag on variable-handle drawing's segment: </span>
                     <span className='label-refer'>Insert a handle</span>
                 </div>
 

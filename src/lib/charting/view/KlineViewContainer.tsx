@@ -12,12 +12,14 @@ import { Path } from "../../svg/Path";
 import Title from "../pane/Title";
 import { Help } from "../pane/Help";
 import { IndicatorView } from "./IndicatorView";
+import { AIAnalysisPanel } from "../pane/AIAnalysisPanel";
 import { Context, PineTS } from "pinets";
 import { DefaultTSer } from "../../timeseris/DefaultTSer";
 import { TFrame } from "../../timeseris/TFrame";
 import type { KlineKind } from "../plot/PlotKline";
 import type { Plot } from "../plot/Plot";
-import { fetchData } from "../../domain/DataFecther";
+import { fetchData, getMarket } from "../../domain/DataFecther";
+import { fetchRealtime } from "../../domain/AShareData";
 
 import {
     ActionButton,
@@ -35,7 +37,9 @@ import {
 } from "@react-spectrum/s2";
 
 import Line from '@react-spectrum/s2/icons/Line';
+import Play from '@react-spectrum/s2/icons/Play';
 import Edit from '@react-spectrum/s2/icons/Edit';
+import Filter from '@react-spectrum/s2/icons/Filter';
 import Copy from '@react-spectrum/s2/icons/Copy';
 import Delete from '@react-spectrum/s2/icons/Delete';
 import Properties from '@react-spectrum/s2/icons/Properties';
@@ -47,6 +51,7 @@ import Collection from '@react-spectrum/s2/icons/Collection';
 import DistributeSpaceHorizontally from '@react-spectrum/s2/icons/DistributeSpaceHorizontally';
 import EditNo from '@react-spectrum/s2/icons/EditNo';
 import Erase from '@react-spectrum/s2/icons/Erase';
+import Refresh from '@react-spectrum/s2/icons/Refresh';
 import SelectNo from '@react-spectrum/s2/icons/SelectNo';
 import SelectNone from '@react-spectrum/s2/icons/SelectNone';
 import New from '@react-spectrum/s2/icons/New';
@@ -69,6 +74,7 @@ import Star from '@react-spectrum/s2/icons/Star';
 import Exposure from '@react-spectrum/s2/icons/Exposure';
 import FullScreenExit from '@react-spectrum/s2/icons/FullScreenExit';
 
+
 import { style } from '@react-spectrum/s2/style' with {type: 'macro'};
 import { Screenshot } from "../pane/Screenshot";
 
@@ -78,6 +84,8 @@ type Props = {
 
     toggleColorTheme?: () => void
     colorTheme?: 'light' | 'dark'
+    navigate?: (path: string) => void
+    symbol?: string
 }
 
 type State = {
@@ -109,7 +117,16 @@ type State = {
 
     isLoaded: boolean;
 
-    screenshot: HTMLCanvasElement
+    screenshot: HTMLCanvasElement;
+    isAIPanelOpen?: boolean;
+    aiPanelWidth?: number;
+    toast?: { message: string, type: 'success' | 'error' | 'info' };
+    apiStatus?: {
+        backoff_active?: boolean;
+        backoff_until?: string;
+        last_error?: string;
+        failure_count?: number;
+    };
 }
 
 // const allIndTags = ['macd']
@@ -129,19 +146,25 @@ class KlineViewContainer extends Component<Props, State> {
     xc: ChartXControl;
 
     reloadDataTimeoutId = undefined;
+    realtimeIntervalId = undefined;
     latestTime: number;
+    reloadIntervalMs = 10000;
+    lastReloadAt = 0;
+    lastRealtimeAt = 0;
 
     predefinedPines: Map<string, string>;
     pines?: { pineName: string, pine: string }[];
 
     containerRef: React.RefObject<HTMLDivElement>;
+    contentRef: React.RefObject<HTMLDivElement>;
     globalKeyboardListener = undefined
     isDragging: boolean;
     xDragStart: number;
     yDragStart: number;
 
     // geometry variables
-    hTitle = 130;
+    toolbarWidth = 64;
+    hTitle = 60;
     hIndtags = 28;
 
     hKlineView = 400;
@@ -156,19 +179,37 @@ class KlineViewContainer extends Component<Props, State> {
 
     constructor(props: Props) {
         super(props);
-        this.width = props.width;
+        // Calculate initial width accounting for AI panel open by default
+        const defaultAiPanelWidth = 500;
+        const toolbarWidth = this.toolbarWidth;
+        const resizeHandleWidth = 4; // AI panel is open by default
+        this.width = props.width - defaultAiPanelWidth - toolbarWidth - resizeHandleWidth;
 
         this.containerRef = React.createRef();
+        this.contentRef = React.createRef();
+
+        // Init base series and kvar immediately so they are available for initial render
+        const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        this.tzone = getMarket() === 'ashare' ? 'Asia/Shanghai' : localTz;
+        // Default to a safe fallback symbol/timeframe until data loads
+        this.tframe = TFrame.DAILY;
+        this.symbol = 'AAPL'; // Default symbol, will be updated in componentDidMount
+        this.baseSer = new DefaultTSer(this.tframe, this.tzone, 365);
+        this.kvar = this.baseSer.varOf(KVAR_NAME) as TVar<Kline>;
+        this.xc = new ChartXControl(this.baseSer, this.width - ChartView.AXISY_WIDTH);
 
         const geometry = this.#calcGeometry([]);
         this.state = {
             isLoaded: false,
             updateEvent: { type: 'chart', changed: 0 },
             updateDrawing: { isHidingDrawing: false },
+            overlayIndicators: [],
             stackedIndicators: [],
-            selectedIndicatorTags: new Set(['sma', 'rsi', 'macd']),
+            selectedIndicatorTags: new Set(['sma', 'ema', 'macd']),
             drawingIdsToCreate: new Set(),
             screenshot: undefined,
+            isAIPanelOpen: true,
+            aiPanelWidth: 500,
             ...geometry,
         }
 
@@ -194,20 +235,190 @@ class KlineViewContainer extends Component<Props, State> {
         this.onMouseMove = this.onMouseMove.bind(this)
         this.onMouseLeave = this.onMouseLeave.bind(this)
         this.onDoubleClick = this.onDoubleClick.bind(this)
+        this.onDoubleClick = this.onDoubleClick.bind(this)
         this.onWheel = this.onWheel.bind(this)
+        this.handleForceRefresh = this.handleForceRefresh.bind(this)
 
         this.callbacks = {
             updateOverlayIndicatorLabels: this.setOverlayIndicatorLabels,
             updateStackedIndicatorLabels: this.setStackedIndicatorLabels,
             updateDrawingIdsToCreate: this.setDrawingIdsToCreate,
         }
+
+        this.toggleAIPanel = this.toggleAIPanel.bind(this);
+        this.handleResizeMouseDown = this.handleResizeMouseDown.bind(this);
+        this.handleResizeMouseMove = this.handleResizeMouseMove.bind(this);
+        this.handleResizeMouseUp = this.handleResizeMouseUp.bind(this);
+    }
+
+    toggleAIPanel() {
+        this.setState(prev => ({ isAIPanelOpen: !prev.isAIPanelOpen }), () => {
+            this.updateChartWidth();
+        });
+    }
+
+    updateChartWidth() {
+        const toolbarWidth = this.toolbarWidth;
+        const resizeHandleWidth = this.state.isAIPanelOpen ? 4 : 0;
+        const panelWidth = this.state.isAIPanelOpen ? (this.state.aiPanelWidth || 350) : 0;
+        const newChartWidth = this.props.width - panelWidth - toolbarWidth - resizeHandleWidth;
+
+        if (newChartWidth !== this.width) {
+            this.width = newChartWidth;
+            // Re-init chart x control with new width
+            this.xc = new ChartXControl(this.baseSer, this.width - ChartView.AXISY_WIDTH);
+            this.update({ type: 'chart' });
+        }
+    }
+
+    // Resize Logic
+    isResizing = false;
+
+    handleResizeMouseDown(e: React.MouseEvent) {
+        e.preventDefault();
+        this.isResizing = true;
+        document.addEventListener('mousemove', this.handleResizeMouseMove);
+        document.addEventListener('mouseup', this.handleResizeMouseUp);
+    }
+
+    handleResizeMouseMove(e: MouseEvent) {
+        if (!this.isResizing) return;
+
+        if (this.containerRef.current) {
+            const newWidth = document.body.clientWidth - e.clientX;
+            // Constrain
+            if (newWidth > 200 && newWidth < 800) {
+                this.setState({ aiPanelWidth: newWidth }, () => {
+                    this.updateChartWidth();
+                });
+            }
+        }
+    }
+
+    handleResizeMouseUp() {
+        this.isResizing = false;
+        document.removeEventListener('mousemove', this.handleResizeMouseMove);
+        document.removeEventListener('mouseup', this.handleResizeMouseUp);
+    }
+
+    handleForceRefresh = async () => {
+        try {
+            this.setState({ toast: { message: "Syncing data...", type: 'info' } });
+
+            const baseUrl = import.meta.env.VITE_ASHARE_API_URL || "";
+            const res = await fetch(`${baseUrl}/api/sync/${this.symbol}?period=${this.tframe.shortName}`, {
+                method: 'POST'
+            });
+            const data = await res.json();
+
+            // Also sync fundamentals for current symbol
+            try {
+                const fundamentalsRes = await fetch(`${baseUrl}/api/fundamentals/sync`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ symbols: [this.symbol], force: true })
+                });
+                await fundamentalsRes.json();
+            } catch (e) {
+                // Ignore fundamentals sync errors for now
+            }
+
+            if (data.success) {
+                if (data.api_status) {
+                    this.setState({ apiStatus: data.api_status });
+                }
+                const source = data.source || "unknown";
+                const count = data.count || 0;
+                this.setState({
+                    toast: {
+                        message: `Success: Synced ${count} records from ${source}`,
+                        type: 'success'
+                    }
+                });
+                // Clear toast after 3 seconds
+                setTimeout(() => this.setState({ toast: undefined }), 3000);
+            } else {
+                throw new Error(data.detail || "Unknown error");
+            }
+
+            // Reload chart data (reuse logic from handleSymbolTimeframeChanged)
+            this.handleSymbolTimeframeChanged(this.symbol, this.tframe);
+
+        } catch (e: any) {
+            console.error("Force sync failed", e);
+            this.setState({
+                toast: {
+                    message: `Sync Failed: ${e.message || e}`,
+                    type: 'error'
+                }
+            });
+            setTimeout(() => this.setState({ toast: undefined }), 5000);
+        }
+    }
+
+    handleSyncWatchlistDaily = async () => {
+        try {
+            this.setState({ toast: { message: "Syncing watchlist daily data...", type: 'info' } });
+
+            const baseUrl = import.meta.env.VITE_ASHARE_API_URL || "";
+            const res = await fetch(`${baseUrl}/api/watchlist/sync_daily?market=ashare`, {
+                method: 'POST'
+            });
+            const data = await res.json();
+
+            if (data.success) {
+                if (data.api_status) {
+                    this.setState({ apiStatus: data.api_status });
+                }
+                const total = data.total || 0;
+                const ok = data.success_count ?? 0;
+                const fail = data.error_count ?? 0;
+                const message = total === 0
+                    ? "No A-share watchlist items to sync."
+                    : `Watchlist synced: ${ok}/${total}${fail ? ` (failed ${fail})` : ''}`;
+                this.setState({
+                    toast: {
+                        message,
+                        type: fail ? 'error' : 'success'
+                    }
+                });
+                setTimeout(() => this.setState({ toast: undefined }), fail ? 5000 : 3000);
+
+                // Refresh current chart in case the active symbol is in watchlist
+                this.handleSymbolTimeframeChanged(this.symbol, this.tframe);
+            } else {
+                throw new Error(data.detail || "Unknown error");
+            }
+        } catch (e: any) {
+            console.error("Watchlist sync failed", e);
+            this.setState({
+                toast: {
+                    message: `Sync Failed: ${e.message || e}`,
+                    type: 'error'
+                }
+            });
+            setTimeout(() => this.setState({ toast: undefined }), 5000);
+        }
     }
 
     fetchOPredefinedPines = (pineName: string[]) => {
-        const fetchIndicatorFn = (pineName: string) =>
-            fetch("./indicators/" + pineName + ".pine")
-                .then(r => r.text())
+        const baseUrl = import.meta.env.BASE_URL || "/";
+        const assetBase = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+        const fetchIndicatorFn = (pineName: string) => {
+            const url = `${assetBase}indicators/${pineName}.pine`;
+            return fetch(url)
+                .then(r => {
+                    if (!r.ok) {
+                        throw new Error(`Failed to fetch indicator ${pineName}: ${r.status}`);
+                    }
+                    return r.text();
+                })
                 .then(pine => ({ pineName, pine }))
+                .catch(error => {
+                    console.warn(`[fetchOPredefinedPines] ${pineName} failed`, error);
+                    return { pineName, pine: undefined };
+                })
+        }
 
         return Promise.all(pineName.map(pineName => fetchIndicatorFn(pineName)))
     }
@@ -231,6 +442,7 @@ class KlineViewContainer extends Component<Props, State> {
     fetchData_calcPines = async (startTime: number, limit: number) => {
 
         const symbol = this.symbol
+        console.log(`[KlineViewContainer] fetchData_calcPines: Fetching for ${symbol}`);
         const tframe = this.tframe
         const tzone = this.tzone
         const baseSer = this.baseSer
@@ -242,8 +454,31 @@ class KlineViewContainer extends Component<Props, State> {
         return fetchData(baseSer, symbol, tframe, tzone, startTime, limit).then(latestTime => {
             let start = performance.now()
 
+            const rawData = kvar.toArray();
+            const hasData = rawData.some(k => k !== undefined);
+            const baseChanged = (this.state.updateEvent?.changed ?? 0) + 1;
+
+            this.latestTime = latestTime;
+            // Always reinit xc to get correct last occurred time/row
+            console.log("reinit xc")
+            xc.reinit()
+
+            this.updateState({
+                isLoaded: true,
+                updateEvent: { type: 'chart', changed: baseChanged },
+                overlayIndicators: this.state.overlayIndicators || [],
+                stackedIndicators: this.state.stackedIndicators || [],
+            });
+
+            if (!hasData) {
+                this.setState({
+                    toast: { message: `No data for ${symbol}`, type: 'info' }
+                });
+                return;
+            }
+
             // console.log(kvar.toArray().filter(k => k === undefined), "undefined klines in series");
-            const pinets = new PineTS(kvar.toArray(), symbol, tframe.shortName);
+            const pinets = new PineTS(rawData, symbol, tframe.shortName);
 
             pinets.ready()
                 .then(async () => {
@@ -282,10 +517,6 @@ class KlineViewContainer extends Component<Props, State> {
                                     tvar.setByIndex(i, vs);
                                 }
 
-                                // console.log(result)
-                                // console.log(plots.map(x => x.data))
-                                // console.log(plots.map(x => x.options))
-
                                 const outputs = plots.map(({ title, options }, atIndex) => {
                                     return ({ atIndex, title, options })
                                 })
@@ -300,41 +531,162 @@ class KlineViewContainer extends Component<Props, State> {
                             }
                         })
 
-                        // console.log(`indicators added to series in ${performance.now() - start} ms`);
-
-                        this.latestTime = latestTime;
-
-                        if (this.state.isLoaded) {
-                            this.updateState({
-                                updateEvent: { type: 'chart', changed: this.state.updateEvent.changed + 1 },
-                                overlayIndicators,
-                                stackedIndicators,
-                            })
-
-                        } else {
-                            // reinit xc to get correct last occured time/row, should be called after data loaded to baseSer
-                            console.log("reinit xc")
-                            xc.reinit()
-
-                            this.updateState({
-                                isLoaded: true,
-                                updateEvent: { type: 'chart', changed: this.state.updateEvent.changed + 1 },
-                                overlayIndicators,
-                                stackedIndicators,
-                            })
-                        }
+                        const indicatorChanged = baseChanged + 1;
+                        this.updateState({
+                            updateEvent: { type: 'chart', changed: indicatorChanged },
+                            overlayIndicators,
+                            stackedIndicators,
+                        })
 
                         if (latestTime !== undefined) {
-                            this.reloadDataTimeoutId = setTimeout(() => this.fetchData_calcPines(latestTime, 1000), 5000)
+                            this.lastReloadAt = Date.now();
+                            this.scheduleNextReload(latestTime);
                         }
 
                     })
                 })
+                .catch(err => {
+                    console.error("Failed to fetch/calculate", err);
+                    this.setState({
+                        toast: { message: `Load failed: ${err.message || 'Unknown error'}`, type: 'error' },
+                        isLoaded: true // Ensure loaded state so we don't stick on loading
+                    });
+                })
 
+        }).catch(err => {
+            console.error("[KlineViewContainer] fetchData failed", err);
+            this.setState({
+                toast: { message: `Load failed: ${err.message || 'Unknown error'}`, type: 'error' },
+                isLoaded: true
+            });
         })
     }
 
+    fetchRealtimeQuote = async () => {
+        if (getMarket() !== 'ashare') return;
+        if (typeof document !== 'undefined' && document.hidden) return;
+        if (!this.symbol) return;
+
+        if (!this.isRealtimeWindow()) return;
+
+        const now = Date.now();
+        if (this.lastRealtimeAt && now - this.lastRealtimeAt < this.reloadIntervalMs) {
+            return;
+        }
+        this.lastRealtimeAt = now;
+
+        try {
+            const rt = await fetchRealtime(this.symbol);
+            if (!rt || rt.price === undefined || !Number.isFinite(rt.price) || rt.price <= 0) return;
+            const stale = (rt as unknown as { stale?: boolean }).stale;
+            if (stale) return;
+
+            const isDaily = this.tframe.shortName === '1d' || this.tframe.shortName === '1D';
+            const kvar = this.kvar;
+            const size = kvar.values().size();
+            if (size <= 0) return;
+            const last = kvar.getByIndex(size - 1);
+            if (!last) return;
+
+            const formatter = new Intl.DateTimeFormat('en-CA', {
+                timeZone: this.tzone,
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            });
+            const lastDate = formatter.format(new Date(last.time));
+            const quoteDate = formatter.format(new Date(rt.timestamp || now));
+            if (lastDate !== quoteDate) {
+                if (!isDaily) return;
+                const open = Number.isFinite(rt.open) ? rt.open : rt.price;
+                const high = Number.isFinite(rt.high) ? rt.high : Math.max(open, rt.price);
+                const low = Number.isFinite(rt.low) ? rt.low : Math.min(open, rt.price);
+                const volume = Number.isFinite(rt.volume) ? rt.volume : 0;
+                const ts = rt.timestamp || now;
+                const kline = new Kline(ts, open, high, low, rt.price, volume, ts, false);
+                this.baseSer.addToVar(KVAR_NAME, kline);
+                this.xc.reinit();
+                const changed = (this.state.updateEvent?.changed ?? 0) + 1;
+                this.updateState({ updateEvent: { type: 'chart', changed } });
+                return;
+            }
+
+            const high = Number.isFinite(rt.high) ? rt.high : rt.price;
+            const low = Number.isFinite(rt.low) ? rt.low : rt.price;
+            last.close = rt.price;
+            if (high > last.high) last.high = high;
+            if (low < last.low) last.low = low;
+            if (isDaily) {
+                if (Number.isFinite(rt.volume)) {
+                    last.volume = Math.max(last.volume, rt.volume);
+                }
+            }
+            last.closeTime = rt.timestamp || now;
+            last.isClosed = false;
+
+            kvar.setByIndex(size - 1, last);
+            const changed = (this.state.updateEvent?.changed ?? 0) + 1;
+            this.updateState({ updateEvent: { type: 'chart', changed } });
+        } catch (e) {
+            // ignore realtime errors
+        }
+    }
+
+    isRealtimeWindow() {
+        try {
+            const now = new Date();
+            const cnNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Shanghai" }));
+            const day = cnNow.getDay();
+            if (day === 0 || day === 6) return false;
+            const minutes = cnNow.getHours() * 60 + cnNow.getMinutes();
+            const inMorning = minutes >= (9 * 60 + 30) && minutes <= (11 * 60 + 30);
+            const inAfternoon = minutes >= (13 * 60) && minutes <= (15 * 60);
+            const postClose = minutes > (15 * 60) && minutes <= (15 * 60 + 5);
+            return inMorning || inAfternoon || postClose;
+        } catch {
+            return true;
+        }
+    }
+
+    scheduleNextReload(latestTime?: number) {
+        if (this.reloadDataTimeoutId) {
+            clearTimeout(this.reloadDataTimeoutId);
+            this.reloadDataTimeoutId = undefined;
+        }
+        if (latestTime === undefined) return;
+        if (typeof document !== 'undefined' && document.hidden) return;
+        const now = Date.now();
+        const elapsed = this.lastReloadAt ? now - this.lastReloadAt : this.reloadIntervalMs;
+        const delay = Math.max(0, this.reloadIntervalMs - elapsed);
+        this.reloadDataTimeoutId = setTimeout(() => {
+            if (typeof document !== 'undefined' && document.hidden) return;
+            this.fetchData_calcPines(latestTime, 1000);
+        }, delay);
+    }
+
+    startRealtimePolling() {
+        if (this.realtimeIntervalId) {
+            clearInterval(this.realtimeIntervalId);
+            this.realtimeIntervalId = undefined;
+        }
+        if (typeof document !== 'undefined' && document.hidden) return;
+        this.fetchRealtimeQuote();
+        this.realtimeIntervalId = setInterval(() => {
+            if (typeof document !== 'undefined' && document.hidden) return;
+            this.fetchRealtimeQuote();
+        }, this.reloadIntervalMs);
+    }
+
+    stopRealtimePolling() {
+        if (this.realtimeIntervalId) {
+            clearInterval(this.realtimeIntervalId);
+            this.realtimeIntervalId = undefined;
+        }
+    }
+
     override componentDidMount() {
+        window.addEventListener('akshare-api-status', this.onAkshareStatus);
+        document.addEventListener('visibilitychange', this.onVisibilityChange);
         this.fetchOPredefinedPines(allIndTags)
             .then(pines => {
                 this.predefinedPines = new Map(pines.map(p => [p.pineName, p.pine]))
@@ -345,18 +697,25 @@ class KlineViewContainer extends Component<Props, State> {
                 const { getDefaultSymbol } = await import("../../domain/Watchlist");
                 const market = getMarket();
 
-                this.symbol = getDefaultSymbol(market);
-                this.tframe = TFrame.DAILY
-                this.tzone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                //this. tzone = "America/Vancouver" 
+                // Restore last selected symbol from sessionStorage to avoid cross-tab interference.
+                // If provided via props, use that. Otherwise use sessionStorage, then localStorage as fallback.
+                const lastSymbol = this.props.symbol
+                    || sessionStorage.getItem('last_selected_symbol')
+                    || localStorage.getItem('last_selected_symbol');
+                this.symbol = lastSymbol || getDefaultSymbol(market);
+                // this.tframe = TFrame.DAILY // Already set in constructor
+                // this.tzone = Intl.DateTimeFormat().resolvedOptions().timeZone; // Already set in constructor
 
-                this.baseSer = new DefaultTSer(this.tframe, this.tzone, 365);
-                this.kvar = this.baseSer.varOf(KVAR_NAME) as TVar<Kline>;
-                this.xc = new ChartXControl(this.baseSer, this.width - ChartView.AXISY_WIDTH);
+                // this.baseSer = new DefaultTSer(this.tframe, this.tzone, 365); // Already set in constructor
+                // this.kvar = this.baseSer.varOf(KVAR_NAME) as TVar<Kline>; // Already set in constructor
+                // this.xc = new ChartXControl(this.baseSer, this.width - ChartView.AXISY_WIDTH); // Already set in constructor
 
                 this.fetchData_calcPines(undefined, 365).then(() => {
+                    this.lastReloadAt = Date.now();
+                    this.startRealtimePolling();
                     this.globalKeyboardListener = this.onGlobalKeyDown;
                     document.addEventListener("keydown", this.onGlobalKeyDown);
+                    window.addEventListener('vibetrader-symbol-change', this.onCustomSymbolChange);
 
                     if (this.containerRef.current) {
                         this.containerRef.current.focus()
@@ -366,14 +725,60 @@ class KlineViewContainer extends Component<Props, State> {
             })
     }
 
+    override componentDidUpdate(prevProps: Props) {
+        console.log(`[KlineViewContainer] componentDidUpdate: prop symbol ${prevProps.symbol} -> ${this.props.symbol} vs current ${this.symbol}`);
+        if (this.props.symbol && this.props.symbol !== prevProps.symbol && this.props.symbol !== this.symbol) {
+            this.handleSymbolTimeframeChanged(this.props.symbol, this.tframe);
+        }
+    }
+
+    onCustomSymbolChange = (e: Event) => {
+        const detail = (e as CustomEvent).detail;
+        if (detail && detail.symbol && detail.symbol !== this.symbol) {
+            console.log("Custom event: symbol changed to", detail.symbol);
+            this.handleSymbolTimeframeChanged(detail.symbol, this.tframe);
+        }
+    }
+
+    onAkshareStatus = (e: Event) => {
+        const detail = (e as CustomEvent).detail;
+        if (detail) {
+            this.setState({ apiStatus: detail });
+        }
+    }
+
+    onVisibilityChange = () => {
+        if (typeof document !== 'undefined' && document.hidden) {
+            if (this.reloadDataTimeoutId) {
+                clearTimeout(this.reloadDataTimeoutId);
+                this.reloadDataTimeoutId = undefined;
+            }
+            this.stopRealtimePolling();
+            return;
+        }
+        const now = Date.now();
+        const elapsed = this.lastReloadAt ? now - this.lastReloadAt : this.reloadIntervalMs;
+        if (elapsed >= this.reloadIntervalMs) {
+            this.fetchData_calcPines(this.latestTime, 1000);
+            this.startRealtimePolling();
+            return;
+        }
+        this.scheduleNextReload(this.latestTime);
+        this.startRealtimePolling();
+    }
+
     override componentWillUnmount() {
         if (this.reloadDataTimeoutId) {
             clearTimeout(this.reloadDataTimeoutId);
         }
+        this.stopRealtimePolling();
 
         if (this.globalKeyboardListener) {
             document.removeEventListener("keydown", this.onGlobalKeyDown)
         }
+        document.removeEventListener('visibilitychange', this.onVisibilityChange);
+        window.removeEventListener('vibetrader-symbol-change', this.onCustomSymbolChange);
+        window.removeEventListener('akshare-api-status', this.onAkshareStatus);
     }
 
     update(event: UpdateEvent) {
@@ -472,7 +877,13 @@ class KlineViewContainer extends Component<Props, State> {
     }
 
     translate(e: React.MouseEvent) {
-        return [e.nativeEvent.offsetX, e.nativeEvent.offsetY]
+        const rect = e.currentTarget.getBoundingClientRect();
+        const scrollTop = this.contentRef.current?.scrollTop || 0;
+        // Adjust for Left Toolbar and Header (Title + TagGroup)
+        return [
+            e.clientX - rect.left - this.toolbarWidth,
+            e.clientY - rect.top - this.hTitle - this.hIndtags + scrollTop
+        ]
     }
 
     onGlobalKeyDown(e: KeyboardEvent) {
@@ -580,7 +991,7 @@ class KlineViewContainer extends Component<Props, State> {
             xc.isReferCursorEnabled = false
             xc.moveChartsInDirection(nBarDelta, -1, true)
 
-            // reset to current position 
+            // reset to current position
             this.xDragStart = x;
             this.yDragStart = y;
 
@@ -665,7 +1076,28 @@ class KlineViewContainer extends Component<Props, State> {
     onWheel(e: React.WheelEvent) {
         const xc = this.xc;
 
-        const delta = Math.sign(e.deltaY)
+        const deltaX = e.deltaX || 0
+        const deltaY = e.deltaY || 0
+        const absX = Math.abs(deltaX)
+        const absY = Math.abs(deltaY)
+        const isPixelMode = e.deltaMode === 0x00
+
+        if (!e.shiftKey && !e.ctrlKey && isPixelMode && absY > absX) {
+            // Trackpad vertical scroll: ignore to avoid horizontal jitter.
+            return
+        }
+
+        if (absX > 0) {
+            // Prevent browser back/forward navigation on horizontal trackpad swipe.
+            e.preventDefault()
+            e.stopPropagation()
+        }
+
+        const dominant = absX > absY ? deltaX : deltaY
+        const delta = Math.sign(dominant)
+        if (!delta) {
+            return
+        }
 
         // treating one event as 'one unit' is good enough and safer.
         switch (e.deltaMode) {
@@ -680,13 +1112,13 @@ class KlineViewContainer extends Component<Props, State> {
         }
 
         if (e.shiftKey) {
-            // zoom in / zoom out 
+            // zoom in / zoom out
             xc.growWBar(-Math.sign(delta))
 
         } else if (e.ctrlKey) {
             const fastSteps = Math.floor(xc.nBars * 0.168)
             const unitsToScroll = xc.isCursorAccelerated ? delta * fastSteps : delta;
-            // move refer cursor left / right 
+            // move refer cursor left / right
             xc.scrollReferCursor(unitsToScroll, true)
 
         } else {
@@ -790,148 +1222,158 @@ class KlineViewContainer extends Component<Props, State> {
     toggleCrosshairVisiable() {
         const xc = this.xc;
 
-        xc.isCrosshairEnabled = !xc.isCrosshairEnabled
+        xc.isCrosshairEnabled = !xc.isCrosshairEnabled;
 
-        this.update({ type: 'cursors' })
-    }
-
-    toggleKlineKind() {
-        let kind: KlineKind
-        switch (this.xc.klineKind) {
-            case 'candle':
-                kind = 'bar'
-                break;
-
-            case 'bar':
-                kind = 'line'
-                break;
-
-            case 'line':
-                kind = 'candle'
-                break;
-
-            default:
-                kind = 'bar'
-        }
-
-        this.xc.klineKind = kind;
-        this.update({ type: 'chart' })
-    }
-
-    toggleScalar() {
-        this.update({ type: 'chart', yScalar: true })
+        this.update({ type: 'cursors' });
     }
 
     toggleOnCalendarMode() {
-        this.xc.setOnCalendarMode(!this.xc.isOnCalendarMode)
-        this.update({ type: 'chart' })
+        const xc = this.xc;
+
+        // toggle onCalendarMode
+        xc.isOnCalendarMode = !xc.isOnCalendarMode;
+        // set default wBar
+        xc.wBar = 10;
+
+        xc.reinit();
+
+        this.update({ type: 'chart' });
     }
 
-    private handleTakeScreenshot() {
-        this.takeScreenshot().then((screenshot) =>
-            this.setState({ screenshot })
-        )
+    toggleKlineKind() {
+        this.update({ type: 'chart', klineKind: 'toggle' });
     }
 
-    takeScreenshot(): Promise<HTMLCanvasElement> {
-        return html2canvas(this.containerRef.current, {
-            useCORS: true // in case you have images stored in your application
-        })
+    toggleScalar() {
+        this.update({ type: 'chart', scalarMode: 'toggle' });
     }
 
-    private handleSymbolTimeframeChanged(symbol: string, timeframe?: string, tzone?: string) {
+    handleSymbolTimeframeChanged = (symbol: string, tframe?: TFrame | string) => {
+        console.log(`[KlineViewContainer] handleSymbolTimeframeChanged: ${this.symbol} -> ${symbol}, tframe: ${tframe}`);
+        // Cancel any pending data reload
         if (this.reloadDataTimeoutId) {
             clearTimeout(this.reloadDataTimeoutId);
+            this.reloadDataTimeoutId = undefined;
+        }
+        this.lastRealtimeAt = 0;
+
+        this.symbol = symbol;
+        sessionStorage.setItem('last_selected_symbol', symbol);
+        localStorage.setItem('last_selected_symbol', symbol);
+
+        // Update timeframe if provided (string shortName or TFrame instance)
+        if (tframe !== undefined) {
+            if (typeof tframe === 'string') {
+                const parsed = TFrame.PREDEFINED.find((tf) => tf.shortName === tframe) || TFrame.ofName(tframe);
+                if (parsed) {
+                    this.tframe = parsed;
+                } else {
+                    console.warn(`[KlineViewContainer] Unknown timeframe: ${tframe}, keep current.`);
+                }
+            } else {
+                this.tframe = tframe;
+            }
         }
 
-        this.symbol = symbol;  // 更新当前 symbol
-        this.tframe = timeframe === undefined ? this.tframe : TFrame.ofName(timeframe)
-        this.tzone = tzone === undefined ? this.tzone : tzone
+        // Force UI update to show new symbol immediately
+        this.update({ type: 'chart' });
 
+        // Update timezone based on market before rebuilding series
+        const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        this.tzone = getMarket() === 'ashare' ? 'Asia/Shanghai' : localTz;
+
+        // Re-create baseSer with new timeframe to clear old data
         this.baseSer = new DefaultTSer(this.tframe, this.tzone, 365);
         this.kvar = this.baseSer.varOf(KVAR_NAME) as TVar<Kline>;
+
+        // Force re-init xc with new baseSer
         this.xc = new ChartXControl(this.baseSer, this.width - ChartView.AXISY_WIDTH);
 
-        // Force related components re-render .
-        // NOTE When you call setState multiple times within the same synchronous block of code, 
-        // React batches these calls into a single update for performance reasons.
-        // So we set isLoaded to false here and use callback.
-        return new Promise<void>((resolve) => {
-            this.setState(
-                {
-                    isLoaded: false,
-                }, () =>
-                this.fetchData_calcPines(undefined, 365).then(() => {
-                    resolve();
-                }))
-        })
+        // Critical: Update state with new kvar/xc to ensure child components re-render with new data references
+        // We do this via forceUpdate or setState since these are not in state
+        this.forceUpdate();
+
+        // Fetch new data
+        this.fetchData_calcPines(undefined, 365).then(() => {
+            this.startRealtimePolling();
+        });
     }
 
-    runPines(pines: { pineName: string, pine: string }[]) {
-        if (this.reloadDataTimeoutId) {
-            clearTimeout(this.reloadDataTimeoutId);
-        }
+    handleTakeScreenshot() {
+        // html2canvas(document.body).then(canvas => {
+        //     document.body.appendChild(canvas)
+        // });
 
-        this.pines = pines;
+        const node = this.containerRef.current
+        html2canvas(node).then(canvas => {
+            // document.body.appendChild(canvas)
+            // const img = canvas.toDataURL("image/png");
+            // document.write('<img src="' + img + '"/>');
 
-        this.baseSer = new DefaultTSer(this.tframe, this.tzone, 1000);
-        this.kvar = this.baseSer.varOf(KVAR_NAME) as TVar<Kline>;
-        this.xc = new ChartXControl(this.baseSer, this.width - ChartView.AXISY_WIDTH);
-
-        return new Promise<void>((resolve) => {
-            console.log("runPines ...")
-            this.setState(
-                {
-                    isLoaded: false,
-                }, () =>
-                this.fetchData_calcPines(undefined, 1000).then(() => {
-                    resolve();
-                }))
-        })
-    }
-
-    resetPines() {
-        if (this.reloadDataTimeoutId) {
-            clearTimeout(this.reloadDataTimeoutId);
-        }
-
-        this.pines = undefined
-
-        this.baseSer = new DefaultTSer(this.tframe, this.tzone, 1000);
-        this.kvar = this.baseSer.varOf(KVAR_NAME) as TVar<Kline>;
-        this.xc = new ChartXControl(this.baseSer, this.width - ChartView.AXISY_WIDTH);
-
-        return new Promise<void>((resolve) => {
-            this.setState(
-                {
-                    isLoaded: false,
-                }, () =>
-                this.fetchData_calcPines(undefined, 1000).then(() => {
-                    resolve();
-                }))
-        })
-    }
-
-    changeSymbol(symbol: string): Promise<void> {
-        return this.handleSymbolTimeframeChanged(symbol, this.tframe.shortName, this.tzone)
-    }
-
-    changeTimeframe(tframe: string): Promise<void> {
-        return this.handleSymbolTimeframeChanged(this.symbol, tframe, this.tzone)
-    }
-
-    changeTimezone(tzone: string): Promise<void> {
-        return this.handleSymbolTimeframeChanged(this.symbol, this.tframe.shortName, tzone)
+            this.setState({ screenshot: canvas })
+        });
     }
 
     render() {
+        const apiStatus = this.state.apiStatus;
+        let apiBannerMessage: string | undefined;
+        if (apiStatus?.backoff_active && apiStatus.backoff_until) {
+            const until = new Date(apiStatus.backoff_until);
+            const remainingMs = until.getTime() - Date.now();
+            const remainingMin = Math.max(0, Math.ceil(remainingMs / 60000));
+            const untilText = Number.isNaN(until.getTime())
+                ? "unknown time"
+                : until.toLocaleTimeString("en-US", { hour12: false });
+            apiBannerMessage = `API degraded. Backoff until ${untilText} (~${remainingMin}m). Click Sync Latest Data to force.`;
+        } else if (apiStatus?.backoff_active) {
+            apiBannerMessage = "API degraded. Backoff active. Click Sync Latest Data to force.";
+        }
+
         return (
-            <div style={{ display: "flex" }} >
+            <div
+                ref={this.containerRef}
+                style={{
+                    width: '100%',
+                    height: '100vh',
+                    position: 'relative',
+                    outline: 'none',
+                    display: 'flex',
+                    flexDirection: 'row',
+                    overflow: 'hidden',
+                    overscrollBehaviorX: 'none'
+                }}
+                tabIndex={-1}
+                // onKeyDown={this.onKeyDown}
+                // onKeyUp={this.onKeyUp}
 
-                {/* Toolbar */}
-                <div style={{ display: "inline-block", paddingTop: '3px' }}>
+                onMouseLeave={this.onMouseLeave}
+                onMouseDown={this.onMouseDown}
+                onMouseMove={this.onMouseMove}
+                onMouseUp={this.onMouseUp}
+                onDoubleClick={this.onDoubleClick}
+                onWheel={this.onWheel}
+            >
+                {/* Left Toolbar */}
+                <div style={{
+                    width: this.toolbarWidth,
+                    minWidth: this.toolbarWidth,
+                    height: '100%',
+                    borderRight: '1px solid #e0e0e0',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    padding: '4px 0',
+                    gap: '2px',
+                    backgroundColor: '#f8f9fa',
+                    zIndex: 10,
+                    overflowY: 'auto',
+                    overflowX: 'hidden'
+                }}
+                    className="left-toolbar"
+                    onMouseDown={(e) => e.stopPropagation()}
+                >
 
-                    <ActionButtonGroup orientation="vertical" >
+                    <ActionButtonGroup orientation="vertical" density="compact">
 
                         <ToggleButtonGroup
                             orientation="vertical"
@@ -1056,15 +1498,6 @@ class KlineViewContainer extends Component<Props, State> {
                             </Tooltip>
                         </TooltipTrigger>
 
-                        {/* <TooltipTrigger delay={TOOPTIP_DELAY} placement="end">
-                            <ActionButton onPress={this.toggleOnCalendarMode} >
-                                {this.state.xc.isOnCalendarMode ? <StarFilled /> : <Star />}
-                            </ActionButton>
-                            <Tooltip >
-                                Toggle Calendar/Occurred mode
-                            </Tooltip>
-                        </TooltipTrigger> */}
-
                         <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
                             <ActionButton onPress={this.backToOriginalChartScale} >
                                 <Maximize />
@@ -1114,52 +1547,137 @@ class KlineViewContainer extends Component<Props, State> {
                         <Divider staticColor='auto' />
 
                         <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
-                            <DialogTrigger>
-                                <ActionButton onPress={this.handleTakeScreenshot} >
-                                    <Exposure />
-                                </ActionButton>
-                                <Tooltip>
-                                    Take screenshot
-                                </Tooltip>
+                            <ActionButton onPress={this.handleForceRefresh} >
+                                <Refresh />
+                            </ActionButton>
+                            <Tooltip>
+                                Sync Latest Data
+                            </Tooltip>
+                        </TooltipTrigger>
 
-                                <Popover>
-                                    <div className="help" >
-                                        <Screenshot canvas={this.state.screenshot} />
-                                    </div>
-                                </Popover>
-                            </DialogTrigger>
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={this.handleSyncWatchlistDaily} >
+                                <Collection />
+                            </ActionButton>
+                            <Tooltip>
+                                Sync Watchlist Daily
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={() => {
+                                const baseUrl = import.meta.env.BASE_URL;
+                                const target = baseUrl.endsWith('/') ? `${baseUrl}industry-templates` : `${baseUrl}/industry-templates`;
+                                window.open(target, '_blank');
+                            }} >
+                                <Edit />
+                            </ActionButton>
+                            <Tooltip>
+                                Industry Templates
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={() => {
+                                const baseUrl = import.meta.env.BASE_URL;
+                                const target = baseUrl.endsWith('/') ? `${baseUrl}screening` : `${baseUrl}/screening`;
+                                window.open(target, '_blank');
+                            }} >
+                                <Filter />
+                            </ActionButton>
+                            <Tooltip>
+                                AI Screening
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={() => {
+                                const baseUrl = import.meta.env.BASE_URL;
+                                // Handle case where baseUrl is '/' or '/vibetrader/'
+                                const target = baseUrl.endsWith('/') ? `${baseUrl}paper` : `${baseUrl}/paper`;
+                                window.open(target, '_blank');
+                            }} >
+                                <Play />
+                            </ActionButton>
+                            <Tooltip>
+                                Paper Trading Simulator
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <Divider staticColor='auto' />
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={this.handleTakeScreenshot} >
+                                <Exposure />
+                            </ActionButton>
+                            <Tooltip>
+                                Take screenshot
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <Divider staticColor='auto' />
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={this.toggleAIPanel} >
+                                <StarFilled />
+                            </ActionButton>
+                            <Tooltip>
+                                Toggle AI Panel
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <Divider staticColor='auto' />
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={() => window.open(import.meta.env.BASE_URL + 'actions', '_blank')} >
+                                <Prototyping />
+                            </ActionButton>
+                            <Tooltip>
+                                Action Plan
+                            </Tooltip>
                         </TooltipTrigger>
 
                     </ActionButtonGroup>
 
                 </div>
 
-                {/* View Container */}
-                <div className="container" style={{ paddingLeft: '6px', width: this.width + 'px', height: this.state.containerHeight + 'px' }}
-                    key="klineviewcontainer"
-                    ref={this.containerRef}
-                >
+                <div
+                    ref={this.contentRef}
+                    style={{
+                    position: 'relative',
+                    flex: 1,
+                    minWidth: 0,
+                    height: '100%',
+                    overflowY: 'auto',
+                    overflowX: 'hidden',
+                    display: 'flex',
+                    flexDirection: 'column'
+                }}>
                     {this.state.isLoaded && (<>
-                        <div className="title" style={{ width: this.width, height: this.hTitle }}>
+                        <div className="title" style={{ width: this.width, height: this.hTitle, flexShrink: 0, paddingTop: '20px', boxSizing: 'border-box' }}>
                             <Title
+                                symbol={this.symbol}
+                                tvar={this.kvar}
                                 width={this.width}
                                 height={this.hTitle}
-                                xc={this.xc}
-                                tvar={this.kvar}
-                                symbol={this.symbol}
-                                updateEvent={this.state.updateEvent}
+                                isAIPanelOpen={this.state.isAIPanelOpen}
+                                toggleAIPanel={this.toggleAIPanel}
+
                                 handleSymbolTimeframeChanged={this.handleSymbolTimeframeChanged}
+                                xc={this.xc}
+                                updateEvent={this.state.updateEvent}
                             />
-                            <div className="borderLeftUp" style={{ top: this.hTitle - 8 }} />
                         </div>
 
                         <div className="" style={{
                             display: 'flex', justifyContent: 'flex-start',
                             width: this.width, height: this.hIndtags,
-                            paddingTop: "0px"
+                            paddingTop: "0px",
+                            position: 'relative', // Anchor for legend
+                            zIndex: 101 // Ensure above chart
                         }}>
                             <TagGroup
-                                aria-label="Or need 'label' that will show" // An aria-label or aria-labelledby prop is required for accessibility.
+                                aria-label="Indicator selection"
                                 size="S"
                                 selectionMode="multiple"
                                 selectedKeys={this.state.selectedIndicatorTags}
@@ -1169,213 +1687,212 @@ class KlineViewContainer extends Component<Props, State> {
                                     <Tag key={"ind-tag-" + n} id={tag}>{tag.toUpperCase()}</Tag>
                                 )}
                             </TagGroup>
+
+                            {/* Legend for Overlay Indicators anchored below buttons */}
+                            <div style={{
+                                position: 'absolute',
+                                top: '100%', // Directly below the buttons
+                                left: 10,
+                                fontSize: '12px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                pointerEvents: 'none',
+                                marginTop: '4px' // Small gap
+                            }}>
+                                {this.state.overlayIndicators?.map((ind, i) => (
+                                    <div key={i} style={{ display: 'flex', gap: '12px', marginBottom: '2px' }}>
+                                        {ind.outputs.map((out, j) => {
+                                            const label = this.state.overlayIndicatorLabels?.[i]?.[j];
+                                            return (
+                                                <span key={j} style={{ color: out.options.color || '#F00', display: 'flex', gap: '4px', textShadow: '0px 0px 2px white' }}>
+                                                    <span style={{ fontWeight: 600 }}>{out.title}</span>
+                                                    {label && <span>{label}</span>}
+                                                </span>
+                                            );
+                                        })}
+                                    </div>
+                                ))}
+                            </div>
                         </div>
-                        <div style={{ position: 'relative', width: this.width, height: this.state.svgHeight }}>
-                            <svg viewBox={`0, 0, ${this.width} ${this.state.svgHeight}`}
+
+
+
+                        <div className="klineview" style={{ width: this.width, height: this.hKlineView, marginTop: this.hSpacing }}>
+                            <svg className="annotations"
                                 width={this.width}
-                                height={this.state.svgHeight}
+                                height={this.hKlineView}
                                 vectorEffect="non-scaling-stroke"
-                                onDoubleClick={this.onDoubleClick}
-                                onMouseLeave={this.onMouseLeave}
-                                onMouseMove={this.onMouseMove}
-                                onMouseDown={this.onMouseDown}
-                                onMouseUp={this.onMouseUp}
-                                onWheel={this.onWheel}
                                 style={{ zIndex: 1 }}
                             >
                                 <KlineView
-                                    id={"kline"}
-                                    x={0}
-                                    y={this.state.yKlineView}
-                                    width={this.width}
-                                    height={this.hKlineView}
-                                    name=""
-                                    xc={this.xc}
-                                    tvar={this.kvar}
                                     updateEvent={this.state.updateEvent}
                                     updateDrawing={this.state.updateDrawing}
-
-                                    overlayIndicators={this.state.overlayIndicators}
-
-                                    callbacksToContainer={this.callbacks}
-                                />
-
-                                <VolumeView
-                                    id={"volume"}
-                                    x={0}
-                                    y={this.state.yVolumeView}
-                                    width={this.width}
-                                    height={this.hVolumeView}
-                                    name="Vol"
                                     xc={this.xc}
                                     tvar={this.kvar}
-                                    updateEvent={this.state.updateEvent}
-                                />
-
-                                <AxisX
-                                    id={"axisx"}
-                                    x={0}
-                                    y={this.state.yAxisx}
                                     width={this.width}
-                                    height={this.hAxisx}
-                                    xc={this.xc}
-                                    updateEvent={this.state.updateEvent}
+                                    height={this.hKlineView}
+                                    x={0}
+                                    y={0}
+                                    id="kline"
+                                    name="kline"
+                                    overlayIndicators={this.state.overlayIndicators}
+                                    callbacksToContainer={this.callbacks}
                                 />
-                                {
-                                    this.state.stackedIndicators.map(({ pineName, tvar, outputs }, n) =>
+                            </svg>
+                        </div>
+                        <div className="volumeview" style={{ width: this.width, height: this.hVolumeView, marginTop: this.hSpacing }}>
+                            <svg
+                                width={this.width}
+                                height={this.hVolumeView}
+                                vectorEffect="non-scaling-stroke"
+                            >
+                                <VolumeView
+                                    updateEvent={this.state.updateEvent}
+                                    xc={this.xc}
+                                    tvar={this.kvar}
+                                    width={this.width}
+                                    height={this.hVolumeView}
+                                    x={0}
+                                    y={0}
+                                    id="volume"
+                                    name="volume"
+                                />
+                            </svg>
+                        </div>
+                        {this.state.stackedIndicators && this.state.stackedIndicators.map((indicator, n) => {
+                            return (
+                                <div className={this.#indicatorViewId(n)} style={{ width: this.width, height: this.hIndicatorView, marginTop: this.hSpacing }}
+                                    key={this.#indicatorViewId(n)}
+                                >
+                                    <svg
+                                        width={this.width}
+                                        height={this.hIndicatorView}
+                                        vectorEffect="non-scaling-stroke"
+                                    >
                                         <IndicatorView
-                                            key={"stacked-indicator-view-" + pineName}
-                                            id={this.#indicatorViewId(n)}
-                                            name={"Indicator-" + n}
-                                            x={0}
-                                            y={this.state.yIndicatorViews + n * (this.hIndicatorView + this.hSpacing)}
+                                            updateEvent={this.state.updateEvent}
+                                            xc={this.xc}
                                             width={this.width}
                                             height={this.hIndicatorView}
-                                            xc={this.xc}
-                                            tvar={tvar}
-                                            mainIndicatorOutputs={outputs}
-                                            updateEvent={this.state.updateEvent}
-                                            indexOfStackedIndicators={n}
-                                            callbacksToContainer={this.callbacks}
+                                            x={0}
+                                            y={0}
+                                            id={this.#indicatorViewId(n)}
+                                            name={this.#indicatorViewId(n)}
+                                            tvar={indicator.tvar}
+                                            mainIndicatorOutputs={indicator.outputs}
+
+                                            indicator={indicator}
+                                            indicatorLabels={this.state.stackedIndicatorLabels && this.state.stackedIndicatorLabels[n]}
+                                            referIndicatorLabels={this.state.referStackedIndicatorLabels && this.state.referStackedIndicatorLabels[n]}
                                         />
-                                    )
-                                }
-
-                                {this.state.referCursor}
-                                {this.state.mouseCursor}
-
+                                    </svg>
+                                </div>
+                            )
+                        }
+                        )}
+                        <div className="axisx" style={{ width: this.width, height: this.hAxisx, marginTop: this.hSpacing }}>
+                            <svg
+                                width={this.width}
+                                height={this.hAxisx}
+                                vectorEffect="non-scaling-stroke"
+                                style={{ fontSize: '11px' }}
+                            >
+                                <AxisX
+                                    updateEvent={this.state.updateEvent}
+                                    xc={this.xc}
+                                    width={this.width}
+                                    height={this.hAxisx}
+                                    x={0}
+                                    y={0}
+                                    id="axisx"
+                                />
                             </svg>
-
-                            {
-                                // labels for overlay indicators
-                                this.state.overlayIndicators.map(({ outputs }, m) =>
-                                    <Fragment key={"indicator-values-" + m}>
-                                        <div style={{
-                                            position: 'absolute',
-                                            top: this.state.yKlineView + m * 13 - this.hSpacing + 2,
-                                            zIndex: 2, // ensure it's above the SVG
-                                            backgroundColor: 'transparent',
-                                        }}>
-                                            <div style={{ paddingRight: "0px", paddingTop: '0px' }}>
-                                                {
-                                                    outputs.map(({ title, options: { color } }, n) =>
-                                                        <Fragment key={"overlay-indicator-lable-" + title} >
-                                                            <span className="label-mouse">{title}&nbsp;</span>
-                                                            <span style={{ color }}>{
-                                                                this.state.overlayIndicatorLabels !== undefined &&
-                                                                this.state.overlayIndicatorLabels[m] !== undefined &&
-                                                                this.state.overlayIndicatorLabels[m][n]
-                                                            }
-                                                            </span>
-                                                            {n === outputs.length - 1
-                                                                ? <span></span>
-                                                                : <span>&nbsp;&middot;&nbsp;</span>
-                                                            }
-                                                        </Fragment>
-                                                    )
-                                                }
-                                            </div>
-                                        </div>
-
-                                        <div style={{
-                                            position: 'absolute',
-                                            top: this.state.yKlineView + m * 13 - this.hSpacing + 2,
-                                            right: ChartView.AXISY_WIDTH,
-                                            zIndex: 2, // ensure it's above the SVG
-                                            backgroundColor: 'transparent',
-                                        }}>
-                                            <div style={{ paddingRight: "0px", paddingTop: '0px' }}>
-                                                {
-                                                    this.xc.isReferCursorEnabled && outputs.map(({ title, options: { color } }, n) =>
-                                                        <Fragment key={"ovarlay-indicator-lable-" + title} >
-                                                            <span className="label-refer">{title}&nbsp;</span>
-                                                            <span style={{ color }}>{
-                                                                this.state.referOverlayIndicatorLabels &&
-                                                                this.state.referOverlayIndicatorLabels[m] &&
-                                                                this.state.referOverlayIndicatorLabels[m][n]
-                                                            }
-                                                            </span>
-                                                            {n === outputs.length - 1
-                                                                ? <span></span>
-                                                                : <span>&nbsp;&middot;&nbsp;</span>
-                                                            }
-                                                        </Fragment>
-                                                    )
-                                                }
-                                            </div>
-                                        </div>
-                                    </Fragment>)
-                            }
-
-                            {
-                                // labels for stacked indicators
-                                this.state.stackedIndicators.map(({ outputs }, n) =>
-                                    <Fragment key={"indicator-values-" + n}>
-                                        <div style={{
-                                            position: 'absolute',
-                                            top: this.state.yIndicatorViews + n * (this.hIndicatorView + this.hSpacing) - this.hSpacing + 2,
-                                            zIndex: 2, // ensure it's above the SVG
-                                            backgroundColor: 'transparent',
-                                        }}>
-
-                                            <div style={{ paddingRight: "0px", paddingTop: '0px' }}>
-                                                {
-                                                    outputs.map(({ title, options: { color } }, k) =>
-                                                        <Fragment key={"stacked-indicator-label-" + n + '-' + k} >
-                                                            <span className="label-mouse">{title}&nbsp;</span>
-                                                            <span style={{ color }}>{
-                                                                this.state.stackedIndicatorLabels &&
-                                                                this.state.stackedIndicatorLabels[n] &&
-                                                                this.state.stackedIndicatorLabels[n][k]
-                                                            }
-                                                            </span>
-                                                            {k === outputs.length - 1
-                                                                ? <span></span>
-                                                                : <span>&nbsp;&middot;&nbsp;</span>
-                                                            }
-                                                        </Fragment>
-                                                    )
-                                                }
-                                            </div>
-
-                                        </div>
-
-                                        <div style={{
-                                            position: 'absolute',
-                                            top: this.state.yIndicatorViews + n * (this.hIndicatorView + this.hSpacing) - this.hSpacing + 2,
-                                            right: ChartView.AXISY_WIDTH,
-                                            zIndex: 2, // ensure it's above the SVG
-                                            backgroundColor: 'transparent',
-                                        }}>
-                                            <div style={{ display: "inline-block", paddingRight: "0px", paddingTop: '0px' }}>
-                                                {
-                                                    this.xc.isReferCursorEnabled && outputs.map(({ title, options: { color } }, k) =>
-                                                        <Fragment key={"stacked-indicator-label-" + n + '-' + k} >
-                                                            <span className="label-refer">{title}&nbsp;</span>
-                                                            <span style={{ color }}>{
-                                                                this.state.referStackedIndicatorLabels &&
-                                                                this.state.referStackedIndicatorLabels[n] &&
-                                                                this.state.referStackedIndicatorLabels[n][k]}
-                                                            </span>
-                                                            {k === outputs.length - 1
-                                                                ? <span></span>
-                                                                : <span>&nbsp;&middot;&nbsp;</span>
-                                                            }
-                                                        </Fragment>
-                                                    )
-                                                }
-                                            </div>
-                                        </div>
-                                    </Fragment>
-                                )
-                            }
                         </div>
                     </>)}
 
-                </div >
-            </div >
+                    {this.state.screenshot && (
+                        <Screenshot
+                            canvas={this.state.screenshot}
+                            onClose={() => { this.setState({ screenshot: undefined }) }}
+                        />
+                    )}
+
+                </div>
+
+                {this.state.isAIPanelOpen && (
+                    <>
+                        <div
+                            onMouseDown={this.handleResizeMouseDown}
+                            style={{
+                                width: '4px',
+                                cursor: 'col-resize',
+                                backgroundColor: 'transparent',
+                                zIndex: 100,
+                                display: 'flex',
+                                justifyContent: 'center',
+                                alignItems: 'center'
+                            }}
+                            className="resize-handle"
+                        >
+                            <div style={{ width: '1px', height: '100%', backgroundColor: '#e0e0e0' }} />
+                        </div>
+                        <div style={{ width: this.state.aiPanelWidth, height: '100%' }}
+                            onWheel={(e) => e.stopPropagation()}
+                            onMouseDown={(e) => e.stopPropagation()}
+                        >
+                            <AIAnalysisPanel
+                                symbol={this.symbol}
+                                klines={this.kvar && this.kvar.toArray ? this.kvar.toArray().slice(-100) : []}
+                                isOpen={this.state.isAIPanelOpen}
+                                onClose={this.toggleAIPanel}
+                            />
+                        </div>
+                    </>
+                )}
+
+                {this.state.toast && (
+                    <div style={{
+                        position: 'absolute',
+                        top: '20px',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        padding: '8px 16px',
+                        borderRadius: '4px',
+                        color: 'white',
+                        backgroundColor: this.state.toast.type === 'error' ? '#e53e3e' :
+                            this.state.toast.type === 'success' ? '#38a169' : '#3182ce',
+                        boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+                        zIndex: 1000,
+                        fontSize: '14px',
+                        fontWeight: 500,
+                        pointerEvents: 'none'
+                    }}>
+                        {this.state.toast.message}
+                    </div>
+                )}
+                {apiBannerMessage && (
+                    <div style={{
+                        position: 'absolute',
+                        top: '8px',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        padding: '4px 10px',
+                        borderRadius: '4px',
+                        color: 'white',
+                        backgroundColor: '#d69e2e',
+                        boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+                        zIndex: 1000,
+                        fontSize: '11px',
+                        fontWeight: 500,
+                        lineHeight: 1.2,
+                        pointerEvents: 'none'
+                    }}>
+                        {apiBannerMessage}
+                    </div>
+                )}
+            </div>
         )
     }
 }
 
-export default KlineViewContainer
+export default KlineViewContainer;

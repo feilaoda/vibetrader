@@ -29,9 +29,10 @@ Toward an Open Source AI-Friendly Trading Platform
 #### Drawing
 * Mouse:
   * Click on drawing: Select it
-  * Ctrl + Click: Complete variable-handle drawing
-  * Ctrl + Click on variable-handle drawing's handle: remove this handle
-  * Ctrl + Drag on variable-handle drawing's segment: insert a handle
+  * Ctrl/Cmd + Click: Complete variable-handle drawing
+  * Double click: Complete variable-handle drawing
+  * Ctrl/Cmd + Click on variable-handle drawing's handle: remove this handle
+  * Ctrl/Cmd + Drag on variable-handle drawing's segment: insert a handle
 
 * Keyboard:
   * ESC: Unselect drawing
@@ -39,6 +40,14 @@ Toward an Open Source AI-Friendly Trading Platform
 
 ## Screenshot
 <img src="./docs/images/screenshot_01.png" />
+
+## Industry Templates & Indicators
+
+See `docs/industry.md` for:
+- Template config format
+- Supported indicator types
+- Cache behavior (global DuckDB cache)
+- API endpoints
 
 ## Build
 

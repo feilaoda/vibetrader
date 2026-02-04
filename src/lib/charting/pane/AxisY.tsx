@@ -12,7 +12,9 @@ type Props = {
     width: number,
     height: number,
     xc: ChartXControl,
-    yc: ChartYControl
+    yc: ChartYControl,
+    formatTick?: (value: number) => string,
+    unitLabel?: string
 }
 
 const AxisY = (props: Props) => {
@@ -66,6 +68,7 @@ const AxisY = (props: Props) => {
 
         const path = new Path;
         const texts = new Texts;
+        const useCustomFormat = typeof props.formatTick === 'function';
 
         // draw axis-y line */
         path.moveto(0, 0)
@@ -83,18 +86,22 @@ const AxisY = (props: Props) => {
                 path.moveto(0, yTick)
                 path.lineto(wTick, yTick)
 
-                vTick = yc.shouldNormScale
+                const vTickScaled = yc.shouldNormScale && !useCustomFormat
                     ? vTick / yc.normScale
                     : vTick;
 
-                const vStr = parseFloat(vTick.toFixed(4)).toString();
+                const vStr = useCustomFormat
+                    ? props.formatTick(vTickScaled)
+                    : parseFloat(vTickScaled.toFixed(4)).toString();
                 const yText = yTick + 4
 
                 texts.text(8, yText, vStr);
             }
         }
 
-        if (yc.shouldNormScale) {
+        if (useCustomFormat && props.unitLabel) {
+            texts.text(8, yc.hCanvas, props.unitLabel);
+        } else if (yc.shouldNormScale) {
             texts.text(8, yc.hCanvas, yc.normMultiple);
         }
 
@@ -111,7 +118,7 @@ const AxisY = (props: Props) => {
 
     const transform = `translate(${x} ${y})`;
     return (
-        <g transform={transform} className="axis" >
+        <g transform={transform} className="axis" style={{ fontSize: '12px' }} >
             {chart.path.render()}
             {chart.texts.render()}
         </g>

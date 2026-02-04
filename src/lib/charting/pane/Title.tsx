@@ -10,7 +10,8 @@ import { TFrame } from "../../timeseris/TFrame";
 import { fetchSymbolList as fetchBinanceSymbols } from "../../domain/BinanaceData";
 import { fetchSymbolList as fetchAShareSymbols, type AShareSymbol } from "../../domain/AShareData";
 import { getMarket, setMarket, type MarketType } from "../../domain/DataFecther";
-import { isInWatchlist, toggleWatchlist, getWatchlistByMarket, type WatchlistItem } from "../../domain/Watchlist";
+import { isInWatchlist, toggleWatchlist, getWatchlistByMarket, loadWatchlistFromServer, type WatchlistItem } from "../../domain/Watchlist";
+
 
 type Props = {
     xc: ChartXControl,
@@ -20,7 +21,9 @@ type Props = {
     tvar: TVar<Kline>,
     symbol: string,
 
-    handleSymbolTimeframeChanged: (symbol: string, timeframe?: string) => void
+    handleSymbolTimeframeChanged: (symbol: string, timeframe?: string) => void;
+    toggleAIPanel: () => void;
+    isAIPanelOpen?: boolean;
 }
 
 type State = {
@@ -38,6 +41,16 @@ type Snapshot = {
 }
 
 const L_SNAPSHOTS = 6;
+
+const formatVolumeAshare = (value: number) => {
+    if (!Number.isFinite(value)) return "0";
+    const abs = Math.abs(value);
+    if (abs >= 1e9) return `${(value / 1e8).toFixed(2)}亿股`;
+    if (abs >= 1e8) return `${(value / 1e7).toFixed(2)}千万股`;
+    if (abs >= 1e7) return `${(value / 1e6).toFixed(2)}百万股`;
+    if (abs >= 1e5) return `${(value / 1e4).toFixed(2)}万股`;
+    return `${Math.round(value)}股`;
+};
 
 function NoDataStatus() {
     const [status, setStatus] = useState<{ visible: boolean, message: string }>({ visible: false, message: '' });
@@ -235,6 +248,15 @@ export function StockNameDisplay(props: { symbol: string }) {
 export function WatchlistButton(props: { symbol: string }) {
     const [isWatched, setIsWatched] = useState(() => isInWatchlist(props.symbol, getMarket()));
 
+    useEffect(() => {
+        const updateStatus = () => {
+            setIsWatched(isInWatchlist(props.symbol, getMarket()));
+        };
+        updateStatus();
+        window.addEventListener('watchlist-updated', updateStatus);
+        return () => window.removeEventListener('watchlist-updated', updateStatus);
+    }, [props.symbol]);
+
     const handleToggle = () => {
         const stockName = getStockName(props.symbol) || undefined;
         const newState = toggleWatchlist(props.symbol, getMarket(), stockName);
@@ -268,7 +290,19 @@ export function WatchlistButton(props: { symbol: string }) {
  * 自选股列表面板
  */
 export function WatchlistPanel(props: { handleSymbolTimeframeChanged: (symbol: string, timeframe?: string) => void }) {
+    const market = getMarket();
     const [watchlist, setWatchlist] = useState<WatchlistItem[]>(() => getWatchlistByMarket(getMarket()));
+
+    useEffect(() => {
+        const updateList = () => {
+            setWatchlist(getWatchlistByMarket(getMarket()));
+        };
+        window.addEventListener('watchlist-updated', updateList);
+        // init
+        setWatchlist(getWatchlistByMarket(getMarket()));
+        return () => window.removeEventListener('watchlist-updated', updateList);
+    }, [market]); // dependency on market to re-subscribe if needed, though getMarket checks global state
+
 
     const refreshList = () => {
         setWatchlist(getWatchlistByMarket(getMarket()));
@@ -339,7 +373,7 @@ export function ChooseTimeframe(props: { symbol: string, timeframe: TFrame, hand
         <MenuTrigger>
             <TooltipTrigger delay={500} placement="top">
                 <Button style={{ fontFamily: 'monospace', fontSize: 12, padding: 0, border: 'none', background: 'transparent' }}>
-                    {props.timeframe.shortName}
+                    {props.timeframe?.shortName || 'D'}
                 </Button>
                 <Tooltip>
                     Change timeframe
@@ -555,6 +589,11 @@ class Title extends Component<Props, State> {
         const rKline = this.state.referKline
         const pKline = this.state.pointKline
         const delta = this.state.delta;
+        const isAshare = getMarket() === 'ashare';
+        const formatVolume = (value: number) => {
+            if (!Number.isFinite(value)) return "0";
+            return isAshare ? formatVolumeAshare(value) : value.toPrecision(8);
+        };
 
         return (
             <>
@@ -575,6 +614,23 @@ class Title extends Component<Props, State> {
                             timeframe={this.props.xc.baseSer.timeframe}
                             handleSymbolTimeframeChanged={this.props.handleSymbolTimeframeChanged} />
                         &nbsp;&middot;&nbsp;
+                        <Button
+                            onPress={this.props.toggleAIPanel}
+                            style={{
+                                fontFamily: 'monospace',
+                                fontSize: 12,
+                                padding: '2px 8px',
+                                background: this.props.isAIPanelOpen ? '#ccc' : 'linear-gradient(45deg, #6a11cb 0%, #2575fc 100%)',
+                                color: 'white',
+                                border: 'none',
+                                borderRadius: '4px',
+                                cursor: 'pointer',
+                                marginLeft: '8px'
+                            }}
+                        >
+                            AI Analyze
+                        </Button>
+                        &nbsp;&middot;&nbsp;
                         <Button style={{ fontFamily: 'monospace', fontSize: 12, padding: 0, border: 'none', background: 'transparent' }}>
                             {this.tzoneShort}
                         </Button>
@@ -584,7 +640,7 @@ class Title extends Component<Props, State> {
                 <div style={{ display: 'flex', justifyContent: 'space-between', padding: '0px 8px 0px 8px', fontFamily: 'monospace', fontSize: '12px' }}>
 
                     <div style={{ flex: 1, justifyContent: "flex-start", padding: '0px 0px' }}>
-                        <div style={{ textAlign: 'left' }}>
+                        <div style={{ textAlign: 'left', display: 'flex', flexDirection: 'row', gap: '16px', alignItems: 'center', whiteSpace: 'nowrap' }}>
                             <div>
                                 {pKline && <>
                                     <span className="label-mouse">
@@ -596,7 +652,7 @@ class Title extends Component<Props, State> {
                                 {pKline && <>
                                     <span className="label-title">V </span>
                                     <span className="label-mouse">
-                                        {pKline.volume}
+                                        {formatVolume(pKline.volume)}
                                     </span>
                                 </>}
                             </div>
@@ -660,7 +716,7 @@ class Title extends Component<Props, State> {
                                     <>
                                         <span className="label-title">{this.dtFormatS.format(new Date(time))} </span>
                                         <span className="label-mouse">{price.toPrecision(8)} </span>
-                                        <span className="label-refer">{parseFloat(volume.toPrecision(8))}</span>
+                                        <span className="label-refer">{formatVolume(volume)}</span>
                                     </>
                                 </div>
                             )
@@ -688,7 +744,7 @@ class Title extends Component<Props, State> {
                                 {rKline && <>
                                     <span className="label-title">V </span>
                                     <span className="label-refer">
-                                        {rKline.volume}
+                                        {formatVolume(rKline.volume)}
                                     </span>
                                 </>}
                             </div>
@@ -732,6 +788,7 @@ class Title extends Component<Props, State> {
     }
 
     override componentDidMount(): void {
+        loadWatchlistFromServer();
         // call to update labels;
         this.updateCursors();
     }

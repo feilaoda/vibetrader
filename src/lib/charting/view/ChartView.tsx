@@ -127,6 +127,18 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
         this.onDrawingMouseMove = this.onDrawingMouseMove.bind(this)
         this.onDrawingMouseUp = this.onDrawingMouseUp.bind(this)
 
+        this.state = {
+            chartLines: [],
+            chartAxisy: undefined,
+            overlayChartLines: [],
+            drawingLines: [],
+            mouseCursor: undefined,
+            referCursor: undefined,
+            latestValueLabel: undefined,
+            sketching: undefined,
+            cursor: DEFAULT_CURSOR
+        };
+
         console.log(`ChartView created`)
     }
 
@@ -370,14 +382,17 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
 
         let crosshair: Path
         if (
-            !(this.props.updateDrawing && this.props.updateDrawing.createDrawingId) &&
-            !this.props.xc.isCrosshairEnabled
+            !(this.props.updateDrawing && this.props.updateDrawing.createDrawingId)
         ) {
             crosshair = new Path();
 
             // horizontal line
             crosshair.moveto(0, y);
             crosshair.lineto(this.props.width - wAxisY, y)
+
+            // vertical line
+            crosshair.moveto(x, 0);
+            crosshair.lineto(x, this.props.height);
         }
 
         const valueLabel = this.plotYValueLabel(y, value, className);
@@ -420,7 +435,7 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
         const transformYAnnot = `translate(${this.props.width - wAxisY}, ${0})`
         return (
             // pay attention to the order to avoid text being overlapped
-            <g transform={transformYAnnot} className={className}>
+            <g transform={transformYAnnot} className={className} style={{ fontSize: '12px' }}>
                 {axisyPath.render()}
                 {axisyTexts.render()}
             </g>
@@ -461,6 +476,20 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
         let yMouse: number
 
         const xyMouse = this.props.updateEvent.xyMouse;
+
+        // Check for prop changes of critical data (fixes stuck chart on symbol change)
+        if (this.props.xc !== prevProps.xc || this.props.tvar !== prevProps.tvar) {
+            console.log(`[ChartView] Props changed: xc=${this.props.xc !== prevProps.xc}, tvar=${this.props.tvar !== prevProps.tvar}`);
+            if (this.props.xc !== prevProps.xc) {
+                const oldScalar = this.yc.valueScalar;
+                const oldScale = this.yc.yChartScale;
+                this.yc = new ChartYControl(this.props.xc.baseSer, this.props.height);
+                this.yc.valueScalar = oldScalar;
+                this.yc.yChartScale = oldScale;
+            }
+            willUpdateChart = true;
+        }
+
         if (this.props.updateEvent.changed !== prevProps.updateEvent.changed) {
 
             switch (this.props.updateEvent.type) {
@@ -574,6 +603,7 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
     drawings: Drawing[] = []
     creatingDrawing: Drawing
     isDragging: boolean
+    commandKeyOnMouseDown = false;
 
     protected plotDrawings() {
         return this.drawings.map((drawing, n) => this.props.xc.selectedDrawingIdx === n || this.props.xc.mouseMoveHitDrawingIdx === n
@@ -663,11 +693,69 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
         return { time: this.props.xc.tx(x), value: this.yc.vy(y) }
     }
 
+    private isCommandKey(e: React.MouseEvent) {
+        if (typeof e.getModifierState === "function") {
+            return e.getModifierState("Control") || e.getModifierState("Meta");
+        }
+
+        return e.ctrlKey || e.metaKey;
+    }
+
+    private finalizeCreatingDrawing(forceCompleteVariable: boolean) {
+        const creatingDrawing = this.creatingDrawing;
+        if (!creatingDrawing) {
+            return;
+        }
+
+        if (!creatingDrawing.isCompleted && forceCompleteVariable && creatingDrawing.nHandles === undefined) {
+            creatingDrawing.isCompleted = true;
+            creatingDrawing.isAnchored = false;
+            creatingDrawing.currHandleIdx = -1;
+            // drop pre-created next handle, see anchorHandle(...)
+            if (creatingDrawing.handles.length > 0) {
+                creatingDrawing.handles.pop();
+            }
+        }
+
+        this.drawings.push(creatingDrawing)
+        if (this.props.callbacksToContainer) {
+            this.props.callbacksToContainer.updateDrawingIdsToCreate(undefined)
+        }
+
+        const drawingLine = creatingDrawing.renderDrawingWithHandles("drawing-new")
+        this.creatingDrawing = undefined
+
+        let drawingLines: JSX.Element[]
+        const prevSelected = this.props.xc.selectedDrawingIdx
+        if (prevSelected !== undefined) {
+            // unselect it at the same time 
+            const toUnselect = this.drawings[prevSelected].renderDrawing("drawing-" + prevSelected)
+
+            drawingLines = [
+                ...this.state.drawingLines.slice(0, prevSelected),
+                toUnselect,
+                ...this.state.drawingLines.slice(prevSelected + 1),
+                drawingLine];
+
+        } else {
+            drawingLines = [
+                ...this.state.drawingLines,
+                drawingLine];
+        }
+
+        // set it as new selected one
+        this.props.xc.selectedDrawingIdx = this.drawings.length - 1;
+
+        this.setState({ drawingLines, sketching: undefined })
+    }
+
     onDrawingMouseDown(e: React.MouseEvent) {
         // console.log('mouse down', e.nativeEvent.offsetX, e.nativeEvent.offsetY)
         this.isDragging = true;
 
         const [x, y] = this.translate(e)
+        const isCommand = this.isCommandKey(e);
+        this.commandKeyOnMouseDown = isCommand;
 
         // select drawing ?
         const hitDrawingIdx = this.drawings.findIndex(drawing => drawing.hits(x, y))
@@ -679,7 +767,7 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
 
             const handleIdx = selectedOne.getHandleIdxAt(x, y)
             if (handleIdx >= 0) {
-                if (selectedOne.nHandles === undefined && e.ctrlKey) {
+                if (selectedOne.nHandles === undefined && isCommand) {
                     // delete handle for variable-handle drawing
                     selectedOne.deleteHandleAt(handleIdx)
 
@@ -693,7 +781,7 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
                 }
 
             } else {
-                if (selectedOne.nHandles === undefined && e.ctrlKey) {
+                if (selectedOne.nHandles === undefined && isCommand) {
                     // insert handle for variable-handle drawing
                     const newHandleIdx = selectedOne.insertHandle(this.p(x, y))
 
@@ -723,6 +811,7 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
     onDrawingMouseMove(e: React.MouseEvent) {
         // console.log('mouse move', e.nativeEvent.offsetX, e.nativeEvent.offsetY, e.target)
         const [x, y] = this.translate(e)
+        const isCommand = this.isCommandKey(e);
 
         if (this.creatingDrawing?.isCompleted === false) {
             if (this.creatingDrawing.isAnchored) {
@@ -789,7 +878,7 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
                 const handleIdx = hitOne.getHandleIdxAt(x, y)
                 const cursor = handleIdx >= 0
                     ? HANDLE_CURSOR
-                    : e.ctrlKey ? HANDLE_CURSOR : GRAB_CURSOR
+                    : isCommand ? HANDLE_CURSOR : GRAB_CURSOR
                 // ctrl + move means going to insert handle for variable-handle drawing, use HANDLE_CURSOR
 
                 this.updateDrawingsWithHandles(hitDrawingIdx, cursor)
@@ -817,11 +906,14 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
         // console.log('mouse up', e.detail, e.nativeEvent.offsetX, e.nativeEvent.offsetY)
         this.isDragging = false
 
-        if (e.detail === 2) {
+        const [x, y] = this.translate(e)
+        const isCommand = this.isCommandKey(e) || this.commandKeyOnMouseDown;
+        this.commandKeyOnMouseDown = false;
+        const isCompleteAction = isCommand || e.detail === 2;
+
+        if (!this.props.updateDrawing) {
             return
         }
-
-        const [x, y] = this.translate(e)
 
         if (this.creatingDrawing === undefined) {
             if (this.props.updateDrawing.createDrawingId) {
@@ -833,44 +925,8 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
             // completing new drawing
             const isCompleted = this.creatingDrawing.anchorHandle(this.p(x, y))
 
-            if (isCompleted || e.ctrlKey) {
-                // is it a variable-handle drawing and ctrl + clicked? complete it 
-                if (this.creatingDrawing.nHandles === undefined && e.ctrlKey) {
-                    this.creatingDrawing.isCompleted = true;
-                    this.creatingDrawing.isAnchored = false;
-                    this.creatingDrawing.currHandleIdx = -1;
-                    // drop pre-created next handle, see anchorHandle(...)
-                    this.creatingDrawing.handles.pop()
-                }
-
-                this.drawings.push(this.creatingDrawing)
-                this.props.callbacksToContainer.updateDrawingIdsToCreate(undefined)
-
-                const drawingLine = this.creatingDrawing.renderDrawingWithHandles("drawing-new")
-                this.creatingDrawing = undefined
-
-                let drawingLines: JSX.Element[]
-                const prevSelected = this.props.xc.selectedDrawingIdx
-                if (prevSelected !== undefined) {
-                    // unselect it at the same time 
-                    const toUnselect = this.drawings[prevSelected].renderDrawing("drawing-" + prevSelected)
-
-                    drawingLines = [
-                        ...this.state.drawingLines.slice(0, prevSelected),
-                        toUnselect,
-                        ...this.state.drawingLines.slice(prevSelected + 1),
-                        drawingLine];
-
-                } else {
-                    drawingLines = [
-                        ...this.state.drawingLines,
-                        drawingLine];
-                }
-
-                // set it as new selected one
-                this.props.xc.selectedDrawingIdx = this.drawings.length - 1;
-
-                this.setState({ drawingLines, sketching: undefined })
+            if (isCompleted || isCompleteAction) {
+                this.finalizeCreatingDrawing(isCompleteAction)
             }
         }
     }
@@ -878,8 +934,9 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
 
     onDrawingMouseDoubleClick(e: React.MouseEvent) {
         //console.log('mouse doule clicked', e.detail, e.nativeEvent.offsetX, e.nativeEvent.offsetY)
-        if (e.detail === 2) {
-            const [x, y] = this.translate(e)
+        if (this.creatingDrawing?.isCompleted === false && this.creatingDrawing.nHandles === undefined) {
+            e.stopPropagation();
+            this.finalizeCreatingDrawing(true);
         }
     }
 
@@ -891,7 +948,7 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
                 onMouseDown={this.onDrawingMouseDown}
                 onMouseMove={this.onDrawingMouseMove}
                 onMouseUp={this.onDrawingMouseUp}
-                cursor={this.state.cursor}
+                cursor={this.state ? this.state.cursor : undefined}
                 ref={this.ref}
             >
                 {/* Invisible background to capture clicks in empty space */}
@@ -914,4 +971,3 @@ export abstract class ChartView<P extends ViewProps, S extends ViewState> extend
     }
 
 }
-

@@ -1,0 +1,314 @@
+.action-page {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100vh;
+    background-color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+.action-header {
+    height: 48px;
+    border-bottom: 1px solid #e0e0e0;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    background-color: #f8f9fa;
+}
+
+.back-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 14px;
+    color: #007bff;
+    font-weight: 500;
+}
+
+.back-btn:hover {
+    text-decoration: underline;
+}
+
+.action-header .title {
+    margin-left: 20px;
+    font-weight: bold;
+    font-size: 16px;
+}
+
+.action-content {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+}
+
+/* Watchlist Styles */
+.action-watchlist {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    border-right: 1px solid #e0e0e0;
+    width: 380px;
+    background-color: #fff;
+}
+
+.watchlist-search {
+    padding: 10px;
+    border-bottom: 1px solid #f0f0f0;
+}
+
+.search-input {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-sizing: border-box;
+}
+
+.watchlist-items {
+    flex: 1;
+    overflow-y: auto;
+}
+
+.watchlist-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-bottom: 1px solid #f9f9f9;
+    cursor: pointer;
+}
+
+.watchlist-item:hover {
+    background-color: #f5f5f5;
+}
+
+.watchlist-item.selected {
+    background-color: #e3f2fd;
+    border-left: 3px solid #007bff;
+}
+
+.watchlist-item .symbol {
+    font-weight: 600;
+}
+
+.watchlist-item .name {
+    font-size: 12px;
+    color: #666;
+}
+
+.watchlist-item .item-actions {
+    opacity: 0;
+    transition: opacity 0.2s ease-in-out;
+}
+
+.watchlist-item:hover .item-actions {
+    opacity: 1;
+}
+
+.market-tag {
+    background-color: #eee;
+    padding: 2px 4px;
+    border-radius: 2px;
+    font-size: 10px;
+    margin-left: 4px;
+}
+
+/* Timeline Styles */
+.action-timeline {
+    padding: 20px;
+    overflow-y: auto;
+    flex: 1;
+    background-color: #f9f9f9;
+}
+
+.timeline-empty,
+.timeline-loading {
+    padding: 20px;
+    color: #888;
+}
+
+.timeline-card {
+    background-color: white;
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    margin-bottom: 20px;
+    border-left: 4px solid #ccc;
+}
+
+.timeline-card.action-buy {
+    border-left-color: #2ecc71;
+}
+
+.timeline-card.action-sell {
+    border-left-color: #e74c3c;
+}
+
+.timeline-card.action-watch {
+    border-left-color: #f39c12;
+}
+
+.badge {
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-weight: bold;
+    font-size: 12px;
+    color: white;
+    background-color: #999;
+    margin-right: 10px;
+}
+
+.badge.buy {
+    background-color: #2ecc71;
+}
+
+.badge.sell {
+    background-color: #e74c3c;
+}
+
+.badge.watch {
+    background-color: #f39c12;
+}
+
+.card-header {
+    display: flex;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.time-range {
+    font-weight: 500;
+    margin-right: auto;
+}
+
+.created-at {
+    font-size: 12px;
+    color: #999;
+}
+
+.card-body {
+    margin-bottom: 12px;
+}
+
+.description {
+    font-size: 16px;
+    font-weight: 500;
+    margin: 0 0 8px 0;
+}
+
+.reasoning {
+    font-size: 14px;
+    color: #666;
+    margin: 0;
+}
+
+.view-original-btn {
+    background: none;
+    border: 1px solid #ccc;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.view-original-btn:hover {
+    background-color: #f0f0f0;
+}
+
+/* Modal */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.5);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+}
+
+.modal-content {
+    background-color: white;
+    width: 600px;
+    max-height: 80vh;
+    padding: 20px;
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+}
+
+.modal-scroll {
+    flex: 1;
+    overflow-y: auto;
+    background-color: #f5f5f5;
+    padding: 10px;
+    border-radius: 4px;
+    margin: 10px 0;
+}
+
+.close-btn {
+    align-self: flex-end;
+    padding: 8px 16px;
+    background-color: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+/* Status Styles */
+.status-checkbox {
+    margin-left: 10px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: #666;
+    cursor: pointer;
+}
+
+.timeline-card.completed {
+    opacity: 0.6;
+    background-color: #f8f8f8;
+    border-left-color: #aaa !important;
+}
+
+.timeline-card.completed .description {
+    text-decoration: line-through;
+    color: #888;
+}
+
+.timeline-card.completed .badge {
+    background-color: #aaa;
+}
+
+.meta-info {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    margin-left: auto;
+    /* Push to right */
+    gap: 2px;
+}
+
+.model-tag {
+    font-size: 10px;
+    background-color: #eef;
+    padding: 2px 4px;
+    border-radius: 3px;
+    color: #55a;
+    border: 1px solid #ccf;
+}
+
+/* Adjust card header to accommodate meta-info */
+.card-header {
+    align-items: flex-start;
+    /* Align top since meta-info is multi-line */
+}
+
+/* Override existing created-at style since it's now inside meta-info */
+.card-header .created-at {
+    margin-left: 0;
+}

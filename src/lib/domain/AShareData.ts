@@ -76,6 +76,9 @@ export async function fetchKlines(
     }
 
     const data = await response.json();
+    if (typeof window !== 'undefined' && data?.api_status) {
+        window.dispatchEvent(new CustomEvent('akshare-api-status', { detail: data.api_status }));
+    }
     return data.data || [];
 }
 

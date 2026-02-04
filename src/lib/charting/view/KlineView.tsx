@@ -20,6 +20,7 @@ export class KlineView extends ChartView<ViewProps, ViewState> {
         const { chartLines, chartAxisy, overlayChartLines, drawingLines } = this.plot();
 
         this.state = {
+            ...this.state,
             chartLines,
             chartAxisy,
             overlayChartLines,

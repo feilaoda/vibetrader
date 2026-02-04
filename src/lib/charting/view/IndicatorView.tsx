@@ -16,6 +16,7 @@ export class IndicatorView extends ChartView<ViewProps, ViewState> {
         const { chartLines, chartAxisy } = this.plot();
 
         this.state = {
+            ...this.state,
             chartLines,
             chartAxisy,
         };

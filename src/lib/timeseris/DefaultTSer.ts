@@ -587,11 +587,18 @@ export class DefaultTSer implements TSer {
      * @return self
      */
     addToVar(name: string, value: TVal): TSer {
-        const theVar = this.varOf(name);
+        if (!value || value.time === undefined || value.time === null || isNaN(value.time)) {
+            return this;
+        }
         const time = this.timeframe.trunc(value.time, this.timezone);
+        if (time <= 0) {
+            return this;
+        }
+
         if (!this.occurred(time)) {
             this.createOrReset(time);
         }
+        const theVar = this.varOf(name);
         theVar.setByTime(time, value);
 
         return this;

@@ -130,6 +130,7 @@ export class TFrame {
 	 * @param tzone string
 	 */
 	trunc(time: number, tzone: string): number {
+		if (time === undefined || time === null || isNaN(time)) return 0;
 		const dt = new Temporal.ZonedDateTime(BigInt(time) * TUnit.NANO_PER_MILLI, tzone);
 		return this.truncDateTime(dt);
 	}
@@ -141,6 +142,7 @@ export class TFrame {
 
 
 	ceil(time: number, tzone: string): number {
+		if (time === undefined || time === null || isNaN(time)) return 0;
 		const dt = new Temporal.ZonedDateTime(BigInt(time) * TUnit.NANO_PER_MILLI, tzone);
 		return this.ceilDateTime(dt);
 	}

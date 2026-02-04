@@ -12,6 +12,17 @@ export default defineConfig({
     base: '/vibetrader/',
     //base: '/',
 
+    server: {
+        host: '0.0.0.0',
+        proxy: {
+            '/api': {
+                target: 'http://127.0.0.1:8000',
+                changeOrigin: true,
+                secure: false,
+            }
+        }
+    },
+
     build: {
         target: ['es2022'],
         // Lightning CSS produces a much smaller CSS bundle than the default minifier.

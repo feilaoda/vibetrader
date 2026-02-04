@@ -39,17 +39,28 @@ export const fetchData = (baseSer: TSer, symbol: string, tframe: TFrame, tzone: 
         })
 }
 
-const fetchDataLocal = (baseSer: TSer) => fetch("./klines.json")
-    .then(r => r.json())
-    .then(json => {
-        for (const k of json) {
-            const time = Date.parse(k.Date);
-            const kline = new Kline(time, k.Open, k.High, k.Low, k.Close, k.Volume, time, true);
-            baseSer.addToVar(KVAR_NAME, kline);
-        }
+const fetchDataLocal = (baseSer: TSer) => {
+    const baseUrl = import.meta.env.BASE_URL || "/";
+    const assetBase = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+    const url = `${assetBase}klines.json`;
 
-        return undefined; // latestTime
-    })
+    return fetch(url)
+        .then(r => {
+            if (!r.ok) {
+                throw new Error(`Failed to fetch local klines from ${url}: ${r.status}`);
+            }
+            return r.json();
+        })
+        .then(json => {
+            for (const k of json) {
+                const time = Date.parse(k.Date);
+                const kline = new Kline(time, k.Open, k.High, k.Low, k.Close, k.Volume, time, true);
+                baseSer.addToVar(KVAR_NAME, kline);
+            }
+
+            return undefined; // latestTime
+        })
+}
 
 const fetchDataBinance = async (baseSer: TSer, symbol: string, tframe: TFrame, tzone: string, startTime?: number, limit?: number) => {
     const endTime = new Date().getTime();
@@ -94,17 +105,33 @@ const fetchDataBinance = async (baseSer: TSer, symbol: string, tframe: TFrame, t
 const fetchDataAShare = async (baseSer: TSer, symbol: string, tframe: TFrame, tzone: string, startTime?: number, limit?: number) => {
     const endTime = new Date().getTime();
     const backLimitTime = tframe.timeBeforeNTimeframes(endTime, limit, tzone);
+    const resolvedStartTime = (startTime !== undefined && !Number.isNaN(startTime))
+        ? Math.max(startTime, backLimitTime)
+        : backLimitTime;
 
-    // 转换时间戳为日期字符串
-    const startDate = startTime
-        ? new Date(startTime).toISOString().slice(0, 10).replace(/-/g, '')
-        : new Date(backLimitTime).toISOString().slice(0, 10).replace(/-/g, '');
-    const endDate = new Date(endTime).toISOString().slice(0, 10).replace(/-/g, '');
+    const formatDate = (time: number, tz: string) => {
+        const formatter = new Intl.DateTimeFormat('en-CA', {
+            timeZone: tz,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+        });
+        return formatter.format(new Date(time)).replace(/-/g, '');
+    };
+    // 转换时间戳为日期字符串 (use exchange timezone)
+    let startDate = formatDate(resolvedStartTime, tzone);
+    let endDate = formatDate(endTime, tzone);
 
     const period = AShare.timeframe_to_ashare[tframe.shortName] || '1d';
 
     // 检测是否是分钟级别周期
     const isMinutePeriod = ['1m', '5m', '15m', '30m', '60m', '1h'].includes(tframe.shortName);
+    if (isMinutePeriod) {
+        // A股分钟线仅显示当天数据
+        const today = formatDate(endTime, tzone);
+        startDate = today;
+        endDate = today;
+    }
 
     console.log(`[fetchDataAShare] symbol=${symbol}, period=${period}, startDate=${startDate}, endDate=${endDate}, isMinute=${isMinutePeriod}`);
 
@@ -146,4 +173,3 @@ const fetchDataAShare = async (baseSer: TSer, symbol: string, tframe: TFrame, tz
         return fetchDataLocal(baseSer);
     }
 }
-

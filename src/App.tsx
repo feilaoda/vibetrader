@@ -2,9 +2,13 @@ import './App.css'
 import { Provider, } from '@react-spectrum/s2';
 import { useNavigate, useHref, type NavigateOptions, Routes, Route } from 'react-router';
 import '@react-spectrum/s2/page.css';
+import { useState } from 'react';
 
 import HomePage from './lib/layouts/HomePage'
-import { useState } from 'react';
+import { ActionPage } from './lib/actions/ActionPage';
+import { PaperTradingPage } from './lib/paper/PaperTradingPage';
+import { IndustryTemplatesPage } from './lib/industry/IndustryTemplatesPage';
+import { ScreeningPage } from './lib/screening/ScreeningPage';
 
 // Configure the type of the `routerOptions` prop on all React Spectrum components.
 declare module '@react-spectrum/s2' {
@@ -52,6 +56,12 @@ function App() {
                 <Route path="/vibetrader" element={
                     <HomePage toggleColorTheme={toggleColorTheme} colorTheme={colorTheme as 'light' | 'dark'} />
                 } />
+                <Route path="/actions" element={
+                    <ActionPage onBack={() => navigate('/')} />
+                } />
+                <Route path="/paper" element={<PaperTradingPage />} />
+                <Route path="/industry-templates" element={<IndustryTemplatesPage />} />
+                <Route path="/screening" element={<ScreeningPage />} />
             </Routes>
         </Provider>
     )

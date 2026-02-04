@@ -29,4 +29,3 @@ __datacache__
 *.json
 *.duckdb
 *.duckdb.wal
-watchlist.json

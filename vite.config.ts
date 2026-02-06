@@ -20,6 +20,19 @@ export default defineConfig({
                 changeOrigin: true,
                 secure: false,
             }
+            ,
+            '/binance-us': {
+                target: 'https://api.binance.us',
+                changeOrigin: true,
+                secure: false,
+                rewrite: (path) => path.replace(/^\/binance-us/, ''),
+            },
+            '/binance': {
+                target: 'https://api.binance.com',
+                changeOrigin: true,
+                secure: false,
+                rewrite: (path) => path.replace(/^\/binance/, ''),
+            }
         }
     },
 

@@ -4,11 +4,12 @@ from typing import List, Optional, Dict, Tuple, Any
 from datetime import datetime, timedelta
 import json
 import os
-import urllib.request
 
 from db import get_connection
 from watchlist import load_watchlist
 from cache import is_etf
+from yahoo import fetch_quote
+from us_indices import resolve_us_index_ticker, get_us_index_label
 
 router = APIRouter()
 
@@ -426,28 +427,7 @@ def _is_cache_fresh(updated_at: Optional[datetime], refresh_minutes: int) -> boo
 
 
 def _fetch_yahoo_quote(ticker: str) -> Optional[Dict[str, Any]]:
-    if not ticker:
-        return None
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        if resp.status != 200:
-            return None
-        raw = resp.read()
-    data = json.loads(raw.decode("utf-8"))
-    items = data.get("quoteResponse", {}).get("result", [])
-    if not items:
-        return None
-    q = items[0] or {}
-    return {
-        "ticker": ticker,
-        "price": q.get("regularMarketPrice"),
-        "change": q.get("regularMarketChange"),
-        "changePercent": q.get("regularMarketChangePercent"),
-        "time": q.get("regularMarketTime"),
-        "currency": q.get("currency"),
-        "source": "yahoo"
-    }
+    return fetch_quote(ticker)
 
 
 def _format_quote(payload: Dict[str, Any]) -> str:
@@ -626,6 +606,38 @@ def build_indicator_context(symbol: str) -> str:
             typ = (spec.get("type") or "").strip()
             if not typ:
                 continue
+            if typ == "index":
+                items = spec.get("items") or spec.get("symbols") or spec.get("tickers") or []
+                if isinstance(items, dict):
+                    items = [items]
+                if isinstance(items, str):
+                    items = [items]
+                if not items:
+                    items = ["^GSPC", "^IXIC"]
+                for item in items:
+                    if isinstance(item, dict):
+                        raw = item.get("ticker") or item.get("symbol") or item.get("code") or ""
+                        ticker = resolve_us_index_ticker(str(raw)) or str(raw).strip()
+                        label = item.get("label") or item.get("name")
+                    else:
+                        raw = str(item).strip()
+                        ticker = resolve_us_index_ticker(raw) or raw
+                        label = None
+                    if not ticker:
+                        continue
+                    label = label or get_us_index_label(ticker) or ticker
+                    key = f"index:{ticker}"
+                    payload, cached, err = _fetch_indicator_with_cache(
+                        conn,
+                        key,
+                        int(spec.get("refresh_minutes") or refresh_minutes),
+                        lambda t=ticker: _fetch_yahoo_quote(t),
+                        source="yahoo"
+                    )
+                    if payload:
+                        lines.append(f"{label}: {_format_quote(payload)}")
+                    else:
+                        lines.append(f"{label}: 无数据")
             if typ == "commodity_price":
                 items = spec.get("items") or []
                 if isinstance(items, dict):

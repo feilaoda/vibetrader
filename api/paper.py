@@ -433,8 +433,8 @@ def create_strategy(strategy: StrategyCreate):
         constraints = normalize_constraints(strategy.constraints)
         params = normalize_params(strategy.params)
         optimization = normalize_optimization(strategy.optimization)
-        row = conn.execute(
-            "INSERT INTO paper_strategies (name, type, prompt, is_ai, is_builtin, model_id, run_interval_minutes, auto_run_enabled, universe_type, universe_symbols, initial_capital, objectives_json, constraints_json, params_json, optimization_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        res = conn.execute(
+            "INSERT INTO paper_strategies (name, type, prompt, is_ai, is_builtin, model_id, run_interval_minutes, auto_run_enabled, universe_type, universe_symbols, initial_capital, objectives_json, constraints_json, params_json, optimization_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name,
                 typ,
@@ -452,8 +452,8 @@ def create_strategy(strategy: StrategyCreate):
                 json.dumps(params, ensure_ascii=False),
                 json.dumps(optimization, ensure_ascii=False)
             )
-        ).fetchone()
-        return {"id": row[0] if row else None}
+        )
+        return {"id": int(res.lastrowid) if hasattr(res, "lastrowid") and res.lastrowid else None}
     finally:
         conn.close()
 

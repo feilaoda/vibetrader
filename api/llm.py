@@ -3,6 +3,7 @@ import re
 from typing import List, Dict, Optional
 from openai import OpenAI
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, PROVIDERS, AVAILABLE_MODELS
+from prompts import DEFAULT_SYSTEM_PROMPT_NAME, SYSTEM_PROMPT_TEMPLATES
 
 class LLMService:
     def __init__(self):
@@ -66,19 +67,17 @@ class LLMService:
             data_str += f"{date} | {k['open']} | {k['high']} | {k['low']} | {k['close']} | {k['volume']}\n"
         return data_str
 
-    DEFAULT_SYSTEM_PROMPT_TEMPLATE = """你是一位拥有20年经验的资深股票分析师。你的名字叫 "VibeTrader Analyst"。
-你擅长结合技术面（K线形态、趋势、支撑阻力、量价关系）和市场情绪进行分析。
-当前分析的目标股票是: {symbol}。
-
-请遵循以下原则:
-1. **专业严谨**: 使用专业的金融术语，但解释要通俗易懂。
-2. **数据驱动**: 所有论点都必须基于提供的 K 线数据。
-3. **风险意识**: 始终提示潜在风险，不盲目推荐。
-4. **结构清晰**: 使用 Markdown 格式使回答易于阅读。
-"""
-
     def get_default_system_prompt_template(self) -> str:
-        return self.DEFAULT_SYSTEM_PROMPT_TEMPLATE
+        try:
+            from db import get_prompt_template_by_name
+            template = get_prompt_template_by_name(DEFAULT_SYSTEM_PROMPT_NAME)
+            if template and template.get("prompt"):
+                return template.get("prompt")
+        except Exception:
+            pass
+        if SYSTEM_PROMPT_TEMPLATES:
+            return SYSTEM_PROMPT_TEMPLATES[0][1]
+        return ""
 
     def build_system_prompt(self, symbol: str, custom_prompt: Optional[str] = None) -> str:
         if custom_prompt:
@@ -88,7 +87,7 @@ class LLMService:
             if symbol and symbol in text:
                 return text
             return f"{text}\n\n当前分析的目标股票是: {symbol}。"
-        return self.DEFAULT_SYSTEM_PROMPT_TEMPLATE.replace("{symbol}", symbol)
+        return self.get_default_system_prompt_template().replace("{symbol}", symbol)
 
     def _tokenize(self, text: str) -> List[str]:
         if not text:
@@ -203,16 +202,27 @@ class LLMService:
         RELEVANT_TOP_K = _to_int("relevant_top_k", 4, 0, 10)
         ENABLE_MEMORY = _to_bool("enable_memory", True)
         ENABLE_RETRIEVAL = _to_bool("enable_retrieval", True)
+        DISABLE_HISTORY = _to_bool("disable_history", False)
+        DISABLE_INDICATOR_CONTEXT = _to_bool("disable_indicator_context", False)
         SAVE_HISTORY = _to_bool("save_history", True)
         KLINE_ROWS_CHAT = _to_int("kline_rows_chat", 100, 0, 365)
         KLINE_ROWS_ASSISTANT = _to_int("kline_rows_assistant", 365, 0, 365)
 
         active_prompt = db.get_active_system_prompt(symbol) if symbol else None
         system_prompt = self.build_system_prompt(symbol, active_prompt.get("prompt") if active_prompt else None)
-        history = db.get_history(symbol, HISTORY_LIMIT)
-        memory = db.get_memory(symbol) if symbol else None
-        summary = memory.get("summary") if memory else ""
-        last_summary_id = memory.get("last_message_id") if memory else 0
+        if DISABLE_HISTORY:
+            ENABLE_MEMORY = False
+            ENABLE_RETRIEVAL = False
+            HISTORY_LIMIT = 0
+            RECENT_LIMIT = 0
+            history = []
+            summary = ""
+            last_summary_id = 0
+        else:
+            history = db.get_history(symbol, HISTORY_LIMIT)
+            memory = db.get_memory(symbol) if symbol else None
+            summary = memory.get("summary") if memory else ""
+            last_summary_id = memory.get("last_message_id") if memory else 0
 
         if ENABLE_MEMORY and history and len(history) >= SUMMARY_MIN:
             last_id = history[-1].id
@@ -230,7 +240,8 @@ class LLMService:
                 updated = self._summarize_memory(client, target_model, symbol, summary or "", new_msgs)
                 if updated:
                     summary = updated
-                    db.save_memory(symbol, summary, last_id)
+                    if SAVE_HISTORY:
+                        db.save_memory(symbol, summary, last_id)
 
         recent_msgs = history[-RECENT_LIMIT:] if history and RECENT_LIMIT > 0 else []
         older_msgs = history[:-RECENT_LIMIT] if history and RECENT_LIMIT > 0 else history
@@ -267,13 +278,14 @@ class LLMService:
         extra_parts: List[str] = []
         if transient_context:
             extra_parts.append(transient_context.strip())
-        try:
-            from industry import build_indicator_context
-            indicator_ctx = build_indicator_context(symbol) if symbol else ""
-            if indicator_ctx:
-                extra_parts.append(indicator_ctx.strip())
-        except Exception:
-            pass
+        if not DISABLE_INDICATOR_CONTEXT:
+            try:
+                from industry import build_indicator_context
+                indicator_ctx = build_indicator_context(symbol) if symbol else ""
+                if indicator_ctx:
+                    extra_parts.append(indicator_ctx.strip())
+            except Exception:
+                pass
         extra_context = "\n\n".join([p for p in extra_parts if p])
         extra_block = f"{extra_context}\n\n" if extra_context else ""
 
@@ -325,24 +337,32 @@ class LLMService:
                         if len(content) > 400:
                             content = content[:400] + "...(truncated)"
                     print(f"  {idx+1}. {msg.get('role')}: {content}")
-            response = client.chat.completions.create(
-                model=target_model,
-                messages=messages,
-                stream=True
-            )
-            
-            # 4. Stream Response & Accumulate for History
+            response = None
             full_response = ""
-            for chunk in response:
-                if chunk.choices and len(chunk.choices) > 0:
-                    content = chunk.choices[0].delta.content
-                    if content:
-                        full_response += content
-                        yield content
-            
-            # 5. Save Assistant Response to DB
-            if full_response and SAVE_HISTORY:
-                db.add_message(symbol, "assistant", full_response, target_model)
+            try:
+                response = client.chat.completions.create(
+                    model=target_model,
+                    messages=messages,
+                    stream=True
+                )
+                
+                # 4. Stream Response & Accumulate for History
+                for chunk in response:
+                    if chunk.choices and len(chunk.choices) > 0:
+                        content = chunk.choices[0].delta.content
+                        if content:
+                            full_response += content
+                            yield content
+                
+                # 5. Save Assistant Response to DB
+                if full_response and SAVE_HISTORY:
+                    db.add_message(symbol, "assistant", full_response, target_model)
+            finally:
+                try:
+                    if response is not None and hasattr(response, "close"):
+                        response.close()
+                except Exception:
+                    pass
             
         except Exception as e:
             err_msg = f"Error analyzing stock: {str(e)}"

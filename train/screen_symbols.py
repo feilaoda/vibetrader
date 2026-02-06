@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "api"))
 
 from api.cache import get_klines_with_cache, _latest_trading_date  # noqa: E402
+from api.config import AVAILABLE_MODELS, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, PROVIDERS  # noqa: E402
 from api.llm import LLMService  # noqa: E402
 from api.symbols import get_all_symbols  # noqa: E402
 from api.watchlist import load_watchlist  # noqa: E402
@@ -25,7 +26,9 @@ from api.db import (
 
 
 PROMPT_TEMPLATE = (
-    "你是股票筛选器，请基于给定日线数据输出简洁JSON，不要Markdown。\n"
+    "你是均衡型A股分析师，目标是在风险可控前提下追求稳定收益。"
+    "兼顾趋势跟随与关键位博弈，允许适度试错但必须有止损逻辑。\n"
+    "请基于给定日线数据输出简洁JSON，不要Markdown。\n"
     "输出格式：{{\"symbol\":\"{symbol}\",\"action\":\"BUY|WATCH|SKIP\",\"score\":0-100,\"reason\":\"一句话\"}}\n"
     "标准：BUY=建议入场，WATCH=重点观察，SKIP=暂不关注。"
 )
@@ -49,6 +52,80 @@ def _has_missing_recent_days(klines: List[Dict], window: int = 30) -> bool:
         return True
     required = _last_n_trading_dates(window)
     return any(date not in last_dates for date in required)
+
+
+def _get_provider_info(model_id: str) -> Dict[str, str | bool]:
+    provider = "default"
+    for model in AVAILABLE_MODELS:
+        if model.get("id") == model_id:
+            provider = model.get("provider", "default") or "default"
+            break
+    config = PROVIDERS.get(provider) or PROVIDERS.get("default") or {}
+    base_url = config.get("base_url") or LLM_BASE_URL
+    has_key = bool(config.get("api_key") or LLM_API_KEY)
+    return {"provider": provider, "base_url": base_url, "has_key": has_key}
+
+
+def _is_error_text(text: str) -> bool:
+    if not text:
+        return True
+    lowered = text.strip().lower()
+    if lowered.startswith("error"):
+        return True
+    if "token error" in lowered or "unhealthy" in lowered:
+        return True
+    return False
+
+
+def _collect_response(response) -> str:
+    if isinstance(response, str):
+        return response
+    return "".join(list(response))
+
+
+def _call_llm_with_retry(
+    llm: LLMService,
+    symbol: str,
+    klines: List[Dict],
+    model: str,
+    user_input: str,
+    context_config: Dict,
+    retries: int,
+    retry_sleep: float,
+    retry_backoff: float
+) -> tuple[str | None, str | None]:
+    model_id = model or LLM_MODEL
+    info = _get_provider_info(model_id)
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = llm.analyze_stock(
+                symbol,
+                klines,
+                model=model,
+                user_input=user_input,
+                mode="assistant",
+                context_config=context_config
+            )
+            text = _collect_response(response)
+        except Exception as exc:
+            text = f"Error analyzing stock: {exc}"
+        if _is_error_text(text):
+            last_error = text
+            print(
+                "[screen][llm-error] "
+                f"symbol={symbol} model={model_id} provider={info['provider']} "
+                f"base_url={info['base_url']} key={'ok' if info['has_key'] else 'missing'} "
+                f"attempt={attempt + 1}/{retries + 1} error={text}"
+            )
+            if attempt < retries:
+                sleep_for = retry_sleep * (retry_backoff ** attempt)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                continue
+            return None, last_error
+        return text, None
+    return None, last_error
 
 
 def _parse_json(text: str) -> Optional[Dict]:
@@ -104,10 +181,13 @@ def main() -> int:
     parser.add_argument("--kline-limit", type=int, default=365, help="Daily klines to include")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh klines")
     parser.add_argument("--cache-only", action="store_true", help="Use cached klines only (skip remote)")
-    parser.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between LLM calls")
+    parser.add_argument("--sleep", type=float, default=1.0, help="Sleep seconds between LLM calls")
     parser.add_argument("--output", default="", help="Output JSON file (default: train/screen_results_*.json)")
     parser.add_argument("--run-id", type=int, default=0, help="Resume existing run id")
     parser.add_argument("--resume", action="store_true", help="Resume latest unfinished run")
+    parser.add_argument("--llm-retries", type=int, default=2, help="Retry times for LLM failures")
+    parser.add_argument("--llm-retry-sleep", type=float, default=5.0, help="Base sleep seconds between LLM retries")
+    parser.add_argument("--llm-retry-backoff", type=float, default=2.0, help="Backoff multiplier for retries")
     args = parser.parse_args()
 
     symbols = _load_symbols(args.universe)
@@ -186,25 +266,27 @@ def main() -> int:
             continue
 
         user_input = PROMPT_TEMPLATE.format(symbol=symbol)
-        response = llm.analyze_stock(
+        text, err = _call_llm_with_retry(
+            llm,
             symbol,
             klines,
-            model=args.model,
-            user_input=user_input,
-            mode="assistant",
-            context_config=context_config
+            args.model,
+            user_input,
+            context_config,
+            args.llm_retries,
+            args.llm_retry_sleep,
+            args.llm_retry_backoff
         )
-        if isinstance(response, str):
+        if err or not text:
             result = {
                 "symbol": symbol,
                 "action": "ERROR",
                 "score": 0,
-                "reason": response
+                "reason": err or "empty_response"
             }
             results.append(result)
             add_screening_result(run_id, symbol, result["action"], result["score"], result["reason"], result, model_id=model_id)
         else:
-            text = "".join(list(response))
             parsed = _parse_json(text) or {}
             action = parsed.get("action") or parsed.get("signal") or "UNKNOWN"
             score = parsed.get("score") if parsed.get("score") is not None else 0

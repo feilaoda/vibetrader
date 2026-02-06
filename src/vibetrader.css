@@ -85,8 +85,8 @@
 }
 
 :root {
-    --positive-color: #00AA00B4;
-    --negative-color: #FF0000B4;
+    --positive-color: #FF0000B4;
+    --negative-color: #00AA00B4;
     --neutral-color: #00F0F0B4;
 
     --annot-color-g: #009000;
@@ -99,8 +99,8 @@
 
     @media (prefers-color-scheme: dark) {
         &:has(#color-scheme option[value="system"]:checked) {
-            --positive-color: #00AA00;
-            --negative-color: #FF0000;
+            --positive-color: #FF0000;
+            --negative-color: #00AA00;
             --neutral-color: #00F0F0;
 
             --annot-color-g: #00F000;
@@ -114,8 +114,8 @@
     }
 
     &:has(#color-scheme option[value="dark"]:checked) {
-        --positive-color: #00AA00;
-        --negative-color: #FF0000;
+        --positive-color: #FF0000;
+        --negative-color: #00AA00;
         --neutral-color: #00F0F0;
 
         --annot-color-g: #00F000;

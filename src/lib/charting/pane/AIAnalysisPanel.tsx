@@ -32,10 +32,9 @@ interface LLMConfig {
 
 interface SystemPromptItem {
     id: number;
-    symbol: string;
     name: string;
     prompt: string;
-    is_active: boolean;
+    is_builtin?: boolean;
 }
 
 interface IndustryProfile {
@@ -77,6 +76,7 @@ type ContextSettings = {
     enableMemory: boolean;
     enableRetrieval: boolean;
     chatUseDaily: boolean;
+    saveHistory: boolean;
     showIndustryInChat: boolean;
     historyLimit: number;
     recentLimit: number;
@@ -93,7 +93,8 @@ const DEFAULT_SETTINGS: ContextSettings = {
     enableMemory: true,
     enableRetrieval: true,
     chatUseDaily: true,
-    showIndustryInChat: false,
+    saveHistory: true,
+    showIndustryInChat: true,
     historyLimit: 60,
     recentLimit: 8,
     summaryMin: 10,
@@ -109,18 +110,24 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const [selectedModel, setSelectedModel] = useState<string>("");
 
     const [messages, setMessages] = useState<ChatMessage[]>([]);
-    const [analysisMode, setAnalysisMode] = useState<'chat' | 'assistant'>('chat');
+    const [analysisMode, setAnalysisMode] = useState<'chat' | 'assistant' | 'temporary'>('chat');
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [settingsTab, setSettingsTab] = useState<'params' | 'prompt' | 'industry'>('params');
     const [contextSettings, setContextSettings] = useState<ContextSettings>(DEFAULT_SETTINGS);
     const [input, setInput] = useState("");
     const [isLoading, setIsLoading] = useState(false);
+    const [isStopping, setIsStopping] = useState(false);
+    const [streamingMessageId, setStreamingMessageId] = useState<number | null>(null);
     const [autoEnabled, setAutoEnabled] = useState(false);
     const [autoLoading, setAutoLoading] = useState(false);
     const [autoError, setAutoError] = useState("");
     const [autoLastRun, setAutoLastRun] = useState<number | null>(null);
     const autoRunningRef = useRef(false);
     const latestKlinesRef = useRef<Kline[]>([]);
+    const abortControllerRef = useRef<AbortController | null>(null);
+    const streamingIdRef = useRef<number | null>(null);
+    const streamingBufferRef = useRef<string>("");
+    const streamingTimerRef = useRef<number | null>(null);
 
     const [actionModalOpen, setActionModalOpen] = useState(false);
     const [actionData, setActionData] = useState<ActionPlanData | null>(null);
@@ -129,10 +136,9 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const [selectedPromptId, setSelectedPromptId] = useState<number | null>(null);
     const [promptName, setPromptName] = useState("");
     const [promptText, setPromptText] = useState("");
-    const [promptSetActive, setPromptSetActive] = useState(false);
+    const [activeTemplateId, setActiveTemplateId] = useState<number | null>(null);
     const [promptLoading, setPromptLoading] = useState(false);
     const [promptError, setPromptError] = useState("");
-    const [defaultPromptTemplate, setDefaultPromptTemplate] = useState("");
     const [industryProfile, setIndustryProfile] = useState<IndustryProfile | null>(null);
     const [industryError, setIndustryError] = useState("");
     const [industryOptions, setIndustryOptions] = useState<string[]>([]);
@@ -188,7 +194,6 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     };
 
     const fetchIndustryIndicatorContext = async () => {
-        if (!contextSettings.showIndustryInChat) return "";
         if (!industryProfile?.enabled) return "";
         try {
             const res = await fetch(`${API_BASE_URL}/api/industry/context?symbol=${encodeURIComponent(props.symbol)}`);
@@ -207,7 +212,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }, [messages, isLoading]);
 
-    // Load config & History
+    // Load config & profile data
     useEffect(() => {
         if (props.isOpen) {
             // Load Config
@@ -220,14 +225,22 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                     })
                     .catch(console.error);
             }
-            // Load History
-            loadHistory();
             // Load System Prompts
             loadSystemPrompts();
             // Load Industry Profile
             loadIndustryProfile();
         }
     }, [props.isOpen, props.symbol]);
+
+    // Load history unless in temporary mode
+    useEffect(() => {
+        if (!props.isOpen) return;
+        if (analysisMode === 'temporary') {
+            setMessages([]);
+            return;
+        }
+        loadHistory();
+    }, [analysisMode, props.isOpen, props.symbol]);
 
     useEffect(() => {
         try {
@@ -277,26 +290,29 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const HISTORY_LIMIT = 5;
 
     const loadHistory = () => {
+        if (analysisMode === 'temporary') {
+            setMessages([]);
+            return;
+        }
         fetch(`${API_BASE_URL}/api/history?symbol=${props.symbol}&limit=${HISTORY_LIMIT}`)
             .then(res => res.json())
             .then(data => setMessages(data.data))
             .catch(console.error);
     };
 
-    const applyPromptSelection = (items: SystemPromptItem[]) => {
+    const applyPromptSelection = (items: SystemPromptItem[], activeId: number | null, defaultId: number | null) => {
         if (!items || items.length === 0) {
             setSelectedPromptId(null);
             setPromptName("");
             setPromptText("");
-            setPromptSetActive(false);
             return;
         }
-        const active = items.find(p => p.is_active);
-        const selected = active || items[0];
+        const selected = items.find(p => p.id === activeId)
+            || items.find(p => p.id === defaultId)
+            || items[0];
         setSelectedPromptId(selected.id);
         setPromptName(selected.name || "");
         setPromptText(selected.prompt || "");
-        setPromptSetActive(!!selected.is_active);
     };
 
     const loadSystemPrompts = () => {
@@ -307,11 +323,11 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             .then(res => res.json())
             .then(data => {
                 const items = Array.isArray(data.data) ? data.data : [];
+                const activeId = typeof data.active_template_id === "number" ? data.active_template_id : null;
+                const defaultId = typeof data.default_template_id === "number" ? data.default_template_id : null;
                 setPromptItems(items);
-                if (typeof data.default_template === "string") {
-                    setDefaultPromptTemplate(data.default_template);
-                }
-                applyPromptSelection(items);
+                setActiveTemplateId(activeId);
+                applyPromptSelection(items, activeId, defaultId);
             })
             .catch(err => {
                 console.error(err);
@@ -456,6 +472,9 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const handleToggleIndustryEnabled = async (enabled: boolean) => {
         if (!props.symbol) return;
         setIndustryEnabled(enabled);
+        if (enabled && !contextSettings.showIndustryInChat) {
+            persistSettings({ ...contextSettings, showIndustryInChat: true });
+        }
         try {
             await fetch(`${API_BASE_URL}/api/industry/settings/${encodeURIComponent(props.symbol)}`, {
                 method: "POST",
@@ -474,7 +493,6 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             setSelectedPromptId(null);
             setPromptName("");
             setPromptText("");
-            setPromptSetActive(false);
             return;
         }
         const id = Number(value);
@@ -483,57 +501,6 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         setSelectedPromptId(id);
         setPromptName(item.name || "");
         setPromptText(item.prompt || "");
-        setPromptSetActive(!!item.is_active);
-    };
-
-    const handlePromptNew = () => {
-        setSelectedPromptId(null);
-        setPromptName("New Prompt");
-        setPromptText(defaultPromptTemplate || "");
-        setPromptSetActive(true);
-        setPromptError("");
-    };
-
-    const handlePromptSave = async () => {
-        if (!props.symbol) return;
-        if (!promptText.trim()) {
-            setPromptError("Prompt不能为空");
-            return;
-        }
-        setPromptLoading(true);
-        setPromptError("");
-        const payload = {
-            symbol: props.symbol,
-            name: promptName.trim() || "Untitled",
-            prompt: promptText.trim(),
-            set_active: promptSetActive
-        };
-        try {
-            if (selectedPromptId) {
-                const updatePayload = {
-                    name: payload.name,
-                    prompt: payload.prompt,
-                    set_active: payload.set_active
-                };
-                await fetch(`${API_BASE_URL}/api/system_prompts/${selectedPromptId}`, {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(updatePayload)
-                });
-            } else {
-                await fetch(`${API_BASE_URL}/api/system_prompts`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(payload)
-                });
-            }
-            loadSystemPrompts();
-        } catch (err) {
-            console.error(err);
-            setPromptError("保存失败");
-        } finally {
-            setPromptLoading(false);
-        }
     };
 
     const handlePromptActivate = async () => {
@@ -541,7 +508,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         setPromptLoading(true);
         setPromptError("");
         try {
-            await fetch(`${API_BASE_URL}/api/system_prompts/${selectedPromptId}/activate`, {
+            await fetch(`${API_BASE_URL}/api/system_prompts/${selectedPromptId}/activate?symbol=${encodeURIComponent(props.symbol)}`, {
                 method: "POST"
             });
             loadSystemPrompts();
@@ -553,34 +520,19 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         }
     };
 
-    const handlePromptDelete = async () => {
-        if (!selectedPromptId) return;
-        setPromptLoading(true);
-        setPromptError("");
-        try {
-            await fetch(`${API_BASE_URL}/api/system_prompts/${selectedPromptId}`, {
-                method: "DELETE"
-            });
-            loadSystemPrompts();
-        } catch (err) {
-            console.error(err);
-            setPromptError("删除失败");
-        } finally {
-            setPromptLoading(false);
-        }
-    };
-
     const streamAnalyze = async (params: {
         symbol: string;
         klines: Kline[];
         userInput: string;
         displayUserContent?: string;
         runMode: "manual" | "auto";
-        analysisMode: "chat" | "assistant";
+        analysisMode: "chat" | "assistant" | "temporary";
         contextSettings: ContextSettings;
         transientContext?: string;
+        disableHistory?: boolean;
+        disableIndicatorContext?: boolean;
     }) => {
-        const { symbol, klines, userInput, displayUserContent, runMode, analysisMode, contextSettings, transientContext } = params;
+        const { symbol, klines, userInput, displayUserContent, runMode, analysisMode, contextSettings, transientContext, disableHistory, disableIndicatorContext } = params;
         if (!config?.configured) return;
         if (!symbol || klines.length === 0) {
             const msg = !symbol ? "No symbol selected" : "No kline data available";
@@ -596,6 +548,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
         if (runMode === "manual") {
             setIsLoading(true);
+            setIsStopping(false);
         } else {
             setAutoLoading(true);
             setAutoError("");
@@ -615,10 +568,26 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             setMessages(prev => [...prev, tempParams]);
         }
 
+        let tempAiMsgId: number | null = null;
+        let aiContent = "";
+        let wasAborted = false;
+        const controller = runMode === "manual" ? new AbortController() : null;
+        if (runMode === "manual") {
+            if (abortControllerRef.current) {
+                try {
+                    abortControllerRef.current.abort();
+                } catch (e) {
+                    // ignore
+                }
+            }
+            abortControllerRef.current = controller;
+        }
+
         try {
             const response = await fetch(`${API_BASE_URL}/api/analyze`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
+                signal: controller?.signal,
                 body: JSON.stringify({
                     symbol,
                     klines,
@@ -629,6 +598,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                     context_config: {
                         enable_memory: contextSettings.enableMemory,
                         enable_retrieval: contextSettings.enableRetrieval,
+                        save_history: contextSettings.saveHistory,
                         chat_use_daily: contextSettings.chatUseDaily,
                         history_limit: contextSettings.historyLimit,
                         recent_limit: contextSettings.recentLimit,
@@ -637,7 +607,9 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                         relevant_top_k: contextSettings.relevantTopK,
                         max_message_chars: contextSettings.maxMessageChars,
                         kline_rows_chat: contextSettings.klineRowsChat,
-                        kline_rows_assistant: contextSettings.klineRowsAssistant
+                        kline_rows_assistant: contextSettings.klineRowsAssistant,
+                        disable_indicator_context: !!disableIndicatorContext,
+                        disable_history: !!disableHistory
                     }
                 })
             });
@@ -647,11 +619,13 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
-            let aiContent = "";
 
-            const tempAiMsgId = Date.now() + 1;
+            tempAiMsgId = Date.now() + 1;
+            streamingIdRef.current = tempAiMsgId;
+            streamingBufferRef.current = "";
+            setStreamingMessageId(tempAiMsgId);
             setMessages(prev => [...prev, {
-                id: tempAiMsgId,
+                id: tempAiMsgId!,
                 role: 'assistant',
                 content: "",
                 timestamp: Date.now() / 1000,
@@ -659,44 +633,83 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 model: selectedModel
             }]);
 
+            if (streamingTimerRef.current) {
+                window.clearInterval(streamingTimerRef.current);
+            }
+            streamingTimerRef.current = window.setInterval(() => {
+                const id = streamingIdRef.current;
+                if (!id) return;
+                const content = streamingBufferRef.current;
+                setMessages(prev => prev.map(msg => {
+                    if (msg.id !== id) return msg;
+                    return { ...msg, content };
+                }));
+            }, 120);
+
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
-                const chunk = decoder.decode(value);
+                const chunk = decoder.decode(value, { stream: true });
                 aiContent += chunk;
+                streamingBufferRef.current = aiContent;
 
-                setMessages(prev => {
-                    const newHistory = [...prev];
-                    const lastMsg = newHistory[newHistory.length - 1];
-                    if (lastMsg.role === 'assistant') {
-                        lastMsg.content = aiContent;
-                    }
-                    return newHistory;
-                });
+                if (streamingTimerRef.current === null) {
+                    setMessages(prev => prev.map(msg => {
+                        if (msg.id !== tempAiMsgId) return msg;
+                        return { ...msg, content: aiContent };
+                    }));
+                }
             }
 
         } catch (e) {
-            const errMsg = `Error: ${(e as Error).message}`;
-            setMessages(prev => [...prev, {
-                id: Date.now(),
-                role: 'assistant',
-                content: errMsg,
-                timestamp: Date.now() / 1000,
-                is_favorite: false
-            }]);
-            if (runMode === "auto") {
-                setAutoError((e as Error).message || "Auto evaluation failed");
+            const err = e as Error;
+            const isAbort = err?.name === "AbortError" || err?.message?.toLowerCase().includes("abort");
+            if (isAbort) {
+                wasAborted = true;
+                if (tempAiMsgId) {
+                    if (aiContent.trim()) {
+                        setMessages(prev => prev.map(msg => {
+                            if (msg.id !== tempAiMsgId) return msg;
+                            return { ...msg, content: `${aiContent}\n\n(已停止)` };
+                        }));
+                    } else {
+                        setMessages(prev => prev.filter(msg => msg.id !== tempAiMsgId));
+                    }
+                }
+            } else {
+                const errMsg = `Error: ${err.message}`;
+                setMessages(prev => [...prev, {
+                    id: Date.now(),
+                    role: 'assistant',
+                    content: errMsg,
+                    timestamp: Date.now() / 1000,
+                    is_favorite: false
+                }]);
+                if (runMode === "auto") {
+                    setAutoError(err.message || "Auto evaluation failed");
+                }
             }
         } finally {
+            if (streamingTimerRef.current) {
+                window.clearInterval(streamingTimerRef.current);
+                streamingTimerRef.current = null;
+            }
+            streamingIdRef.current = null;
+            streamingBufferRef.current = "";
+            setStreamingMessageId(null);
             if (runMode === "manual") {
                 setIsLoading(false);
+                setIsStopping(false);
+                abortControllerRef.current = null;
             } else {
                 setAutoLoading(false);
             }
-            try {
-                loadHistory();
-            } catch (e) {
-                console.error("Error reloading history:", e);
+            if (!wasAborted && analysisMode !== 'temporary') {
+                try {
+                    loadHistory();
+                } catch (e) {
+                    console.error("Error reloading history:", e);
+                }
             }
         }
     };
@@ -710,7 +723,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
         let klinesToUse = props.klines;
         let realtimeSummary = '';
-        const wantDaily = analysisMode === 'assistant' || (analysisMode === 'chat' && contextSettings.chatUseDaily);
+        const wantDaily = analysisMode === 'assistant' || ((analysisMode === 'chat' || analysisMode === 'temporary') && contextSettings.chatUseDaily);
         if (wantDaily) {
             try {
                 const limit = analysisMode === 'assistant'
@@ -728,7 +741,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 // fallback to current klines
             }
         }
-        if (analysisMode === 'chat') {
+        if (analysisMode === 'chat' || analysisMode === 'temporary') {
             try {
                 const realtimeRes = await fetch(`${API_BASE_URL}/api/realtime/${encodeURIComponent(props.symbol)}`);
                 if (realtimeRes.ok) {
@@ -747,25 +760,58 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         }
 
         const industryContext = buildIndustryTransient(industryProfile);
-        const indicatorContext = await fetchIndustryIndicatorContext();
+        const indicatorContext = industryProfile?.enabled
+            ? await fetchIndustryIndicatorContext()
+            : "";
+        const transientParts = [industryContext, indicatorContext].filter(Boolean);
+        const transientContext = transientParts.join("\n");
         const baseUserInput = realtimeSummary ? `${userInput}\n\n${realtimeSummary}` : userInput;
 
         const displayParts = [baseUserInput];
         if (contextSettings.showIndustryInChat) {
-            if (indicatorContext) displayParts.push(`[行业指标]\n${indicatorContext}`);
+            if (indicatorContext) displayParts.push(indicatorContext);
         }
         const displayUserContent = displayParts.join("\n\n");
 
-        await streamAnalyze({
-            symbol: props.symbol,
-            klines: klinesToUse,
-            userInput: baseUserInput,
-            displayUserContent,
-            runMode: "manual",
-            analysisMode,
-            contextSettings,
-            transientContext: industryContext
-        });
+        const useTempMode = analysisMode === 'temporary';
+        const effectiveContextSettings = useTempMode
+            ? {
+                ...contextSettings,
+                enableMemory: false,
+                enableRetrieval: false,
+                saveHistory: false,
+                historyLimit: 0,
+                recentLimit: 0,
+                summaryMin: 0,
+                summaryStep: 0
+            }
+            : contextSettings;
+        try {
+            await streamAnalyze({
+                symbol: props.symbol,
+                klines: klinesToUse,
+                userInput: baseUserInput,
+                displayUserContent,
+                runMode: "manual",
+                analysisMode,
+                contextSettings: effectiveContextSettings,
+                transientContext,
+                disableIndicatorContext: !!indicatorContext,
+                disableHistory: useTempMode
+            });
+        } finally {
+            // no-op
+        }
+    };
+
+    const handleStop = () => {
+        if (!abortControllerRef.current) return;
+        setIsStopping(true);
+        try {
+            abortControllerRef.current.abort();
+        } catch (e) {
+            // ignore
+        }
     };
 
     const runAutoEvaluation = async () => {
@@ -807,12 +853,16 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             const nowText = new Date().toLocaleString();
             const userInput = `自动评估。当前时间: ${nowText}。\n${realtimeSummary}\n请结合历史日线数据评估下一步动作（买/卖/观望），给出理由和风险提示。`;
             const industryContext = buildIndustryTransient(industryProfile);
-            const indicatorContext = await fetchIndustryIndicatorContext();
+            const indicatorContext = industryProfile?.enabled
+                ? await fetchIndustryIndicatorContext()
+                : "";
+            const transientParts = [industryContext, indicatorContext].filter(Boolean);
+            const transientContext = transientParts.join("\n");
 
             const baseDisplay = `自动评估 · ${nowText}\n${realtimeSummary}`;
             const displayParts = [baseDisplay];
             if (contextSettings.showIndustryInChat) {
-                if (indicatorContext) displayParts.push(`[行业指标]\n${indicatorContext}`);
+                if (indicatorContext) displayParts.push(indicatorContext);
             }
             const displayUserContent = displayParts.join("\n\n");
 
@@ -824,7 +874,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 runMode: "auto",
                 analysisMode: "assistant",
                 contextSettings,
-                transientContext: industryContext
+                transientContext,
+                disableIndicatorContext: !!indicatorContext
             });
         } finally {
             autoRunningRef.current = false;
@@ -1023,7 +1074,11 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
                             {/* Content */}
                             <div className="markdown-body" style={{ textAlign: 'left', wordBreak: 'break-word' }}>
-                                <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayContent}</ReactMarkdown>
+                                {msg.role === 'assistant' && msg.id === streamingMessageId ? (
+                                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>{displayContent}</pre>
+                                ) : (
+                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayContent}</ReactMarkdown>
+                                )}
                             </div>
 
                             {/* Message Actions (Footer) */}
@@ -1123,7 +1178,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
                             <select
                                 value={analysisMode}
-                                onChange={(e) => setAnalysisMode(e.target.value as 'chat' | 'assistant')}
+                                onChange={(e) => setAnalysisMode(e.target.value as 'chat' | 'assistant' | 'temporary')}
                                 style={{
                                     padding: '4px 8px',
                                     borderRadius: '2px',
@@ -1135,6 +1190,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                             >
                                 <option value="chat">对话</option>
                                 <option value="assistant">助手</option>
+                                <option value="temporary">临时</option>
                             </select>
 
                             {!config?.configured && (
@@ -1167,6 +1223,23 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                             >
                                 ⚙︎
                             </Button>
+                            {isLoading && (
+                                <Button
+                                    onPress={handleStop}
+                                    isDisabled={isStopping}
+                                    style={{
+                                        background: '#ffe5e5',
+                                        color: '#c00',
+                                        border: '1px solid #f2b8b8',
+                                        borderRadius: '4px',
+                                        padding: '6px 10px',
+                                        fontSize: '12px',
+                                        cursor: isStopping ? 'wait' : 'pointer'
+                                    }}
+                                >
+                                    停止
+                                </Button>
+                            )}
                             <Button
                                 onPress={handleSend}
                                 isDisabled={isLoading || !config?.configured}
@@ -1275,6 +1348,13 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                     <label style={{ fontSize: '12px' }}>
                                         <input
                                             type="checkbox"
+                                            checked={!contextSettings.saveHistory}
+                                            onChange={(e) => persistSettings({ ...contextSettings, saveHistory: !e.target.checked })}
+                                        /> 临时对话不入库
+                                    </label>
+                                    <label style={{ fontSize: '12px' }}>
+                                        <input
+                                            type="checkbox"
                                             checked={contextSettings.chatUseDaily}
                                             onChange={(e) => persistSettings({ ...contextSettings, chatUseDaily: e.target.checked })}
                                         /> 对话模式使用日线
@@ -1360,29 +1440,29 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
                         {settingsTab === 'prompt' && (
                             <div style={{ borderTop: '1px solid #eee', paddingTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                                <div style={{ fontWeight: 600, fontSize: '12px' }}>System Prompt (per symbol)</div>
+                                <div style={{ fontWeight: 600, fontSize: '12px' }}>System Prompt Template</div>
                                 <label style={{ fontSize: '12px' }}>
-                                    Prompt List
+                                    Prompt Template
                                     <select
                                         value={selectedPromptId ? String(selectedPromptId) : ""}
                                         onChange={(e) => handlePromptSelect(e.target.value)}
                                         style={inputStyle}
                                     >
-                                        <option value="">(No prompt selected)</option>
+                                        <option value="">(No template selected)</option>
                                         {promptItems.map(item => (
                                             <option key={item.id} value={item.id}>
-                                                {item.name}{item.is_active ? " (active)" : ""}
+                                                {item.name}{item.id === activeTemplateId ? " · 当前" : ""}{item.is_builtin ? " · 内置" : ""}
                                             </option>
                                         ))}
                                     </select>
                                 </label>
 
                                 <label style={{ fontSize: '12px' }}>
-                                    Name
+                                    Template Name
                                     <input
                                         type="text"
                                         value={promptName}
-                                        onChange={(e) => setPromptName(e.target.value)}
+                                        readOnly
                                         style={inputStyle}
                                     />
                                 </label>
@@ -1392,18 +1472,13 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                     <textarea
                                         rows={6}
                                         value={promptText}
-                                        onChange={(e) => setPromptText(e.target.value)}
+                                        readOnly
                                         style={{ ...inputStyle, fontFamily: 'monospace' }}
                                     />
                                 </label>
-
-                                <label style={{ fontSize: '12px' }}>
-                                    <input
-                                        type="checkbox"
-                                        checked={promptSetActive}
-                                        onChange={(e) => setPromptSetActive(e.target.checked)}
-                                    /> 保存时设为当前激活
-                                </label>
+                                <div style={{ fontSize: '11px', color: '#666' }}>
+                                    模板修改会影响所有使用该模板的股票/币。
+                                </div>
 
                                 {promptError && (
                                     <div style={{ fontSize: '12px', color: '#c00' }}>{promptError}</div>
@@ -1411,31 +1486,11 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
                                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                                     <Button
-                                        onPress={handlePromptNew}
-                                        style={{ background: '#f3f3f3', border: '1px solid #ddd', padding: '6px 10px', borderRadius: '4px' }}
-                                    >
-                                        New
-                                    </Button>
-                                    <Button
-                                        onPress={handlePromptSave}
-                                        isDisabled={promptLoading}
-                                        style={{ background: '#007acc', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: '4px' }}
-                                    >
-                                        Save
-                                    </Button>
-                                    <Button
                                         onPress={handlePromptActivate}
                                         isDisabled={!selectedPromptId || promptLoading}
                                         style={{ background: '#f3f3f3', border: '1px solid #ddd', padding: '6px 10px', borderRadius: '4px' }}
                                     >
                                         Set Active
-                                    </Button>
-                                    <Button
-                                        onPress={handlePromptDelete}
-                                        isDisabled={!selectedPromptId || promptLoading}
-                                        style={{ background: '#fff3f3', border: '1px solid #e5bcbc', padding: '6px 10px', borderRadius: '4px' }}
-                                    >
-                                        Delete
                                     </Button>
                                 </div>
                             </div>

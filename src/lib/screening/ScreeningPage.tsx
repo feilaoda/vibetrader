@@ -32,6 +32,57 @@ export function ScreeningPage() {
     const [summary, setSummary] = useState<Record<string, number>>({});
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
+    const [deletingRunId, setDeletingRunId] = useState<number | null>(null);
+    const [symbolNames, setSymbolNames] = useState<Record<string, string>>({});
+    const appBaseUrl = (import.meta as unknown as { env: Record<string, string> }).env?.BASE_URL || "/";
+
+    const detectMarket = (symbol: string) => {
+        const upper = (symbol || "").toUpperCase();
+        if (upper.endsWith(".SZ") || upper.endsWith(".SH")) return "ashare";
+        if (upper.endsWith(".US")) return "us";
+        return "crypto";
+    };
+
+    const buildSymbolLink = (symbol: string) => {
+        const base = appBaseUrl.endsWith("/") ? appBaseUrl : `${appBaseUrl}/`;
+        const root = base || "/";
+        const market = detectMarket(symbol);
+        return `${root}?symbol=${encodeURIComponent(symbol)}&market=${market}`;
+    };
+
+    const resolveSymbolNames = (items: ScreeningResult[]) => {
+        const missing = items
+            .map(item => item.symbol)
+            .filter(symbol => symbol && !symbolNames[symbol]);
+        if (missing.length === 0) return;
+        const next = { ...symbolNames };
+        missing.forEach(symbol => {
+            const cached = localStorage.getItem(`stock_name_${symbol}`);
+            if (cached) {
+                next[symbol] = cached;
+            }
+        });
+        setSymbolNames(next);
+        const toFetch = missing.filter(symbol => !next[symbol] && detectMarket(symbol) !== "crypto");
+        if (toFetch.length === 0) return;
+        const limit = Math.min(50, toFetch.length);
+        toFetch.slice(0, limit).forEach(symbol => {
+            const params = new URLSearchParams({ q: symbol, limit: "1" });
+            fetch(`${API_BASE_URL}/api/symbols?${params.toString()}`)
+                .then(res => (res.ok ? res.json() : null))
+                .then(data => {
+                    const rows = Array.isArray(data?.data) ? data.data : [];
+                    const match = rows.find((row: { symbol?: string }) => row?.symbol === symbol) || rows[0];
+                    const name = match?.name || "";
+                    if (!name) return;
+                    localStorage.setItem(`stock_name_${symbol}`, name);
+                    setSymbolNames(prev => ({ ...prev, [symbol]: name }));
+                })
+                .catch(() => {
+                    // ignore
+                });
+        });
+    };
 
     const loadRuns = () => {
         fetch(`${API_BASE_URL}/api/screening/runs?limit=50`)
@@ -47,6 +98,31 @@ export function ScreeningPage() {
                 console.error(err);
                 setError("加载筛选任务失败");
             });
+    };
+
+    const deleteRun = (runId: number) => {
+        if (!window.confirm(`删除 Run #${runId} 吗？此操作会删除对应的全部筛选结果。`)) return;
+        setDeletingRunId(runId);
+        fetch(`${API_BASE_URL}/api/screening/runs/${runId}`, { method: "DELETE" })
+            .then(res => {
+                if (!res.ok) throw new Error("delete failed");
+                return res.json();
+            })
+            .then(() => {
+                const nextRuns = runs.filter(run => run.id !== runId);
+                setRuns(nextRuns);
+                if (selectedRun === runId) {
+                    const nextId = nextRuns.length > 0 ? nextRuns[0].id : null;
+                    setSelectedRun(nextId);
+                    setResults([]);
+                    setSummary({});
+                }
+            })
+            .catch(err => {
+                console.error(err);
+                setError("删除任务失败");
+            })
+            .finally(() => setDeletingRunId(null));
     };
 
     const loadSummary = (runId: number) => {
@@ -68,12 +144,31 @@ export function ScreeningPage() {
             .then(data => {
                 const items = Array.isArray(data?.data) ? data.data : [];
                 setResults(items);
+                resolveSymbolNames(items);
             })
             .catch(err => {
                 console.error(err);
                 setError("加载筛选结果失败");
             })
             .finally(() => setLoading(false));
+    };
+
+    const deleteFailedResults = (runId: number) => {
+        if (!window.confirm("只删除该任务中的 ERROR/NO_DATA/UNKNOWN 结果吗？")) return;
+        setError("");
+        fetch(`${API_BASE_URL}/api/screening/results?run_id=${runId}&actions=ERROR,NO_DATA,UNKNOWN`, { method: "DELETE" })
+            .then(res => {
+                if (!res.ok) throw new Error("delete failed");
+                return res.json();
+            })
+            .then(() => {
+                loadSummary(runId);
+                loadResults(runId, actionFilter);
+            })
+            .catch(err => {
+                console.error(err);
+                setError("删除失败结果失败");
+            });
     };
 
     useEffect(() => {
@@ -125,7 +220,26 @@ export function ScreeningPage() {
                                         cursor: "pointer"
                                     }}
                                 >
-                                    <div style={{ fontWeight: 600 }}>Run #{run.id}</div>
+                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
+                                        <div style={{ fontWeight: 600 }}>Run #{run.id}</div>
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                deleteRun(run.id);
+                                            }}
+                                            disabled={deletingRunId === run.id}
+                                            style={{
+                                                border: "none",
+                                                background: "transparent",
+                                                color: "#c00",
+                                                fontSize: "12px",
+                                                cursor: "pointer"
+                                            }}
+                                            title="删除该任务"
+                                        >
+                                            {deletingRunId === run.id ? "删除中..." : "删除"}
+                                        </button>
+                                    </div>
                                     <div style={{ color: "#666" }}>{run.universe} · {run.model_id}</div>
                                     <div style={{ color: "#999" }}>
                                         {run.processed ?? 0}/{run.total ?? 0} · {run.status}
@@ -148,6 +262,9 @@ export function ScreeningPage() {
                                     BUY: {summary.BUY || 0} / WATCH: {summary.WATCH || 0} / SKIP: {summary.SKIP || 0}
                                 </div>
                                 <div style={{ marginLeft: "auto", display: "flex", gap: "8px", alignItems: "center" }}>
+                                    <Button variant="secondary" onPress={() => selectedRun && deleteFailedResults(selectedRun)} isDisabled={!selectedRun}>
+                                        清理失败
+                                    </Button>
                                     <select
                                         value={actionFilter}
                                         onChange={(e) => setActionFilter(e.target.value)}
@@ -171,7 +288,7 @@ export function ScreeningPage() {
                         </div>
 
                         <div style={{ background: "#fff", border: "1px solid #e6e8ee", borderRadius: "10px", overflow: "hidden" }}>
-                            <div style={{ display: "grid", gridTemplateColumns: "140px 90px 90px 140px 1fr", padding: "10px 12px", background: "#f7f8fb", fontSize: "12px", color: "#666" }}>
+                            <div style={{ display: "grid", gridTemplateColumns: "200px 90px 90px 140px 1fr", padding: "10px 12px", background: "#f7f8fb", fontSize: "12px", color: "#666" }}>
                                 <div>Symbol</div>
                                 <div>Action</div>
                                 <div>Score</div>
@@ -181,8 +298,17 @@ export function ScreeningPage() {
                             {loading && <div style={{ padding: "12px", fontSize: "12px", color: "#666" }}>加载中...</div>}
                             {error && <div style={{ padding: "12px", fontSize: "12px", color: "#c00" }}>{error}</div>}
                             {!loading && filteredResults.map(item => (
-                                <div key={item.symbol} style={{ display: "grid", gridTemplateColumns: "140px 90px 90px 140px 1fr", padding: "10px 12px", borderTop: "1px solid #f0f0f0", fontSize: "12px" }}>
-                                    <div>{item.symbol}</div>
+                                <div key={item.symbol} style={{ display: "grid", gridTemplateColumns: "200px 90px 90px 140px 1fr", padding: "10px 12px", borderTop: "1px solid #f0f0f0", fontSize: "12px" }}>
+                                    <div>
+                                        <a
+                                            href={buildSymbolLink(item.symbol)}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            style={{ color: "#007acc", textDecoration: "none" }}
+                                        >
+                                            {item.symbol}{symbolNames[item.symbol] ? ` ${symbolNames[item.symbol]}` : ""}
+                                        </a>
+                                    </div>
                                     <div>{item.action}</div>
                                     <div>{item.score ?? 0}</div>
                                     <div style={{ color: "#666" }}>{item.model_id || selectedRunMeta?.model_id || "--"}</div>

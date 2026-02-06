@@ -1,5 +1,8 @@
-import duckdb
+import os
+import re
 from pathlib import Path
+from typing import Any, Iterable, List, Optional
+import pymysql
 from strategy_defaults import (
     DEFAULT_OBJECTIVES,
     DEFAULT_CONSTRAINTS,
@@ -11,41 +14,83 @@ import time
 from datetime import datetime
 from pydantic import BaseModel
 from config import LLM_MODEL
+from prompts import SYSTEM_PROMPT_TEMPLATES, DEFAULT_SYSTEM_PROMPT_NAME
 
 DB_PATH = str(Path(__file__).resolve().parent / "history.duckdb")
+DB_BACKEND = os.getenv("DB_BACKEND", "mysql").lower()
+MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306") or 3306)
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "vibetrader")
 
-SYSTEM_PROMPT_TEMPLATES = [
-    ("稳健型", """你是一位稳健型A股分析师，目标是控制回撤、提升胜率，优先保护本金。
-关注高质量蓝筹、低波动行业龙头或宽基ETF。以中期趋势与关键支撑阻力为主，交易频率低。
-当前分析的目标股票是: {symbol}。
 
-请遵循以下原则:
-1. 以风险控制优先，强调确认信号，不要追高。
-2. 关注趋势强弱、量价配合、支撑/阻力是否有效。
-3. 给出保守的仓位建议与风险提示。
-4. 输出结构化结论，便于快速阅读。
-"""),
-    ("中间型", """你是一位平衡型A股分析师，目标是在风险可控前提下追求稳定收益。
-兼顾趋势跟随与关键位博弈，允许适度试错但必须有止损逻辑。
-当前分析的目标股票是: {symbol}。
+def _normalize_query(sql: str) -> str:
+    if not sql:
+        return sql
+    text = re.sub(r"(?i)INSERT\\s+OR\\s+REPLACE", "REPLACE", sql)
+    text = text.replace("BEGIN TRANSACTION", "START TRANSACTION")
+    if "?" in text:
+        text = text.replace("?", "%s")
+    return text
 
-请遵循以下原则:
-1. 综合趋势强度、关键位与量价关系。
-2. 给出多情景判断（强势延续/震荡/转弱）。
-3. 结合风险控制给出中性仓位建议。
-4. 输出结构清晰、结论明确。
-"""),
-    ("激进型", """你是一位激进型A股分析师，目标是捕捉趋势加速与放量突破机会，接受更高波动。
-关注强势板块、趋势加速、龙头股与流动性好的ETF。
-当前分析的目标股票是: {symbol}。
 
-请遵循以下原则:
-1. 优先识别强势趋势与突破形态。
-2. 强调量能与关键位突破的有效性。
-3. 给出进攻性但明确的止损/风控提示。
-4. 输出简洁清晰，结论直接。
-"""),
-]
+class _MySQLResult:
+    def __init__(self, cursor):
+        self._rows: List[Any] = []
+        self._idx = 0
+        self._desc = cursor.description
+        self.lastrowid = cursor.lastrowid
+        self.rowcount = cursor.rowcount
+        if cursor.description:
+            self._rows = list(cursor.fetchall())
+
+    def fetchone(self):
+        if self._idx >= len(self._rows):
+            return None
+        row = self._rows[self._idx]
+        self._idx += 1
+        return row
+
+    def fetchall(self):
+        if self._idx == 0:
+            self._idx = len(self._rows)
+            return self._rows
+        rows = self._rows[self._idx:]
+        self._idx = len(self._rows)
+        return rows
+
+    def df(self):
+        try:
+            import pandas as pd
+        except Exception:
+            return None
+        if not self._desc:
+            return pd.DataFrame([])
+        columns = [d[0] for d in self._desc]
+        return pd.DataFrame(self._rows, columns=columns)
+
+
+class _MySQLConnection:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql: str, params: Optional[Iterable] = None):
+        cursor = self._conn.cursor()
+        cursor.execute(_normalize_query(sql), params or ())
+        result = _MySQLResult(cursor)
+        cursor.close()
+        return result
+
+    def executemany(self, sql: str, params: Iterable[Iterable]):
+        cursor = self._conn.cursor()
+        cursor.executemany(_normalize_query(sql), params)
+        result = _MySQLResult(cursor)
+        cursor.close()
+        return result
+
+    def close(self):
+        self._conn.close()
 
 class ChatMessage(BaseModel):
     id: int
@@ -56,219 +101,476 @@ class ChatMessage(BaseModel):
     model: str
     is_favorite: bool
 
-class SymbolPrompt(BaseModel):
+class PromptTemplate(BaseModel):
     id: int
-    symbol: str
     name: str
     prompt: str
-    is_active: bool
+    is_builtin: bool
     created_at: str | None = None
     updated_at: str | None = None
 
+class SymbolPromptSetting(BaseModel):
+    symbol: str
+    template_id: int | None = None
+    updated_at: str | None = None
+
 def get_connection():
-    conn = duckdb.connect(DB_PATH)
-    return conn
+    if DB_BACKEND == "duckdb":
+        import duckdb
+        return duckdb.connect(DB_PATH)
+    conn = pymysql.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        charset="utf8mb4",
+        autocommit=True
+    )
+    return _MySQLConnection(conn)
 
 def init_db():
     conn = get_connection()
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS seq_chat_id;
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_chat_id'),
-            symbol VARCHAR,
-            timestamp DOUBLE,
-            role VARCHAR,
-            content TEXT,
-            model VARCHAR,
-            is_favorite BOOLEAN DEFAULT FALSE
-        );
+    if DB_BACKEND == "duckdb":
+        conn.execute("""
+            CREATE SEQUENCE IF NOT EXISTS seq_chat_id;
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_chat_id'),
+                symbol VARCHAR,
+                timestamp DOUBLE,
+                role VARCHAR,
+                content TEXT,
+                model VARCHAR,
+                is_favorite BOOLEAN DEFAULT FALSE
+            );
 
-        CREATE SEQUENCE IF NOT EXISTS seq_action_id;
-        CREATE TABLE IF NOT EXISTS action_plans (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_action_id'),
-            symbol VARCHAR,
-            stock_name VARCHAR,
-            action VARCHAR, -- Buy, Sell, Watch
-            time_range VARCHAR,
-            description TEXT,
-            reasoning TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            original_response TEXT,
-            status VARCHAR DEFAULT 'pending', -- pending, completed
-            model VARCHAR
-        );
-    """)
+            CREATE SEQUENCE IF NOT EXISTS seq_action_id;
+            CREATE TABLE IF NOT EXISTS action_plans (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_action_id'),
+                symbol VARCHAR,
+                stock_name VARCHAR,
+                action VARCHAR, -- Buy, Sell, Watch
+                time_range VARCHAR,
+                description TEXT,
+                reasoning TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                original_response TEXT,
+                status VARCHAR DEFAULT 'pending', -- pending, completed
+                model VARCHAR
+            );
+        """)
 
-    # Paper Trading
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS seq_paper_strategy_id;
-        CREATE TABLE IF NOT EXISTS paper_strategies (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_paper_strategy_id'),
-            name VARCHAR,
-            type VARCHAR, -- manual | aggressive | conservative | custom
-            prompt TEXT,
-            is_ai BOOLEAN DEFAULT FALSE,
-            is_builtin BOOLEAN DEFAULT FALSE,
-            model_id VARCHAR,
-            run_interval_minutes INTEGER DEFAULT 1440,
-            auto_run_enabled BOOLEAN DEFAULT FALSE,
-            universe_type VARCHAR,
-            universe_symbols TEXT,
-            objectives_json TEXT,
-            constraints_json TEXT,
-            params_json TEXT,
-            optimization_json TEXT,
-            initial_capital DOUBLE DEFAULT 100000,
-            last_run_at TIMESTAMP,
-            last_optimized_at TIMESTAMP,
-            last_optimization_score DOUBLE,
-            last_optimization_summary TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+        # Paper Trading
+        conn.execute("""
+            CREATE SEQUENCE IF NOT EXISTS seq_paper_strategy_id;
+            CREATE TABLE IF NOT EXISTS paper_strategies (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_paper_strategy_id'),
+                name VARCHAR,
+                type VARCHAR, -- manual | aggressive | conservative | custom
+                prompt TEXT,
+                is_ai BOOLEAN DEFAULT FALSE,
+                is_builtin BOOLEAN DEFAULT FALSE,
+                model_id VARCHAR,
+                run_interval_minutes INTEGER DEFAULT 1440,
+                auto_run_enabled BOOLEAN DEFAULT FALSE,
+                universe_type VARCHAR,
+                universe_symbols TEXT,
+                objectives_json TEXT,
+                constraints_json TEXT,
+                params_json TEXT,
+                optimization_json TEXT,
+                initial_capital DOUBLE DEFAULT 100000,
+                last_run_at TIMESTAMP,
+                last_optimized_at TIMESTAMP,
+                last_optimization_score DOUBLE,
+                last_optimization_summary TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE SEQUENCE IF NOT EXISTS seq_paper_order_id;
-        CREATE TABLE IF NOT EXISTS paper_orders (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_paper_order_id'),
-            symbol VARCHAR,
-            side VARCHAR, -- 'BUY' or 'SELL'
-            price DOUBLE,
-            quantity INTEGER,
-            fee DOUBLE,
-            strategy_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        CREATE TABLE IF NOT EXISTS paper_positions (
-            symbol VARCHAR PRIMARY KEY,
-            quantity INTEGER,
-            avg_cost DOUBLE
-        );
+            CREATE SEQUENCE IF NOT EXISTS seq_paper_order_id;
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_paper_order_id'),
+                symbol VARCHAR,
+                side VARCHAR, -- 'BUY' or 'SELL'
+                price DOUBLE,
+                quantity INTEGER,
+                fee DOUBLE,
+                strategy_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                symbol VARCHAR PRIMARY KEY,
+                quantity INTEGER,
+                avg_cost DOUBLE
+            );
 
-        CREATE SEQUENCE IF NOT EXISTS seq_paper_run_id;
-        CREATE TABLE IF NOT EXISTS paper_strategy_runs (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_paper_run_id'),
-            strategy_id INTEGER,
-            status VARCHAR,
-            symbols TEXT,
-            symbol_count INTEGER,
-            action_count INTEGER,
-            model_id VARCHAR,
-            run_interval_minutes INTEGER,
-            details TEXT,
-            error TEXT,
-            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            finished_at TIMESTAMP
-        );
+            CREATE SEQUENCE IF NOT EXISTS seq_paper_run_id;
+            CREATE TABLE IF NOT EXISTS paper_strategy_runs (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_paper_run_id'),
+                strategy_id INTEGER,
+                status VARCHAR,
+                symbols TEXT,
+                symbol_count INTEGER,
+                action_count INTEGER,
+                model_id VARCHAR,
+                run_interval_minutes INTEGER,
+                details TEXT,
+                error TEXT,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP
+            );
 
-        CREATE TABLE IF NOT EXISTS symbol_fundamentals_daily (
-            symbol VARCHAR,
-            date VARCHAR,
-            market_cap DOUBLE,
-            float_market_cap DOUBLE,
-            pe_ttm DOUBLE,
-            pb DOUBLE,
-            source VARCHAR,
-            metrics_json TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY(symbol, date)
-        );
+            CREATE TABLE IF NOT EXISTS symbol_fundamentals_daily (
+                symbol VARCHAR,
+                date VARCHAR,
+                market_cap DOUBLE,
+                float_market_cap DOUBLE,
+                pe_ttm DOUBLE,
+                pb DOUBLE,
+                source VARCHAR,
+                metrics_json TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, date)
+            );
 
-        CREATE TABLE IF NOT EXISTS symbol_industry (
-            symbol VARCHAR PRIMARY KEY,
-            industry VARCHAR,
-            source VARCHAR,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS symbol_industry (
+                symbol VARCHAR PRIMARY KEY,
+                industry VARCHAR,
+                source VARCHAR,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE TABLE IF NOT EXISTS industry_profiles (
-            profile_id VARCHAR PRIMARY KEY,
-            name VARCHAR,
-            keywords_json TEXT,
-            config_json TEXT,
-            priority INTEGER DEFAULT 0,
-            enabled BOOLEAN DEFAULT TRUE,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS industry_profiles (
+                profile_id VARCHAR PRIMARY KEY,
+                name VARCHAR,
+                keywords_json TEXT,
+                config_json TEXT,
+                priority INTEGER DEFAULT 0,
+                enabled BOOLEAN DEFAULT TRUE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE TABLE IF NOT EXISTS symbol_profile_override (
-            symbol VARCHAR PRIMARY KEY,
-            profile_id VARCHAR,
-            source VARCHAR,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS symbol_profile_override (
+                symbol VARCHAR PRIMARY KEY,
+                profile_id VARCHAR,
+                source VARCHAR,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE TABLE IF NOT EXISTS symbol_industry_settings (
-            symbol VARCHAR PRIMARY KEY,
-            enabled BOOLEAN DEFAULT FALSE,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS symbol_industry_settings (
+                symbol VARCHAR PRIMARY KEY,
+                enabled BOOLEAN DEFAULT FALSE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE TABLE IF NOT EXISTS industry_indicator_cache (
-            indicator_key VARCHAR PRIMARY KEY,
-            payload_json TEXT,
-            source VARCHAR,
-            error TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS industry_indicator_cache (
+                indicator_key VARCHAR PRIMARY KEY,
+                payload_json TEXT,
+                source VARCHAR,
+                error TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE TABLE IF NOT EXISTS chat_memory (
-            symbol VARCHAR PRIMARY KEY,
-            summary TEXT,
-            last_message_id INTEGER,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS chat_memory (
+                symbol VARCHAR PRIMARY KEY,
+                summary TEXT,
+                last_message_id INTEGER,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE SEQUENCE IF NOT EXISTS seq_symbol_prompt_id;
-        CREATE TABLE IF NOT EXISTS symbol_prompts (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_symbol_prompt_id'),
-            symbol VARCHAR,
-            name VARCHAR,
-            prompt TEXT,
-            is_active BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE SEQUENCE IF NOT EXISTS seq_prompt_template_id;
+            CREATE TABLE IF NOT EXISTS prompt_templates (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_prompt_template_id'),
+                name VARCHAR,
+                prompt TEXT,
+                is_builtin BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE SEQUENCE IF NOT EXISTS seq_screening_run_id;
-        CREATE TABLE IF NOT EXISTS screening_runs (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_screening_run_id'),
-            status VARCHAR,
-            model_id VARCHAR,
-            universe VARCHAR,
-            params_json TEXT,
-            total INTEGER,
-            processed INTEGER DEFAULT 0,
-            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            finished_at TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS symbol_prompt_settings (
+                symbol VARCHAR PRIMARY KEY,
+                template_id INTEGER,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-        CREATE TABLE IF NOT EXISTS screening_results (
-            run_id INTEGER,
-            symbol VARCHAR,
-            action VARCHAR,
-            score DOUBLE,
-            reason TEXT,
-            model_id VARCHAR,
-            raw_json TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY(run_id, symbol)
-        );
-    """)
+            CREATE SEQUENCE IF NOT EXISTS seq_symbol_prompt_id;
+            CREATE TABLE IF NOT EXISTS symbol_prompts (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_symbol_prompt_id'),
+                symbol VARCHAR,
+                name VARCHAR,
+                prompt TEXT,
+                is_active BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE SEQUENCE IF NOT EXISTS seq_screening_run_id;
+            CREATE TABLE IF NOT EXISTS screening_runs (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_screening_run_id'),
+                status VARCHAR,
+                model_id VARCHAR,
+                universe VARCHAR,
+                params_json TEXT,
+                total INTEGER,
+                processed INTEGER DEFAULT 0,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS screening_results (
+                run_id INTEGER,
+                symbol VARCHAR,
+                action VARCHAR,
+                score DOUBLE,
+                reason TEXT,
+                model_id VARCHAR,
+                raw_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(run_id, symbol)
+            );
+        """)
+    else:
+        schema_statements = [
+            """
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                symbol VARCHAR(32),
+                timestamp DOUBLE,
+                role VARCHAR(32),
+                content TEXT,
+                model VARCHAR(64),
+                is_favorite BOOLEAN DEFAULT FALSE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS action_plans (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                symbol VARCHAR(32),
+                stock_name VARCHAR(128),
+                action VARCHAR(16),
+                time_range VARCHAR(32),
+                description TEXT,
+                reasoning TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                original_response TEXT,
+                status VARCHAR(32) DEFAULT 'pending',
+                model VARCHAR(64)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS paper_strategies (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                name VARCHAR(128),
+                type VARCHAR(32),
+                prompt TEXT,
+                is_ai BOOLEAN DEFAULT FALSE,
+                is_builtin BOOLEAN DEFAULT FALSE,
+                model_id VARCHAR(64),
+                run_interval_minutes INTEGER DEFAULT 1440,
+                auto_run_enabled BOOLEAN DEFAULT FALSE,
+                universe_type VARCHAR(32),
+                universe_symbols TEXT,
+                objectives_json TEXT,
+                constraints_json TEXT,
+                params_json TEXT,
+                optimization_json TEXT,
+                initial_capital DOUBLE DEFAULT 100000,
+                last_run_at TIMESTAMP NULL,
+                last_optimized_at TIMESTAMP NULL,
+                last_optimization_score DOUBLE,
+                last_optimization_summary TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                symbol VARCHAR(32),
+                side VARCHAR(8),
+                price DOUBLE,
+                quantity INTEGER,
+                fee DOUBLE,
+                strategy_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                strategy_id INTEGER,
+                symbol VARCHAR(32),
+                quantity INTEGER,
+                avg_cost DOUBLE,
+                PRIMARY KEY (strategy_id, symbol)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS paper_strategy_runs (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                strategy_id INTEGER,
+                status VARCHAR(32),
+                symbols TEXT,
+                symbol_count INTEGER,
+                action_count INTEGER,
+                model_id VARCHAR(64),
+                run_interval_minutes INTEGER,
+                details TEXT,
+                error TEXT,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS symbol_fundamentals_daily (
+                symbol VARCHAR(32),
+                date VARCHAR(10),
+                market_cap DOUBLE,
+                float_market_cap DOUBLE,
+                pe_ttm DOUBLE,
+                pb DOUBLE,
+                source VARCHAR(32),
+                metrics_json TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS symbol_industry (
+                symbol VARCHAR(32) PRIMARY KEY,
+                industry VARCHAR(128),
+                source VARCHAR(32),
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS industry_profiles (
+                profile_id VARCHAR(64) PRIMARY KEY,
+                name VARCHAR(128),
+                keywords_json TEXT,
+                config_json TEXT,
+                priority INTEGER DEFAULT 0,
+                enabled BOOLEAN DEFAULT TRUE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS symbol_profile_override (
+                symbol VARCHAR(32) PRIMARY KEY,
+                profile_id VARCHAR(64),
+                source VARCHAR(32),
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS symbol_industry_settings (
+                symbol VARCHAR(32) PRIMARY KEY,
+                enabled BOOLEAN DEFAULT FALSE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS industry_indicator_cache (
+                indicator_key VARCHAR(128) PRIMARY KEY,
+                payload_json TEXT,
+                source VARCHAR(32),
+                error TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_memory (
+                symbol VARCHAR(32) PRIMARY KEY,
+                summary TEXT,
+                last_message_id INTEGER,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS prompt_templates (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                name VARCHAR(128),
+                prompt TEXT,
+                is_builtin BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS symbol_prompt_settings (
+                symbol VARCHAR(32) PRIMARY KEY,
+                template_id INTEGER,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS symbol_prompts (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                symbol VARCHAR(32),
+                name VARCHAR(128),
+                prompt TEXT,
+                is_active BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS screening_runs (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                status VARCHAR(32),
+                model_id VARCHAR(64),
+                universe VARCHAR(32),
+                params_json TEXT,
+                total INTEGER,
+                processed INTEGER DEFAULT 0,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS screening_results (
+                run_id INTEGER,
+                symbol VARCHAR(32),
+                action VARCHAR(16),
+                score DOUBLE,
+                reason TEXT,
+                model_id VARCHAR(64),
+                raw_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(run_id, symbol)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+        ]
+        for stmt in schema_statements:
+            conn.execute(stmt)
 
     # Paper Trading - migration for strategy support
     def _col_exists(table: str, col: str) -> bool:
         try:
-            cols = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
-            return any(c[1] == col for c in cols)
+            if DB_BACKEND == "duckdb":
+                cols = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+                return any(c[1] == col for c in cols)
+            row = conn.execute(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+                (MYSQL_DATABASE, table, col)
+            ).fetchone()
+            return bool(row and row[0] > 0)
         except Exception:
             return False
 
     def _col_pk(table: str, col: str) -> int:
         try:
-            cols = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
-            for c in cols:
-                if c[1] == col:
-                    return int(c[5])
+            if DB_BACKEND == "duckdb":
+                cols = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+                for c in cols:
+                    if c[1] == col:
+                        return int(c[5])
+            row = conn.execute(
+                "SELECT COLUMN_KEY FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+                (MYSQL_DATABASE, table, col)
+            ).fetchone()
+            if row and row[0] == "PRI":
+                return 1
         except Exception:
             pass
         return 0
@@ -447,6 +749,13 @@ def init_db():
         except Exception:
             pass
 
+    # Ensure prompt templates are seeded, and migrate legacy per-symbol prompts if needed.
+    try:
+        ensure_prompt_templates()
+        migrate_symbol_prompts_to_templates()
+    except Exception as e:
+        print(f"[DB] prompt template init skipped: {e}")
+
     # Paper orders add strategy_id column if missing
     try:
         if not _col_exists("paper_orders", "strategy_id"):
@@ -578,7 +887,10 @@ def init_db():
                     SELECT ?, symbol, quantity, avg_cost FROM paper_positions
                 """, (manual_id,))
             conn.execute("DROP TABLE paper_positions")
-            conn.execute("ALTER TABLE paper_positions_v2 RENAME TO paper_positions")
+            if DB_BACKEND == "duckdb":
+                conn.execute("ALTER TABLE paper_positions_v2 RENAME TO paper_positions")
+            else:
+                conn.execute("RENAME TABLE paper_positions_v2 TO paper_positions")
     except Exception:
         pass
 
@@ -665,44 +977,86 @@ def init_db():
         pass
     
     # Symbols Table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS symbols (
-            symbol VARCHAR PRIMARY KEY,
-            code VARCHAR,
-            name VARCHAR,
-            market VARCHAR,
-            type VARCHAR, -- 'stock' or 'etf'
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
+    if DB_BACKEND == "duckdb":
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbols (
+                symbol VARCHAR PRIMARY KEY,
+                code VARCHAR,
+                name VARCHAR,
+                market VARCHAR,
+                type VARCHAR, -- 'stock' or 'etf'
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+    else:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbols (
+                symbol VARCHAR(32) PRIMARY KEY,
+                code VARCHAR(16),
+                name VARCHAR(128),
+                market VARCHAR(8),
+                type VARCHAR(16), -- 'stock' or 'etf'
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+    # Watchlist Table
+    if DB_BACKEND == "duckdb":
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                symbol VARCHAR,
+                market VARCHAR,
+                name VARCHAR,
+                added_at BIGINT,
+                sort_order INTEGER,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (symbol, market)
+            );
+        """)
+    else:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                symbol VARCHAR(32),
+                market VARCHAR(16),
+                name VARCHAR(128),
+                added_at BIGINT,
+                sort_order INT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (symbol, market)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
         
     conn.close()
 
 def save_symbols_db(df):
-    """Save symbols to DuckDB (Overwrite all)"""
+    """Save symbols to DB (Overwrite all)"""
     conn = get_connection()
     try:
         # It's faster to drop/create or just replace logic. 
         # But for simplicity, we can delete all and insert.
-        conn.execute("BEGIN TRANSACTION")
+        conn.execute("START TRANSACTION")
         conn.execute("DELETE FROM symbols")
-        
-        # Insert in bulk. Pandas to DuckDB is very fast.
-        # df should have cols: symbol, code, name, market, type
-        conn.register('df_view', df)
-        conn.execute("""
-            INSERT INTO symbols (symbol, code, name, market, type, updated_at)
-            SELECT symbol, code, name, 
-                   CASE 
-                       WHEN symbol LIKE '%.SH' THEN 'SH' 
-                       WHEN symbol LIKE '%.SZ' THEN 'SZ' 
-                       ELSE 'BJ' 
-                   END as market,
-                   'unknown' as type,
-                   CURRENT_TIMESTAMP
-            FROM df_view
-        """)
-        conn.unregister('df_view')
+
+        rows = []
+        for row in df.itertuples(index=False):
+            symbol = getattr(row, "symbol", "")
+            code = getattr(row, "code", "")
+            name = getattr(row, "name", "")
+            if symbol.endswith(".US"):
+                market = "US"
+            elif symbol.endswith(".SH"):
+                market = "SH"
+            elif symbol.endswith(".SZ"):
+                market = "SZ"
+            else:
+                market = "BJ"
+            sym_type = "index" if market == "US" else "unknown"
+            rows.append((symbol, code, name, market, sym_type))
+        if rows:
+            conn.executemany(
+                "INSERT INTO symbols (symbol, code, name, market, type, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                rows
+            )
         conn.execute("COMMIT")
         print(f"[DB] Saved {len(df)} symbols")
     except Exception as e:
@@ -713,7 +1067,7 @@ def save_symbols_db(df):
         conn.close()
 
 def get_symbols_db():
-    """Get all symbols from DuckDB"""
+    """Get all symbols from DB"""
     conn = get_connection()
     try:
         # Check if empty or old
@@ -727,7 +1081,7 @@ def get_symbols_db():
             return None
             
         # Check expiry (24h)
-        # DuckDB timestamp is datetime object
+        # DB timestamp is datetime object
         if (datetime.now() - ts).total_seconds() > 86400:
             print("[DB] Symbols expired")
             return None
@@ -744,14 +1098,12 @@ def add_message(symbol: str, role: str, content: str, model: str) -> int:
     conn = get_connection()
     timestamp = time.time()
     # Insert and return ID
-    conn.execute("""
+    res = conn.execute("""
         INSERT INTO chat_history (symbol, timestamp, role, content, model)
         VALUES (?, ?, ?, ?, ?)
     """, (symbol, timestamp, role, content, model))
-    
-    res = conn.execute("SELECT currval('seq_chat_id')").fetchone()
     conn.close()
-    return res[0] if res else -1
+    return res.lastrowid if hasattr(res, "lastrowid") and res.lastrowid else -1
 
 def get_history(symbol: str = None, limit: int = 50):
     conn = get_connection()
@@ -763,7 +1115,7 @@ def get_history(symbol: str = None, limit: int = 50):
         params.append(symbol)
     
     if limit:
-        query = f"SELECT * FROM ({base_query} ORDER BY timestamp DESC LIMIT {limit}) ORDER BY timestamp ASC"
+        query = f"SELECT * FROM ({base_query} ORDER BY timestamp DESC LIMIT {limit}) AS recent ORDER BY timestamp ASC"
     else:
         query = base_query + " ORDER BY timestamp ASC"
     
@@ -824,162 +1176,237 @@ def save_memory(symbol: str, summary: str, last_message_id: int):
     finally:
         conn.close()
 
-def ensure_symbol_prompts(symbol: str):
+def _normalize_template_name(conn, base_name: str) -> str:
+    name = (base_name or "").strip() or "Untitled"
+    existing = conn.execute(
+        "SELECT 1 FROM prompt_templates WHERE name = ? LIMIT 1",
+        (name,)
+    ).fetchone()
+    if not existing:
+        return name
+    idx = 2
+    while True:
+        candidate = f"{name} ({idx})"
+        row = conn.execute(
+            "SELECT 1 FROM prompt_templates WHERE name = ? LIMIT 1",
+            (candidate,)
+        ).fetchone()
+        if not row:
+            return candidate
+        idx += 1
+
+def ensure_prompt_templates():
     conn = get_connection()
     try:
-        sym = (symbol or "").upper()
-        if not sym:
-            return
-        count = conn.execute(
-            "SELECT COUNT(*) FROM symbol_prompts WHERE symbol = ?",
-            (sym,)
-        ).fetchone()[0]
-        if count and int(count) > 0:
-            return
-        active_id = None
         for name, prompt in SYSTEM_PROMPT_TEMPLATES:
             row = conn.execute(
-                "INSERT INTO symbol_prompts (symbol, name, prompt, is_active, updated_at) "
-                "VALUES (?, ?, ?, FALSE, CURRENT_TIMESTAMP) RETURNING id",
-                (sym, name, prompt)
+                "SELECT id FROM prompt_templates WHERE name = ? LIMIT 1",
+                (name,)
             ).fetchone()
-            if name == "中间型" and row:
-                active_id = int(row[0])
-        if active_id:
-            conn.execute("UPDATE symbol_prompts SET is_active = FALSE WHERE symbol = ?", (sym,))
+            if row:
+                continue
             conn.execute(
-                "UPDATE symbol_prompts SET is_active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (active_id,)
+                "INSERT INTO prompt_templates (name, prompt, is_builtin, updated_at) VALUES (?, ?, TRUE, CURRENT_TIMESTAMP)",
+                (name, prompt)
             )
     finally:
         conn.close()
 
-def list_symbol_prompts(symbol: str) -> list[dict]:
-    ensure_symbol_prompts(symbol)
+def migrate_symbol_prompts_to_templates():
+    """将旧的 per-symbol prompt（symbol_prompts）迁移为模板并绑定到 symbol。"""
     conn = get_connection()
     try:
-        sym = (symbol or "").upper()
+        # Only run if legacy table has data and new settings empty
+        try:
+            legacy_count = conn.execute("SELECT COUNT(*) FROM symbol_prompts").fetchone()[0]
+        except Exception:
+            legacy_count = 0
+        try:
+            settings_count = conn.execute("SELECT COUNT(*) FROM symbol_prompt_settings").fetchone()[0]
+        except Exception:
+            settings_count = 0
+        if not legacy_count or settings_count:
+            return
+
         rows = conn.execute(
-            "SELECT id, symbol, name, prompt, is_active, created_at, updated_at "
-            "FROM symbol_prompts WHERE symbol = ? ORDER BY id",
-            (sym,)
+            "SELECT symbol, name, prompt FROM symbol_prompts WHERE is_active = TRUE"
+        ).fetchall()
+        for symbol, name, prompt in rows:
+            if not prompt:
+                continue
+            # reuse existing template by exact prompt if possible
+            tmpl = conn.execute(
+                "SELECT id FROM prompt_templates WHERE prompt = ? LIMIT 1",
+                (prompt,)
+            ).fetchone()
+            if tmpl:
+                template_id = tmpl[0]
+            else:
+                tmpl_name = _normalize_template_name(conn, f"{name} - {symbol}")
+                res = conn.execute(
+                    "INSERT INTO prompt_templates (name, prompt, is_builtin, updated_at) VALUES (?, ?, FALSE, CURRENT_TIMESTAMP)",
+                    (tmpl_name, prompt)
+                )
+                template_id = int(res.lastrowid) if hasattr(res, "lastrowid") and res.lastrowid else None
+            if template_id:
+                conn.execute("DELETE FROM symbol_prompt_settings WHERE symbol = ?", (symbol,))
+                conn.execute(
+                    "INSERT INTO symbol_prompt_settings (symbol, template_id, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (symbol, template_id)
+                )
+    finally:
+        conn.close()
+
+def list_prompt_templates() -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, name, prompt, is_builtin, created_at, updated_at FROM prompt_templates ORDER BY id"
         ).fetchall()
         return [
             {
                 "id": r[0],
-                "symbol": r[1],
-                "name": r[2],
-                "prompt": r[3],
-                "is_active": bool(r[4]),
-                "created_at": r[5],
-                "updated_at": r[6],
+                "name": r[1],
+                "prompt": r[2],
+                "is_builtin": bool(r[3]),
+                "created_at": r[4],
+                "updated_at": r[5],
             }
             for r in rows
         ]
     finally:
         conn.close()
 
-def get_active_system_prompt(symbol: str) -> dict | None:
-    ensure_symbol_prompts(symbol)
+def get_prompt_template_by_name(name: str) -> dict | None:
     conn = get_connection()
     try:
-        sym = (symbol or "").upper()
         row = conn.execute(
-            "SELECT id, symbol, name, prompt FROM symbol_prompts WHERE symbol = ? AND is_active = TRUE",
-            (sym,)
+            "SELECT id, name, prompt, is_builtin FROM prompt_templates WHERE name = ? LIMIT 1",
+            ((name or "").strip(),)
         ).fetchone()
         if not row:
             return None
-        return {"id": row[0], "symbol": row[1], "name": row[2], "prompt": row[3]}
+        return {"id": row[0], "name": row[1], "prompt": row[2], "is_builtin": bool(row[3])}
     finally:
         conn.close()
 
-def create_symbol_prompt(symbol: str, name: str, prompt: str, set_active: bool = False) -> dict:
+def get_prompt_template_by_id(template_id: int) -> dict | None:
     conn = get_connection()
     try:
-        sym = (symbol or "").upper()
-        title = (name or "").strip() or "Untitled"
+        row = conn.execute(
+            "SELECT id, name, prompt, is_builtin FROM prompt_templates WHERE id = ?",
+            (int(template_id),)
+        ).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "name": row[1], "prompt": row[2], "is_builtin": bool(row[3])}
+    finally:
+        conn.close()
+
+def create_prompt_template(name: str, prompt: str, is_builtin: bool = False) -> dict:
+    conn = get_connection()
+    try:
         text = (prompt or "").strip()
         if not text:
             raise ValueError("prompt required")
-        row = conn.execute(
-            "INSERT INTO symbol_prompts (symbol, name, prompt, is_active, updated_at) "
-            "VALUES (?, ?, ?, FALSE, CURRENT_TIMESTAMP) RETURNING id",
-            (sym, title, text)
-        ).fetchone()
-        prompt_id = int(row[0]) if row else None
-        if set_active and prompt_id:
-            set_active_symbol_prompt(prompt_id)
-        else:
-            active = conn.execute(
-                "SELECT 1 FROM symbol_prompts WHERE symbol = ? AND is_active = TRUE LIMIT 1",
-                (sym,)
-            ).fetchone()
-            if not active and prompt_id:
-                set_active_symbol_prompt(prompt_id)
-        return {"id": prompt_id}
+        title = _normalize_template_name(conn, name)
+        res = conn.execute(
+            "INSERT INTO prompt_templates (name, prompt, is_builtin, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (title, text, bool(is_builtin))
+        )
+        return {"id": int(res.lastrowid) if hasattr(res, "lastrowid") and res.lastrowid else None}
     finally:
         conn.close()
 
-def update_symbol_prompt(prompt_id: int, name: str | None = None, prompt: str | None = None, set_active: bool | None = None) -> bool:
+def update_prompt_template(template_id: int, name: str | None = None, prompt: str | None = None) -> bool:
     conn = get_connection()
     try:
         updates = []
         params: list = []
         if name is not None:
+            raw_name = (name or "").strip() or "Untitled"
+            row = conn.execute(
+                "SELECT id FROM prompt_templates WHERE name = ? LIMIT 1",
+                (raw_name,)
+            ).fetchone()
+            if row and int(row[0]) != int(template_id):
+                raw_name = _normalize_template_name(conn, raw_name)
             updates.append("name = ?")
-            params.append((name or "").strip() or "Untitled")
+            params.append(raw_name)
         if prompt is not None:
             updates.append("prompt = ?")
             params.append((prompt or "").strip())
-        if updates:
-            updates.append("updated_at = CURRENT_TIMESTAMP")
-            params.append(prompt_id)
-            conn.execute(
-                f"UPDATE symbol_prompts SET {', '.join(updates)} WHERE id = ?",
-                params
-            )
-        if set_active is True:
-            set_active_symbol_prompt(prompt_id)
-        elif set_active is False:
-            conn.execute("UPDATE symbol_prompts SET is_active = FALSE WHERE id = ?", (prompt_id,))
-        return True
-    finally:
-        conn.close()
-
-def set_active_symbol_prompt(prompt_id: int) -> bool:
-    conn = get_connection()
-    try:
-        row = conn.execute("SELECT symbol FROM symbol_prompts WHERE id = ?", (prompt_id,)).fetchone()
-        if not row:
-            return False
-        symbol = row[0]
-        conn.execute("UPDATE symbol_prompts SET is_active = FALSE WHERE symbol = ?", (symbol,))
+        if not updates:
+            return True
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(int(template_id))
         conn.execute(
-            "UPDATE symbol_prompts SET is_active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (prompt_id,)
+            f"UPDATE prompt_templates SET {', '.join(updates)} WHERE id = ?",
+            params
         )
         return True
     finally:
         conn.close()
 
-def delete_symbol_prompt(prompt_id: int) -> bool:
+def delete_prompt_template(template_id: int) -> bool:
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM symbol_prompts WHERE id = ?", (prompt_id,))
+        conn.execute("DELETE FROM symbol_prompt_settings WHERE template_id = ?", (int(template_id),))
+        conn.execute("DELETE FROM prompt_templates WHERE id = ?", (int(template_id),))
         return True
     finally:
         conn.close()
+
+def set_symbol_prompt_template(symbol: str, template_id: int | None) -> bool:
+    conn = get_connection()
+    try:
+        sym = (symbol or "").upper()
+        if not sym:
+            return False
+        if template_id is None:
+            conn.execute("DELETE FROM symbol_prompt_settings WHERE symbol = ?", (sym,))
+            return True
+        conn.execute("DELETE FROM symbol_prompt_settings WHERE symbol = ?", (sym,))
+        conn.execute(
+            "INSERT INTO symbol_prompt_settings (symbol, template_id, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (sym, int(template_id))
+        )
+        return True
+    finally:
+        conn.close()
+
+def get_symbol_prompt_template(symbol: str) -> dict | None:
+    conn = get_connection()
+    try:
+        sym = (symbol or "").upper()
+        row = conn.execute(
+            "SELECT t.id, t.name, t.prompt, t.is_builtin "
+            "FROM symbol_prompt_settings s JOIN prompt_templates t ON s.template_id = t.id "
+            "WHERE s.symbol = ? LIMIT 1",
+            (sym,)
+        ).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "name": row[1], "prompt": row[2], "is_builtin": bool(row[3])}
+    finally:
+        conn.close()
+
+def get_active_system_prompt(symbol: str) -> dict | None:
+    templ = get_symbol_prompt_template(symbol)
+    if templ:
+        return templ
+    default = get_prompt_template_by_name(DEFAULT_SYSTEM_PROMPT_NAME)
+    return default
 
 
 def create_screening_run(model_id: str, universe: str, params: dict, total: int) -> int:
     conn = get_connection()
     try:
-        row = conn.execute(
-            "INSERT INTO screening_runs (status, model_id, universe, params_json, total, processed) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        res = conn.execute(
+            "INSERT INTO screening_runs (status, model_id, universe, params_json, total, processed) VALUES (?, ?, ?, ?, ?, ?)",
             ("running", model_id, universe, dumps_config(params or {}, {}), int(total), 0)
-        ).fetchone()
-        return int(row[0]) if row else 0
+        )
+        return int(res.lastrowid) if hasattr(res, "lastrowid") and res.lastrowid else 0
     finally:
         conn.close()
 
@@ -1003,7 +1430,7 @@ def add_screening_result(run_id: int, symbol: str, action: str, score: float, re
     conn = get_connection()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO screening_results (run_id, symbol, action, score, reason, model_id, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "REPLACE INTO screening_results (run_id, symbol, action, score, reason, model_id, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (int(run_id), symbol, action, float(score or 0), reason or "", model_id or "", dumps_config(raw_json or {}, {}))
         )
     finally:
@@ -1106,6 +1533,23 @@ def list_screening_results(run_id: int, action: str = None, limit: int = 200, of
         conn.close()
 
 
+def delete_screening_results(run_id: int, actions: list[str] | None = None) -> int:
+    conn = get_connection()
+    try:
+        if actions:
+            placeholders = ", ".join(["?"] * len(actions))
+            params = [int(run_id), *actions]
+            res = conn.execute(
+                f"DELETE FROM screening_results WHERE run_id = ? AND action IN ({placeholders})",
+                params
+            )
+        else:
+            res = conn.execute("DELETE FROM screening_results WHERE run_id = ?", (int(run_id),))
+        return int(res.rowcount) if hasattr(res, "rowcount") and res.rowcount is not None else 0
+    finally:
+        conn.close()
+
+
 def list_screening_result_symbols(run_id: int):
     conn = get_connection()
     try:
@@ -1139,6 +1583,16 @@ def get_latest_screening_run():
         if row:
             return int(row[0])
         return None
+    finally:
+        conn.close()
+
+
+def delete_screening_run(run_id: int) -> bool:
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM screening_results WHERE run_id = ?", (int(run_id),))
+        conn.execute("DELETE FROM screening_runs WHERE id = ?", (int(run_id),))
+        return True
     finally:
         conn.close()
 

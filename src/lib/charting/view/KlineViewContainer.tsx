@@ -190,7 +190,10 @@ class KlineViewContainer extends Component<Props, State> {
 
         // Init base series and kvar immediately so they are available for initial render
         const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-        this.tzone = getMarket() === 'ashare' ? 'Asia/Shanghai' : localTz;
+        const market = getMarket();
+        this.tzone = market === 'ashare'
+            ? 'Asia/Shanghai'
+            : (market === 'us' ? 'America/New_York' : localTz);
         // Default to a safe fallback symbol/timeframe until data loads
         this.tframe = TFrame.DAILY;
         this.symbol = 'AAPL'; // Default symbol, will be updated in componentDidMount
@@ -693,13 +696,26 @@ class KlineViewContainer extends Component<Props, State> {
             })
             .then(async () => {
                 // 根据市场类型设置默认 symbol
-                const { getMarket } = await import("../../domain/DataFecther");
+                const { getMarket, setMarket } = await import("../../domain/DataFecther");
                 const { getDefaultSymbol } = await import("../../domain/Watchlist");
+                const params = new URLSearchParams(window.location.search);
+                const urlMarket = params.get("market");
+                if (urlMarket === "ashare" || urlMarket === "crypto" || urlMarket === "us") {
+                    setMarket(urlMarket);
+                }
                 const market = getMarket();
+                const marketKey = `last_selected_symbol_${market}`;
+                const urlSymbol = params.get("symbol")?.toUpperCase() || undefined;
+                if (urlSymbol) {
+                    sessionStorage.setItem(marketKey, urlSymbol);
+                }
 
                 // Restore last selected symbol from sessionStorage to avoid cross-tab interference.
-                // If provided via props, use that. Otherwise use sessionStorage, then localStorage as fallback.
-                const lastSymbol = this.props.symbol
+                // Use market-specific key first, then legacy key as fallback.
+                const lastSymbol = urlSymbol
+                    || this.props.symbol
+                    || sessionStorage.getItem(marketKey)
+                    || localStorage.getItem(marketKey)
                     || sessionStorage.getItem('last_selected_symbol')
                     || localStorage.getItem('last_selected_symbol');
                 this.symbol = lastSymbol || getDefaultSymbol(market);
@@ -1258,6 +1274,10 @@ class KlineViewContainer extends Component<Props, State> {
         this.lastRealtimeAt = 0;
 
         this.symbol = symbol;
+        const market = getMarket();
+        const marketKey = `last_selected_symbol_${market}`;
+        sessionStorage.setItem(marketKey, symbol);
+        localStorage.setItem(marketKey, symbol);
         sessionStorage.setItem('last_selected_symbol', symbol);
         localStorage.setItem('last_selected_symbol', symbol);
 
@@ -1280,7 +1300,9 @@ class KlineViewContainer extends Component<Props, State> {
 
         // Update timezone based on market before rebuilding series
         const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-        this.tzone = getMarket() === 'ashare' ? 'Asia/Shanghai' : localTz;
+        this.tzone = market === 'ashare'
+            ? 'Asia/Shanghai'
+            : (market === 'us' ? 'America/New_York' : localTz);
 
         // Re-create baseSer with new timeframe to clear old data
         this.baseSer = new DefaultTSer(this.tframe, this.tzone, 365);
@@ -1561,6 +1583,19 @@ class KlineViewContainer extends Component<Props, State> {
                             </ActionButton>
                             <Tooltip>
                                 Sync Watchlist Daily
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={() => {
+                                const baseUrl = import.meta.env.BASE_URL;
+                                const target = baseUrl.endsWith('/') ? `${baseUrl}watchlist` : `${baseUrl}/watchlist`;
+                                window.open(target, '_blank');
+                            }} >
+                                <MenuHamburger />
+                            </ActionButton>
+                            <Tooltip>
+                                Watchlist Sort
                             </Tooltip>
                         </TooltipTrigger>
 

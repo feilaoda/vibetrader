@@ -1,9 +1,11 @@
 
 const MAX_LIMIT = 1000; // Binance API max limit per request
 
-const BINANCE_API_URL_DEFAULT = 'https://api.binance.com/api/v3';
-const BINANCE_API_URL_US = 'https://api.binance.us/api/v3';
-const BINANCE_API_URL = BINANCE_API_URL_US
+const BINANCE_API_URL_DEFAULT = '/binance/api/v3';
+const BINANCE_API_URL_US = '/binance-us/api/v3';
+const BINANCE_PRIMARY = (import.meta.env.VITE_BINANCE_PRIMARY || 'us').toLowerCase() === 'com'
+    ? BINANCE_API_URL_DEFAULT
+    : BINANCE_API_URL_US;
 
 interface Kline {
     openTime: number;
@@ -60,29 +62,27 @@ export async function fetchKlinesBatch(
     limit: number = MAX_LIMIT
 ): Promise<Kline[]> {
     interval = timeframe_to_binance[interval] || interval
+    const query = `/klines?symbol=${symbol}&interval=${interval}&startTime=${startTime}&endTime=${endTime}&limit=${limit}`;
 
-    const url = `${BINANCE_API_URL}/klines?symbol=${symbol}&interval=${interval}&startTime=${startTime}&endTime=${endTime}&limit=${limit}`;
+    const data = await fetchBinanceJson<unknown[][]>(query);
+    if (!data) {
+        return [];
+    }
 
-    // console.log(`Fetching batch: ${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}`);
-
-    return fetch(url)
-        .then(r => r.json())
-        .then(data =>
-            data.map((item: unknown[]) => ({
-                openTime: item[0],
-                open: parseFloat(item[1] as string),
-                high: parseFloat(item[2] as string),
-                low: parseFloat(item[3] as string),
-                close: parseFloat(item[4] as string),
-                volume: parseFloat(item[5] as string),
-                closeTime: item[6],
-                quoteAssetVolume: parseFloat(item[7] as string),
-                numberOfTrades: parseInt(item[8] as string),
-                takerBuyBaseAssetVolume: parseFloat(item[9] as string),
-                takerBuyQuoteAssetVolume: parseFloat(item[10] as string),
-                ignore: item[11],
-            })))
-        .catch(e => console.error(`Error fetching klines batch:`, e));
+    return data.map((item: unknown[]) => ({
+        openTime: item[0],
+        open: parseFloat(item[1] as string),
+        high: parseFloat(item[2] as string),
+        low: parseFloat(item[3] as string),
+        close: parseFloat(item[4] as string),
+        volume: parseFloat(item[5] as string),
+        closeTime: item[6],
+        quoteAssetVolume: parseFloat(item[7] as string),
+        numberOfTrades: parseInt(item[8] as string),
+        takerBuyBaseAssetVolume: parseFloat(item[9] as string),
+        takerBuyQuoteAssetVolume: parseFloat(item[10] as string),
+        ignore: item[11],
+    }));
 }
 
 
@@ -138,49 +138,42 @@ export async function fetchAllKlines(
     return allKlines;
 }
 
-let activeApiUrl: string | null = null; // Persist the working endpoint
+let activeApiUrl: string | null = BINANCE_PRIMARY; // Persist the working endpoint
 
-/**
-  * Resolves the working Binance API endpoint.
-  * Tries default first, then falls back to US endpoint.
-  * Caches the working endpoint for future calls.
-  */
-async function getBaseUrl(): Promise<string> {
-    if (activeApiUrl) {
-        return activeApiUrl;
-    }
+const resolvePrimaryUrl = () => activeApiUrl ?? BINANCE_PRIMARY;
+const resolveFallbackUrl = (primary: string) =>
+    primary === BINANCE_API_URL_DEFAULT ? BINANCE_API_URL_US : BINANCE_API_URL_DEFAULT;
 
-    // Try default endpoint
-    try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout
-        const response = await fetch(`${BINANCE_API_URL_DEFAULT}/ping`, { signal: controller.signal });
-        clearTimeout(timeoutId);
-        if (response.ok) {
-            activeApiUrl = BINANCE_API_URL_DEFAULT;
-            return activeApiUrl;
+async function fetchBinanceJson<T>(path: string, init?: RequestInit): Promise<T | null> {
+    const primary = resolvePrimaryUrl();
+    const fallback = resolveFallbackUrl(primary);
+
+    const tryFetch = async (base: string): Promise<Response | null> => {
+        try {
+            const response = await fetch(`${base}${path}`, init);
+            if (response.ok) {
+                activeApiUrl = base;
+            }
+            return response;
+        } catch (e) {
+            return null;
         }
-    } catch (e) {
-        // Default failed, try US endpoint
-        // console.warn('Binance default API unreachable, trying US endpoint...');
+    };
+
+    let response = await tryFetch(primary);
+    if (!response || !response.ok) {
+        response = await tryFetch(fallback);
     }
 
-    // Try US endpoint
+    if (!response || !response.ok) {
+        return null;
+    }
+
     try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000);
-        const response = await fetch(`${BINANCE_API_URL_US}/ping`, { signal: controller.signal });
-        clearTimeout(timeoutId);
-        if (response.ok) {
-            this.activeApiUrl = BINANCE_API_URL_US;
-            return this.activeApiUrl;
-        }
-    } catch (e) {
-        // Both failed
+        return (await response.json()) as T;
+    } catch {
+        return null;
     }
-
-    // Fallback to default if check fails entirely (let actual request fail)
-    return BINANCE_API_URL_DEFAULT;
 }
 
 
@@ -196,22 +189,12 @@ let symbolLoaded = false
 let symbols: { symbol: string }[]
 export async function fetchSymbolList(filterText: string, init: RequestInit): Promise<{ symbol: string }[]> {
     if (!symbolLoaded) {
-        const baseUrl = await getBaseUrl();
-        const url = `${baseUrl}/exchangeInfo`;
-
-        return fetch(url, init)
-            .then(r => r.json())
-            .then(data => {
-                symbols = data.symbols.filter(({ status }) => status === 'TRADING')
-
-                symbolLoaded = true;
-
-                return defaultSymbols
-            })
-            .catch(e => {
-                console.error(`Error fetching klines batch:`, e)
-                return defaultSymbols
-            });
+        const data = await fetchBinanceJson<{ symbols: { symbol: string; status: string }[] }>(`/exchangeInfo`, init);
+        if (data && Array.isArray(data.symbols)) {
+            symbols = data.symbols.filter(({ status }) => status === 'TRADING');
+            symbolLoaded = true;
+        }
+        return defaultSymbols;
 
     } else {
         if (filterText) {
@@ -230,4 +213,3 @@ export async function fetchSymbolList(filterText: string, init: RequestInit): Pr
         }
     }
 }
-

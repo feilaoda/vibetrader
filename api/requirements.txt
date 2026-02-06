@@ -4,4 +4,5 @@ akshare>=1.12.0
 openai>=1.0.0
 pandas>=2.0.0
 python-dotenv>=1.0.0
+pymysql>=1.1.0
 duckdb>=0.9.0

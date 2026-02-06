@@ -9,7 +9,7 @@ const API_BASE_URL = (import.meta as unknown as { env: Record<string, string> })
 export interface WatchlistItem {
     symbol: string;
     name?: string;
-    market: 'ashare' | 'crypto';
+    market: 'ashare' | 'crypto' | 'us';
     addedAt: number;
 }
 
@@ -57,7 +57,7 @@ export function getWatchlist(): WatchlistItem[] {
 /**
  * 添加到自选股
  */
-export function addToWatchlist(symbol: string, market: 'ashare' | 'crypto', name?: string): WatchlistItem[] {
+export function addToWatchlist(symbol: string, market: 'ashare' | 'crypto' | 'us', name?: string): WatchlistItem[] {
     // 检查是否已存在
     if (memoryList.some(item => item.symbol === symbol && item.market === market)) {
         return [...memoryList];
@@ -81,6 +81,14 @@ export function addToWatchlist(symbol: string, market: 'ashare' | 'crypto', name
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newItem)
+    }).then(async (res) => {
+        if (!res.ok) return;
+        const json = await res.json();
+        if (json?.data && Array.isArray(json.data)) {
+            memoryList = json.data;
+            saveWatchlist(memoryList);
+            window.dispatchEvent(new Event('watchlist-updated'));
+        }
     }).catch(e => console.error('Failed to sync add to server:', e));
 
     return [...memoryList];
@@ -89,7 +97,7 @@ export function addToWatchlist(symbol: string, market: 'ashare' | 'crypto', name
 /**
  * 从自选股移除
  */
-export function removeFromWatchlist(symbol: string, market: 'ashare' | 'crypto'): WatchlistItem[] {
+export function removeFromWatchlist(symbol: string, market: 'ashare' | 'crypto' | 'us'): WatchlistItem[] {
     memoryList = memoryList.filter(item => !(item.symbol === symbol && item.market === market));
     saveWatchlist(memoryList);
 
@@ -107,14 +115,14 @@ export function removeFromWatchlist(symbol: string, market: 'ashare' | 'crypto')
 /**
  * 检查是否在自选股中
  */
-export function isInWatchlist(symbol: string, market: 'ashare' | 'crypto'): boolean {
+export function isInWatchlist(symbol: string, market: 'ashare' | 'crypto' | 'us'): boolean {
     return memoryList.some(item => item.symbol === symbol && item.market === market);
 }
 
 /**
  * 切换自选状态
  */
-export function toggleWatchlist(symbol: string, market: 'ashare' | 'crypto', name?: string): boolean {
+export function toggleWatchlist(symbol: string, market: 'ashare' | 'crypto' | 'us', name?: string): boolean {
     if (isInWatchlist(symbol, market)) {
         removeFromWatchlist(symbol, market);
         return false;
@@ -127,7 +135,7 @@ export function toggleWatchlist(symbol: string, market: 'ashare' | 'crypto', nam
 /**
  * 获取指定市场的自选股
  */
-export function getWatchlistByMarket(market: 'ashare' | 'crypto'): WatchlistItem[] {
+export function getWatchlistByMarket(market: 'ashare' | 'crypto' | 'us'): WatchlistItem[] {
     return memoryList.filter(item => item.market === market);
 }
 
@@ -148,7 +156,27 @@ function saveWatchlist(list: WatchlistItem[]): void {
 /**
  * 移动自选股顺序
  */
-export function moveWatchlistItem(symbol: string, market: 'ashare' | 'crypto', direction: 'up' | 'down' | 'top'): WatchlistItem[] {
+function applyWatchlistOrder(newList: WatchlistItem[]): WatchlistItem[] {
+    if (newList.length === memoryList.length && newList.every((item, idx) => item === memoryList[idx])) {
+        return [...memoryList];
+    }
+    memoryList = newList;
+    saveWatchlist(memoryList);
+
+    // 触发更新事件
+    window.dispatchEvent(new Event('watchlist-updated'));
+
+    // 异步同步到服务端 (覆盖更新)
+    fetch(`${API_BASE_URL}/api/watchlist/sync`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newList)
+    }).catch(e => console.error('Failed to sync order to server:', e));
+
+    return [...memoryList];
+}
+
+export function moveWatchlistItem(symbol: string, market: 'ashare' | 'crypto' | 'us', direction: 'up' | 'down' | 'top'): WatchlistItem[] {
     const index = memoryList.findIndex(item => item.symbol === symbol && item.market === market);
     if (index === -1) return [...memoryList];
 
@@ -168,30 +196,57 @@ export function moveWatchlistItem(symbol: string, market: 'ashare' | 'crypto', d
         return [...memoryList];
     }
 
-    memoryList = newList;
-    saveWatchlist(memoryList);
+    return applyWatchlistOrder(newList);
+}
 
-    // 触发更新事件
-    window.dispatchEvent(new Event('watchlist-updated'));
+/**
+ * 在指定市场内移动自选股顺序（不影响其它市场的相对位置）
+ */
+export function moveWatchlistItemInMarket(
+    symbol: string,
+    market: 'ashare' | 'crypto' | 'us',
+    direction: 'up' | 'down' | 'top'
+): WatchlistItem[] {
+    const index = memoryList.findIndex(item => item.symbol === symbol && item.market === market);
+    if (index === -1) return [...memoryList];
 
-    // 异步同步到服务端 (覆盖更新)
-    fetch(`${API_BASE_URL}/api/watchlist/sync`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newList)
-    }).catch(e => console.error('Failed to sync order to server:', e));
+    const marketIndices = memoryList
+        .map((item, idx) => (item.market === market ? idx : -1))
+        .filter(idx => idx >= 0);
+    const position = marketIndices.indexOf(index);
+    if (position === -1) return [...memoryList];
 
-    return [...memoryList];
+    let targetIndex: number | null = null;
+    if (direction === 'top') {
+        if (position === 0) return [...memoryList];
+        targetIndex = marketIndices[0];
+    } else if (direction === 'up') {
+        if (position === 0) return [...memoryList];
+        targetIndex = marketIndices[position - 1];
+    } else if (direction === 'down') {
+        if (position >= marketIndices.length - 1) return [...memoryList];
+        targetIndex = marketIndices[position + 1];
+    }
+
+    if (targetIndex == null) return [...memoryList];
+
+    const newList = [...memoryList];
+    const temp = newList[targetIndex];
+    newList[targetIndex] = newList[index];
+    newList[index] = temp;
+
+    return applyWatchlistOrder(newList);
 }
 
 /**
  * 获取默认 symbol（优先自选股第一个，否则返回默认）
  */
-export function getDefaultSymbol(market: 'ashare' | 'crypto'): string {
+export function getDefaultSymbol(market: 'ashare' | 'crypto' | 'us'): string {
     const list = getWatchlistByMarket(market);
     if (list.length > 0) {
         return list[0].symbol;
     }
-    return market === 'ashare' ? '600519.SH' : 'BTCUSDT';
+    if (market === 'ashare') return '600519.SH';
+    if (market === 'us') return 'SPX.US';
+    return 'BTCUSDT';
 }
-

@@ -46,7 +46,7 @@ Toward an Open Source AI-Friendly Trading Platform
 See `docs/industry.md` for:
 - Template config format
 - Supported indicator types
-- Cache behavior (global DuckDB cache)
+- Cache behavior (global DB cache)
 - API endpoints
 
 ## Build

@@ -52,7 +52,9 @@ export const ActionWatchlist: React.FC<ActionWatchlistProps> = ({ selectedSymbol
                         <div className="item-content" style={{ flex: 1 }}>
                             <div className="symbol">{item.symbol}</div>
                             <div className="name">
-                                {item.name} <span className="market-tag">{item.market === 'ashare' ? 'A股' : 'Crypto'}</span>
+                                {item.name} <span className="market-tag">
+                                    {item.market === 'ashare' ? 'A股' : (item.market === 'us' ? '美股' : 'Crypto')}
+                                </span>
                             </div>
                         </div>
                         <div className="item-actions" onClick={(e) => e.stopPropagation()}>

@@ -12,6 +12,7 @@ import { fetchSymbolList as fetchAShareSymbols, type AShareSymbol } from "../../
 import { getMarket, setMarket, type MarketType } from "../../domain/DataFecther";
 import { isInWatchlist, toggleWatchlist, getWatchlistByMarket, loadWatchlistFromServer, type WatchlistItem } from "../../domain/Watchlist";
 
+const API_BASE_URL = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_ASHARE_API_URL || "http://localhost:8000";
 
 type Props = {
     xc: ChartXControl,
@@ -91,7 +92,7 @@ export function ChooseSymbol(props: { symbol: string, handleSymbolTimeframeChang
     const list = useAsyncList<{ symbol: string; name?: string }>({
         async load({ signal, filterText }) {
             const market = getMarket();
-            if (market === 'ashare') {
+            if (market === 'ashare' || market === 'us') {
                 const items = await fetchAShareSymbols(filterText, { signal });
                 return { items };
             } else {
@@ -158,6 +159,7 @@ export function ChooseMarket(props: { onMarketChange: (newSymbol: string) => voi
 
     const marketOptions: { id: MarketType; label: string }[] = [
         { id: 'ashare', label: 'A股' },
+        { id: 'us', label: '美股' },
         { id: 'crypto', label: 'Crypto' },
     ];
 
@@ -223,10 +225,31 @@ function getStockName(symbol: string): string | null {
 export function StockNameDisplay(props: { symbol: string }) {
     const [name, setName] = useState<string | null>(() => getStockName(props.symbol));
 
-    // 当 symbol 变化时更新
-    if (getStockName(props.symbol) !== name) {
-        setName(getStockName(props.symbol));
-    }
+    useEffect(() => {
+        const cached = getStockName(props.symbol);
+        if (cached) {
+            setName(cached);
+            return;
+        }
+        let cancelled = false;
+        const params = new URLSearchParams({ q: props.symbol, limit: "1" });
+        fetch(`${API_BASE_URL}/api/symbols?${params.toString()}`)
+            .then(res => (res.ok ? res.json() : null))
+            .then(data => {
+                if (cancelled) return;
+                const items = Array.isArray(data?.data) ? data.data : [];
+                const match = items.find((item: { symbol?: string }) => item?.symbol === props.symbol) || items[0];
+                const fetchedName = match?.name || null;
+                if (fetchedName) {
+                    localStorage.setItem(`stock_name_${props.symbol}`, fetchedName);
+                    setName(fetchedName);
+                }
+            })
+            .catch(() => {
+                // ignore
+            });
+        return () => { cancelled = true; };
+    }, [props.symbol]);
 
     if (!name) return null;
 
@@ -589,7 +612,7 @@ class Title extends Component<Props, State> {
         const rKline = this.state.referKline
         const pKline = this.state.pointKline
         const delta = this.state.delta;
-        const isAshare = getMarket() === 'ashare';
+        const isAshare = getMarket() === 'ashare' || getMarket() === 'us';
         const formatVolume = (value: number) => {
             if (!Number.isFinite(value)) return "0";
             return isAshare ? formatVolumeAshare(value) : value.toPrecision(8);

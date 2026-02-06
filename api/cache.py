@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Literal
 import akshare as ak
 from akshare_guard import should_skip_remote, record_failure, record_success, throttle
+from us_indices import is_us_index_symbol, resolve_us_index_ticker
+from yahoo import fetch_chart
 
 # 配置代理
 # PROXY = "http://127.0.0.1:33210"
@@ -52,11 +54,36 @@ DAILY_PERIODS = ["daily", "weekly", "monthly"]
 # 分钟级别周期 (东方财富API格式)
 MINUTE_PERIODS = ["1", "5", "15", "30", "60"]
 
+US_INDEX_CACHE_TTL_SECONDS = 6 * 3600
+
 CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else None
 
 
 def _now_cn() -> datetime:
     return datetime.now(CN_TZ) if CN_TZ else datetime.now()
+
+
+def _source_scope(source: str) -> str:
+    return f"kline_{source}"
+
+
+def _source_disabled(source: str) -> bool:
+    key = f"DISABLE_{source.upper()}"
+    return os.getenv(key, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _should_skip_source(source: str, force_remote: bool = False) -> bool:
+    if _source_disabled(source):
+        return True
+    return should_skip_remote(force_remote, scope=_source_scope(source))
+
+
+def _record_source_failure(source: str, error: str) -> None:
+    record_failure(error, scope=_source_scope(source))
+
+
+def _record_source_success(source: str) -> None:
+    record_success(scope=_source_scope(source))
 
 
 def _today_cn() -> date:
@@ -265,6 +292,115 @@ def should_refresh_cache(cache: Dict, period: str) -> Tuple[bool, str]:
             if elapsed < 60:
                 return False, "too_recent"
         return True, "minute_refresh"
+
+
+def _yahoo_interval(period: str) -> str:
+    if period in ("weekly", "1w", "1W"):
+        return "1wk"
+    if period in ("monthly", "1M"):
+        return "1mo"
+    return "1d"
+
+
+def _ymd_to_int(text: Optional[str]) -> Optional[int]:
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    if "-" in s:
+        s = s.replace("-", "")
+    if len(s) != 8 or not s.isdigit():
+        return None
+    return int(s)
+
+
+def _should_refresh_us_cache(cache: Dict) -> Tuple[bool, str]:
+    if not cache:
+        return True, "no_cache"
+    last_update = cache.get("last_update_time")
+    if not last_update:
+        return True, "no_timestamp"
+    elapsed = datetime.utcnow().timestamp() - float(last_update)
+    if elapsed > US_INDEX_CACHE_TTL_SECONDS:
+        return True, "stale"
+    return False, "cache"
+
+
+def _needs_us_range_refresh(cached_klines: List[Dict], start_date: Optional[str], end_date: Optional[str]) -> bool:
+    if not cached_klines:
+        return True
+    start_i = _ymd_to_int(start_date)
+    end_i = _ymd_to_int(end_date)
+    first = _ymd_to_int(cached_klines[0].get("date"))
+    last = _ymd_to_int(cached_klines[-1].get("date"))
+    if start_i and first and start_i < first:
+        return True
+    if end_i and last and end_i > last:
+        return True
+    return False
+
+
+def get_us_index_klines_with_cache(
+    symbol: str,
+    period: str = "daily",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 365,
+    force_refresh: bool = False
+) -> Tuple[List[Dict], str]:
+    ticker = resolve_us_index_ticker(symbol) or symbol
+    if not ticker:
+        return [], "unsupported"
+
+    if period not in DAILY_PERIODS:
+        period = "daily"
+
+    cache = load_cache(symbol, period)
+    cached_klines = cache.get("klines", []) if cache else []
+
+    need_refresh, reason = _should_refresh_us_cache(cache)
+    range_refresh = _needs_us_range_refresh(cached_klines, start_date, end_date)
+    if not force_refresh and not need_refresh and not range_refresh:
+        filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
+        return filtered[-limit:], "cache"
+
+    now = datetime.utcnow()
+    fetch_start = _to_ymd_compact(start_date)
+    fetch_end = _to_ymd_compact(end_date) or now.strftime("%Y%m%d")
+    if not fetch_start:
+        if cached_klines and not force_refresh:
+            last_date = cached_klines[-1].get("date")
+            fetch_start = _to_ymd_compact(last_date) or (now - timedelta(days=365)).strftime("%Y%m%d")
+        else:
+            fetch_start = (now - timedelta(days=365)).strftime("%Y%m%d")
+
+    interval = _yahoo_interval(period)
+    new_klines = fetch_chart(ticker, fetch_start, fetch_end, interval=interval)
+
+    if not new_klines:
+        filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
+        return filtered[-limit:], "cache"
+
+    if cached_klines and not force_refresh:
+        existing_times = {k.get("openTime") for k in cached_klines}
+        for kline in new_klines:
+            if kline.get("openTime") not in existing_times:
+                cached_klines.append(kline)
+        cached_klines.sort(key=lambda x: x.get("openTime", 0))
+    else:
+        cached_klines = new_klines
+
+    save_cache(symbol, period, {
+        "symbol": symbol,
+        "period": period,
+        "last_update_date": now.strftime("%Y%m%d"),
+        "last_update_time": now.timestamp(),
+        "klines": cached_klines,
+    })
+
+    filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
+    return filtered[-limit:], "yahoo"
 
 
 def is_etf(code: str) -> bool:
@@ -534,6 +670,9 @@ def _normalize_intraday_volume(kline: Dict, history: List[Dict]) -> Dict:
 
 def build_daily_kline_from_minutes(code: str, date_ymd: str, force_remote: bool = False) -> Optional[Dict]:
     """Build a daily kline for date_ymd (YYYYMMDD) from 1m data."""
+    if _should_skip_source("eastmoney", force_remote):
+        print("[Backoff] Skip eastmoney minute data fetch")
+        return None
     if should_skip_remote(force_remote):
         print("[Backoff] Skip minute data fetch")
         return None
@@ -563,6 +702,7 @@ def build_daily_kline_from_minutes(code: str, date_ymd: str, force_remote: bool 
     except Exception as e:
         print(f"[intraday] Error fetching minute data: {e}")
         record_failure(f"minute_kline_failed: {e}")
+        _record_source_failure("eastmoney", f"minute_kline_failed: {e}")
         return None
 
     if df is None or df.empty:
@@ -601,11 +741,15 @@ def build_daily_kline_from_minutes(code: str, date_ymd: str, force_remote: bool 
         "closeTime": timestamp + 86400000 - 1,
     }
     record_success()
+    _record_source_success("eastmoney")
     return kline
 
 
 def fetch_from_eastmoney(code: str, period: str, fetch_start: str, fetch_end: str) -> Optional[List[Dict]]:
     """从东方财富获取数据"""
+    if _should_skip_source("eastmoney"):
+        print("[Backoff] Skip eastmoney kline fetch")
+        return None
     print(f"[DataSource] Using eastmoney for {code}")
     try:
         if is_etf(code):
@@ -699,15 +843,19 @@ def fetch_from_eastmoney(code: str, period: str, fetch_start: str, fetch_end: st
             except Exception as e:
                 print(f"[eastmoney] Error parsing row: {e}")
                 continue
-        
+        _record_source_success("eastmoney")
         return klines
     except Exception as e:
         print(f"[eastmoney] Error: {e}")
+        _record_source_failure("eastmoney", f"eastmoney_failed: {e}")
         return None
 
 
 def fetch_from_sina(code: str, period: str, fetch_start: str, fetch_end: str) -> Optional[List[Dict]]:
     """从新浪财经获取数据"""
+    if _should_skip_source("sina"):
+        print("[Backoff] Skip sina kline fetch")
+        return None
     sina_symbol = format_sina_symbol(code)
     print(f"[DataSource] Using sina for {sina_symbol}")
     
@@ -793,30 +941,36 @@ def fetch_from_sina(code: str, period: str, fetch_start: str, fetch_end: str) ->
                 today_str = now.strftime("%Y-%m-%d")
                 
                 if last_date < today_str:
-                    print(f"[sina] Last date {last_date} < {today_str}, trying to fetch today from eastmoney...")
+                    if _should_skip_source("eastmoney"):
+                        print("[Backoff] Skip eastmoney fetch for today")
+                    else:
+                        print(f"[sina] Last date {last_date} < {today_str}, trying to fetch today from eastmoney...")
                     t_str = now.strftime("%Y%m%d")
                     
                     # Retry logic for today's data
-                    for retry in range(3):
-                        try:
-                            # Try fetch just today
-                            todays_data = fetch_from_eastmoney(code, period, t_str, t_str)
-                            if todays_data:
-                                # Append unique
-                                if todays_data[0]['date'] > last_date:
-                                    klines.extend(todays_data)
-                                    print(f"[sina] Appended today's candle (Retry {retry+1}): {todays_data[0]['date']} {todays_data[0]['close']}")
-                                    break
-                        except Exception as e:
-                            print(f"[sina] Retry {retry+1} failed to fetch today: {e}")
-                            import time
-                            time.sleep(1)
+                    if not _should_skip_source("eastmoney"):
+                        for retry in range(3):
+                            try:
+                                # Try fetch just today
+                                todays_data = fetch_from_eastmoney(code, period, t_str, t_str)
+                                if todays_data:
+                                    # Append unique
+                                    if todays_data[0]['date'] > last_date:
+                                        klines.extend(todays_data)
+                                        print(f"[sina] Appended today's candle (Retry {retry+1}): {todays_data[0]['date']} {todays_data[0]['close']}")
+                                        break
+                            except Exception as e:
+                                print(f"[sina] Retry {retry+1} failed to fetch today: {e}")
+                                import time
+                                time.sleep(1)
             except Exception as e:
                 print(f"[sina] Error checking today: {e}")
         
+        _record_source_success("sina")
         return klines
     except Exception as e:
         print(f"[sina] Error: {e}")
+        _record_source_failure("sina", f"sina_failed: {e}")
         return None
 
 
@@ -840,13 +994,19 @@ def fetch_klines_from_source(code: str, period: str, fetch_start: str, fetch_end
     if source == "sina":
         result = fetch_from_sina(code, period, fetch_start, fetch_end)
         if result is None:
-            print(f"[DataSource] Sina failed, trying eastmoney...")
-            result = fetch_from_eastmoney(code, period, fetch_start, fetch_end)
+            if _should_skip_source("eastmoney"):
+                print("[Backoff] Skip eastmoney fallback")
+            else:
+                print(f"[DataSource] Sina failed, trying eastmoney...")
+                result = fetch_from_eastmoney(code, period, fetch_start, fetch_end)
     else:
         result = fetch_from_eastmoney(code, period, fetch_start, fetch_end)
         if result is None:
-            print(f"[DataSource] Eastmoney failed, trying sina...")
-            result = fetch_from_sina(code, period, fetch_start, fetch_end)
+            if _should_skip_source("sina"):
+                print("[Backoff] Skip sina fallback")
+            else:
+                print(f"[DataSource] Eastmoney failed, trying sina...")
+                result = fetch_from_sina(code, period, fetch_start, fetch_end)
     if result is None:
         if period in DAILY_PERIODS and is_etf(code):
             print(f"[DataSource] Eastmoney/Sina failed, trying tencent for {code}")
@@ -871,6 +1031,15 @@ def get_klines_with_cache(
     include_intraday: bool = True
 ) -> Tuple[List[Dict], str]:
     """获取K线数据（带缓存）"""
+    if is_us_index_symbol(symbol):
+        return get_us_index_klines_with_cache(
+            symbol=symbol,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            force_refresh=force_refresh
+        )
     now = _now_cn()
     today = now.date()
     today_str = today.strftime("%Y%m%d")

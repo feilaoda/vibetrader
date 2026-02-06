@@ -8,6 +8,16 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from db import save_symbols_db, get_symbols_db
 from akshare_guard import throttle
+from us_indices import US_INDEX_SYMBOLS
+
+
+def _append_builtin_symbols(df: pd.DataFrame) -> pd.DataFrame:
+    extra = pd.DataFrame(US_INDEX_SYMBOLS)
+    if df is None or df.empty:
+        return extra
+    merged = pd.concat([df, extra], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["symbol"], keep="first")
+    return merged
 
 def load_symbols_from_disk():
     """Load symbols from DB (Compatibility alias)"""
@@ -55,6 +65,7 @@ def fetch_all_symbols_remote():
     
     # Clean up
     final_df = df[["symbol", "code", "name"]]
+    final_df = _append_builtin_symbols(final_df)
     
     # Save to DB
     save_symbols_to_disk(final_df)
@@ -67,7 +78,7 @@ def get_all_symbols():
     # 1. Try DB Cache
     df = get_symbols_db()
     if df is not None:
-        return df
+        return _append_builtin_symbols(df)
         
     # 2. Fetch Remote (Blocking if no cache)
     return fetch_all_symbols_remote()

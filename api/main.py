@@ -3,12 +3,14 @@ VibeTrader AKShare API Backend
 A股数据代理服务
 """
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from datetime import datetime, timedelta
 import re
 import urllib.request
+import asyncio
+import threading
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -39,11 +41,13 @@ from actions import router as actions_router
 from paper import router as paper_router
 from fundamentals import router as fundamentals_router
 from industry import router as industry_router
+from crypto import router as crypto_router
 
 app.include_router(actions_router, prefix="/api")
 app.include_router(paper_router, prefix="/api")
 app.include_router(fundamentals_router, prefix="/api")
 app.include_router(industry_router, prefix="/api")
+app.include_router(crypto_router, prefix="/api")
 
 # CORS 配置
 app.add_middleware(
@@ -220,7 +224,7 @@ async def sync_watchlist_endpoint(items: list[dict]):
     return {"success": True, "data": updated_list}
 
 @app.post("/api/watchlist/sync_daily")
-async def sync_watchlist_daily(market: str = Query("ashare", description="市场: ashare 或 crypto")):
+async def sync_watchlist_daily(market: str = Query("ashare", description="市场: ashare / us / crypto")):
     """手动同步所有自选股最新日线数据"""
     from watchlist import load_watchlist
     from cache import force_sync
@@ -273,19 +277,20 @@ class AnalyzeRequest(BaseModel):
 
 
 class SystemPromptCreate(BaseModel):
-    symbol: str
     name: Optional[str] = None
     prompt: str
     set_active: Optional[bool] = False
+    symbol: Optional[str] = None
 
 
 class SystemPromptUpdate(BaseModel):
     name: Optional[str] = None
     prompt: Optional[str] = None
     set_active: Optional[bool] = None
+    symbol: Optional[str] = None
 
 @app.post("/api/analyze")
-async def analyze_stock(request: AnalyzeRequest):
+async def analyze_stock(request: AnalyzeRequest, http_request: Request):
     """请求 AI 分析股票"""
     from llm import llm_service
     from fastapi.responses import StreamingResponse
@@ -307,73 +312,110 @@ async def analyze_stock(request: AnalyzeRequest):
          # 错误信息
          raise HTTPException(status_code=500, detail=response)
          
-    def iter_response():
+    async def iter_response():
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        done = threading.Event()
+        stop = threading.Event()
+
+        def worker():
+            try:
+                for chunk in response:
+                    if stop.is_set():
+                        break
+                    if chunk:
+                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
+            except Exception as e:
+                if not stop.is_set():
+                    loop.call_soon_threadsafe(queue.put_nowait, f"\nError: {e}")
+            finally:
+                done.set()
+                try:
+                    if hasattr(response, "close"):
+                        response.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
         try:
-             # Response is a generator yielding strings
-             for chunk in response:
-                 yield chunk
-        except Exception as e:
-            yield f"\nError: {e}"
+            while True:
+                if await http_request.is_disconnected():
+                    stop.set()
+                    break
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=0.2)
+                    yield chunk
+                except asyncio.TimeoutError:
+                    if done.is_set() and queue.empty():
+                        break
+        finally:
+            stop.set()
 
     return StreamingResponse(iter_response(), media_type="text/plain")
 
 @app.get("/api/system_prompts")
 async def list_system_prompts(symbol: str = Query(..., description="股票代码")):
-    """获取指定股票的系统提示词列表"""
-    from db import list_symbol_prompts, get_active_system_prompt
-    from llm import llm_service
-    items = list_symbol_prompts(symbol)
-    active = get_active_system_prompt(symbol)
+    """获取系统提示词模板列表 + 当前标的关联模板"""
+    from db import list_prompt_templates, get_symbol_prompt_template, get_prompt_template_by_name
+    from prompts import DEFAULT_SYSTEM_PROMPT_NAME
+    items = list_prompt_templates()
+    active = get_symbol_prompt_template(symbol)
+    default_tmpl = get_prompt_template_by_name(DEFAULT_SYSTEM_PROMPT_NAME)
     return {
         "data": items,
-        "active_prompt_id": active.get("id") if active else None,
-        "default_template": llm_service.get_default_system_prompt_template()
+        "active_template_id": active.get("id") if active else None,
+        "default_template_id": default_tmpl.get("id") if default_tmpl else None,
+        "default_template_name": DEFAULT_SYSTEM_PROMPT_NAME,
     }
 
 @app.post("/api/system_prompts")
 async def create_system_prompt(payload: SystemPromptCreate):
-    """创建系统提示词"""
-    from db import create_symbol_prompt
+    """创建系统提示词模板"""
+    from db import create_prompt_template, set_symbol_prompt_template
     try:
-        result = create_symbol_prompt(
-            payload.symbol,
+        result = create_prompt_template(
             payload.name or "Untitled",
             payload.prompt,
-            bool(payload.set_active)
+            False
         )
-        return {"success": True, "id": result.get("id")}
+        template_id = result.get("id")
+        if payload.set_active and payload.symbol and template_id:
+            set_symbol_prompt_template(payload.symbol, template_id)
+        return {"success": True, "id": template_id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.put("/api/system_prompts/{prompt_id}")
 async def update_system_prompt(prompt_id: int, payload: SystemPromptUpdate):
-    """更新系统提示词"""
-    from db import update_symbol_prompt
+    """更新系统提示词模板"""
+    from db import update_prompt_template, set_symbol_prompt_template
     try:
-        update_symbol_prompt(
+        update_prompt_template(
             prompt_id,
             name=payload.name,
-            prompt=payload.prompt,
-            set_active=payload.set_active
+            prompt=payload.prompt
         )
+        if payload.set_active and payload.symbol:
+            set_symbol_prompt_template(payload.symbol, prompt_id)
         return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/system_prompts/{prompt_id}/activate")
-async def activate_system_prompt(prompt_id: int):
-    """设置为当前股票的激活提示词"""
-    from db import set_active_symbol_prompt
-    ok = set_active_symbol_prompt(prompt_id)
+async def activate_system_prompt(prompt_id: int, symbol: str = Query(..., description="股票代码")):
+    """设置为当前标的激活模板"""
+    from db import set_symbol_prompt_template
+    ok = set_symbol_prompt_template(symbol, prompt_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Prompt not found")
     return {"success": True}
 
 @app.delete("/api/system_prompts/{prompt_id}")
 async def delete_system_prompt(prompt_id: int):
-    """删除系统提示词"""
-    from db import delete_symbol_prompt
-    delete_symbol_prompt(prompt_id)
+    """删除系统提示词模板"""
+    from db import delete_prompt_template
+    delete_prompt_template(prompt_id)
     return {"success": True}
 
 @app.get("/api/history")
@@ -434,6 +476,7 @@ async def startup_event():
     from paper_strategy_runner import start_strategy_scheduler
     from strategy_optimizer import start_optimizer_scheduler
     from industry_scheduler import start_industry_scheduler
+    from watchlist_scheduler import start_watchlist_scheduler
     
     # Check if we need to refresh cache on startup
     df = load_symbols_from_disk()
@@ -455,6 +498,7 @@ async def startup_event():
     start_strategy_scheduler()
     start_optimizer_scheduler()
     start_industry_scheduler()
+    start_watchlist_scheduler()
 
 
 @app.get("/api/symbols")
@@ -560,6 +604,16 @@ def get_screening_run_api(run_id: int):
     return {"data": data}
 
 
+@app.delete("/api/screening/runs/{run_id}")
+def delete_screening_run_api(run_id: int):
+    from db import delete_screening_run, get_screening_run
+    existing = get_screening_run(run_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Run not found")
+    delete_screening_run(run_id)
+    return {"success": True}
+
+
 @app.get("/api/screening/results")
 def list_screening_results_api(
     run_id: int = Query(..., description="Run ID"),
@@ -569,6 +623,19 @@ def list_screening_results_api(
 ):
     from db import list_screening_results
     return {"data": list_screening_results(run_id, action=action, limit=limit, offset=offset)}
+
+
+@app.delete("/api/screening/results")
+def delete_screening_results_api(
+    run_id: int = Query(..., description="Run ID"),
+    actions: Optional[str] = Query(None, description="Comma separated actions, e.g. ERROR,NO_DATA"),
+):
+    from db import delete_screening_results
+    action_list = None
+    if actions:
+        action_list = [a.strip() for a in actions.split(",") if a.strip()]
+    deleted = delete_screening_results(run_id, action_list)
+    return {"success": True, "deleted": deleted}
 
 
 @app.get("/api/screening/summary")
@@ -581,6 +648,50 @@ def get_screening_summary_api(run_id: int = Query(..., description="Run ID")):
 async def get_realtime(symbol: str):
     """获取实时行情"""
     try:
+        from us_indices import is_us_index_symbol, resolve_us_index_ticker, get_us_index_label
+        from yahoo import fetch_quote
+
+        if is_us_index_symbol(symbol):
+            ticker = resolve_us_index_ticker(symbol) or symbol
+            quote = fetch_quote(ticker)
+            if not quote:
+                return {
+                    "symbol": symbol,
+                    "name": get_us_index_label(ticker) or ticker,
+                    "price": 0,
+                    "change": 0,
+                    "changePercent": 0,
+                    "open": 0,
+                    "high": 0,
+                    "low": 0,
+                    "volume": 0,
+                    "amount": 0,
+                    "timestamp": int(datetime.utcnow().timestamp() * 1000),
+                    "source": "yahoo",
+                    "stale": True,
+                    "error": "yahoo_quote_failed"
+                }
+            ts = quote.get("time")
+            try:
+                ts = int(float(ts) * 1000) if ts else int(datetime.utcnow().timestamp() * 1000)
+            except Exception:
+                ts = int(datetime.utcnow().timestamp() * 1000)
+            return {
+                "symbol": symbol,
+                "name": get_us_index_label(ticker) or ticker,
+                "price": quote.get("price") or 0,
+                "change": quote.get("change") or 0,
+                "changePercent": quote.get("changePercent") or 0,
+                "open": 0,
+                "high": 0,
+                "low": 0,
+                "volume": 0,
+                "amount": 0,
+                "timestamp": ts,
+                "source": "yahoo",
+                "stale": False
+            }
+
         code = format_symbol(symbol)
         
         is_etf = code.startswith(("15", "16", "5"))

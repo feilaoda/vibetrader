@@ -415,8 +415,8 @@ def _run_strategy_for_symbol(
 
 def _create_run_record(conn, strategy: Dict[str, Any], symbols: List[str]) -> Optional[int]:
     try:
-        row = conn.execute(
-            "INSERT INTO paper_strategy_runs (strategy_id, status, symbols, symbol_count, model_id, run_interval_minutes, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        res = conn.execute(
+            "INSERT INTO paper_strategy_runs (strategy_id, status, symbols, symbol_count, model_id, run_interval_minutes, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 strategy["id"],
                 "running",
@@ -426,8 +426,8 @@ def _create_run_record(conn, strategy: Dict[str, Any], symbols: List[str]) -> Op
                 strategy.get("run_interval_minutes"),
                 datetime.now()
             )
-        ).fetchone()
-        return row[0] if row else None
+        )
+        return int(res.lastrowid) if hasattr(res, "lastrowid") and res.lastrowid else None
     except Exception as e:
         print(f"[StrategyRunner] Failed to create run record: {e}")
         return None

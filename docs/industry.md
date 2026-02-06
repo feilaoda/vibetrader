@@ -1,14 +1,14 @@
 # Industry Templates & Indicators
 
 This project supports **industry templates** that drive optional **external indicators** (e.g., DXY, commodity prices, sector leaders).
-Indicators are **cached globally in DuckDB** and **shared across symbols** to avoid duplicate remote requests.
+Indicators are **cached globally in the database** and **shared across symbols** to avoid duplicate remote requests.
 
 ## Data Flow
 
 1. Each symbol maps to an **industry** (auto via CNINFO / manual override).
 2. The industry selects a **template** (auto by keywords or manual override).
 3. Template `config.indicators` defines **which external data** to fetch.
-4. Indicator results are cached in `industry_indicator_cache` (DuckDB) and reused.
+4. Indicator results are cached in `industry_indicator_cache` and reused.
 5. AI requests automatically include indicator context as **transient context** (not saved to history/memory).
 
 ## Cache Behavior

@@ -6,7 +6,8 @@ import { Kline } from "../../domain/Kline";
 import AxisY from "../pane/AxisY";
 import PlotVolmue from "../plot/PlotVolume";
 import { Fragment } from "react/jsx-runtime";
-import { getMarket } from "../../domain/DataFecther";
+import { getCurrentSymbol, getMarket } from "../../domain/DataFecther";
+import { splitCryptoSymbol } from "../../domain/CryptoSymbol";
 import { Path } from "../../svg/Path";
 import { Texts } from "../../svg/Texts";
 import { stringMetrics } from "../../Utils";
@@ -84,7 +85,8 @@ export class VolumeView extends ChartView<ViewProps, ViewState> {
             max = 1
         }
 
-        if (getMarket() === 'ashare') {
+        const market = getMarket();
+        if (market === 'ashare' || market === 'us') {
             if (max >= 1e9) {
                 this.volumeUnitScale = 1e8;
                 this.volumeUnitLabel = "亿股";
@@ -103,7 +105,8 @@ export class VolumeView extends ChartView<ViewProps, ViewState> {
             }
         } else {
             this.volumeUnitScale = 1;
-            this.volumeUnitLabel = "";
+            const parts = splitCryptoSymbol(getCurrentSymbol());
+            this.volumeUnitLabel = parts?.base || "";
         }
 
         // if (max === min) {
@@ -131,9 +134,11 @@ export class VolumeView extends ChartView<ViewProps, ViewState> {
 
     override plotYValueLabel(y: number, value: number, className: string) {
         const rawValue = this.yc.shouldNormScale ? value * this.yc.normScale : value;
-        const valueStr = getMarket() === 'ashare'
+        const market = getMarket();
+        const parts = market === 'crypto' ? splitCryptoSymbol(getCurrentSymbol()) : null;
+        const valueStr = market === 'ashare' || market === 'us'
             ? formatVolumeAshare(rawValue)
-            : rawValue.toPrecision(8);
+            : `${rawValue.toPrecision(8)}${parts?.base ? ` ${parts.base}` : ''}`;
 
         const metrics = stringMetrics(valueStr, this.font)
         const wLabel = metrics.width + 4

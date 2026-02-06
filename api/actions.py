@@ -2,7 +2,6 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
-import duckdb
 from db import get_connection
 
 router = APIRouter()
@@ -35,17 +34,15 @@ def create_action_plan(plan: ActionPlanCreate):
     conn = get_connection()
     try:
         # Insert
-        conn.execute("""
+        res = conn.execute("""
             INSERT INTO action_plans (symbol, stock_name, action, time_range, description, reasoning, original_response, status, model)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (plan.symbol, plan.stock_name, plan.action, plan.time_range, plan.description, plan.reasoning, plan.original_response, plan.status, plan.model))
         
-        # Get extracted ID
-        res = conn.execute("SELECT currval('seq_action_id')").fetchone()
-        new_id = res[0]
+        new_id = res.lastrowid if hasattr(res, "lastrowid") and res.lastrowid else None
         
         # Fetch back
-        row = conn.execute("SELECT * FROM action_plans WHERE id = ?", (new_id,)).fetchone()
+        row = conn.execute("SELECT * FROM action_plans WHERE id = ?", (new_id,)).fetchone() if new_id else None
         
         return _map_row_to_plan(row)
     finally:

@@ -216,26 +216,37 @@ export function moveWatchlistItemInMarket(
     const position = marketIndices.indexOf(index);
     if (position === -1) return [...memoryList];
 
-    let targetIndex: number | null = null;
     if (direction === 'top') {
         if (position === 0) return [...memoryList];
-        targetIndex = marketIndices[0];
-    } else if (direction === 'up') {
-        if (position === 0) return [...memoryList];
-        targetIndex = marketIndices[position - 1];
-    } else if (direction === 'down') {
-        if (position >= marketIndices.length - 1) return [...memoryList];
-        targetIndex = marketIndices[position + 1];
+        const newList = [...memoryList];
+        const [item] = newList.splice(index, 1);
+        let targetIndex = marketIndices[0];
+        if (targetIndex > index) targetIndex -= 1;
+        newList.splice(targetIndex, 0, item);
+        return applyWatchlistOrder(newList);
     }
 
-    if (targetIndex == null) return [...memoryList];
+    if (direction === 'up') {
+        if (position === 0) return [...memoryList];
+        const targetIndex = marketIndices[position - 1];
+        const newList = [...memoryList];
+        const temp = newList[targetIndex];
+        newList[targetIndex] = newList[index];
+        newList[index] = temp;
+        return applyWatchlistOrder(newList);
+    }
 
-    const newList = [...memoryList];
-    const temp = newList[targetIndex];
-    newList[targetIndex] = newList[index];
-    newList[index] = temp;
+    if (direction === 'down') {
+        if (position >= marketIndices.length - 1) return [...memoryList];
+        const targetIndex = marketIndices[position + 1];
+        const newList = [...memoryList];
+        const temp = newList[targetIndex];
+        newList[targetIndex] = newList[index];
+        newList[index] = temp;
+        return applyWatchlistOrder(newList);
+    }
 
-    return applyWatchlistOrder(newList);
+    return [...memoryList];
 }
 
 /**

@@ -3,6 +3,7 @@ import { Button } from 'react-aria-components';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Kline } from "../../domain/Kline";
+import { getMarket } from "../../domain/DataFecther";
 import Close from '@react-spectrum/s2/icons/Close';
 import Copy from '@react-spectrum/s2/icons/Copy';
 import Star from '@react-spectrum/s2/icons/Star';
@@ -105,6 +106,20 @@ const DEFAULT_SETTINGS: ContextSettings = {
     klineRowsAssistant: 365
 };
 
+type PushSettings = {
+    enabled: boolean;
+    intervalMinutes: number;
+    chatId: string;
+    token: string;
+};
+
+const DEFAULT_PUSH_SETTINGS: PushSettings = {
+    enabled: false,
+    intervalMinutes: 5,
+    chatId: "",
+    token: ""
+};
+
 export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const [config, setConfig] = useState<LLMConfig | null>(null);
     const [selectedModel, setSelectedModel] = useState<string>("");
@@ -112,8 +127,12 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [analysisMode, setAnalysisMode] = useState<'chat' | 'assistant' | 'temporary'>('chat');
     const [settingsOpen, setSettingsOpen] = useState(false);
-    const [settingsTab, setSettingsTab] = useState<'params' | 'prompt' | 'industry'>('params');
+    const [settingsTab, setSettingsTab] = useState<'params' | 'prompt' | 'industry' | 'push'>('params');
     const [contextSettings, setContextSettings] = useState<ContextSettings>(DEFAULT_SETTINGS);
+    const [pushSettings, setPushSettings] = useState<PushSettings>(DEFAULT_PUSH_SETTINGS);
+    const [pushSymbolEnabled, setPushSymbolEnabled] = useState(false);
+    const [pushSettingsError, setPushSettingsError] = useState("");
+    const [pushSettingsSaving, setPushSettingsSaving] = useState(false);
     const [input, setInput] = useState("");
     const [isLoading, setIsLoading] = useState(false);
     const [isStopping, setIsStopping] = useState(false);
@@ -167,10 +186,72 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         return `${num.toFixed(0)}股`;
     };
 
-    const buildRealtimeSummary = (rt: any) => {
+    const buildRealtimeSummary = (rt: any, note?: string) => {
         const ts = rt?.timestamp ? new Date(rt.timestamp).toLocaleString() : new Date().toLocaleString();
         const volumeText = formatVolume(rt?.volume, rt?.source);
-        return `当前行情(${ts}): 最新价 ${rt?.price ?? 'N/A'}，今开 ${rt?.open ?? 'N/A'}，最高 ${rt?.high ?? 'N/A'}，最低 ${rt?.low ?? 'N/A'}，成交量 ${volumeText}。`;
+        const suffix = note ? `（${note}）` : "";
+        return `当前行情(${ts}): 最新价 ${rt?.price ?? 'N/A'}，今开 ${rt?.open ?? 'N/A'}，最高 ${rt?.high ?? 'N/A'}，最低 ${rt?.low ?? 'N/A'}，成交量 ${volumeText}。${suffix}`;
+    };
+
+    const formatPushText = (text: string) => {
+        let output = text || "";
+        output = output.replace(/```[\s\S]*?```/g, (match) => match.replace(/```/g, "").trim());
+        output = output.replace(/`([^`]+)`/g, "$1");
+        output = output.replace(/^#{1,6}\s+/gm, "");
+        output = output.replace(/!\[.*?\]\(.*?\)/g, "");
+        output = output.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");
+        output = output.replace(/^\s*>\s?/gm, "");
+        output = output.replace(/\*\*(.*?)\*\*/g, "$1");
+        output = output.replace(/__(.*?)__/g, "$1");
+        output = output.replace(/\*(.*?)\*/g, "$1");
+        output = output.replace(/_(.*?)_/g, "$1");
+        output = output.replace(/^\s*[-*+]\s+/gm, "• ");
+        output = output.replace(/^\s*\d+\.\s+/gm, "• ");
+        output = output.replace(/^\s*\|?[\s:-]+\|[\s:-|]*$/gm, "");
+        output = output.replace(/\s*\|\s*/g, " | ");
+        output = output.replace(/<[^>]+>/g, "");
+        output = output.replace(/\n{3,}/g, "\n\n");
+        return output.trim();
+    };
+
+    const inferTimeframe = (klines: Kline[]) => {
+        if (!klines || klines.length < 2) return '1d';
+        const last = klines[klines.length - 1];
+        const prev = klines[klines.length - 2];
+        const delta = Math.abs((last?.time || 0) - (prev?.time || 0));
+        if (delta >= 20 * 60 * 60 * 1000) return '1d';
+        if (delta >= 3.5 * 60 * 60 * 1000) return '4h';
+        if (delta >= 1.5 * 60 * 60 * 1000) return '2h';
+        if (delta >= 45 * 60 * 1000) return '1h';
+        if (delta >= 20 * 60 * 1000) return '30m';
+        if (delta >= 10 * 60 * 1000) return '15m';
+        if (delta >= 4 * 60 * 1000) return '5m';
+        if (delta >= 2 * 60 * 1000) return '3m';
+        return '1m';
+    };
+
+    const timeframeToMs = (tf: string) => {
+        switch (tf) {
+            case '1m':
+                return 60 * 1000;
+            case '3m':
+                return 3 * 60 * 1000;
+            case '5m':
+                return 5 * 60 * 1000;
+            case '15m':
+                return 15 * 60 * 1000;
+            case '30m':
+                return 30 * 60 * 1000;
+            case '1h':
+                return 60 * 60 * 1000;
+            case '2h':
+                return 2 * 60 * 60 * 1000;
+            case '4h':
+                return 4 * 60 * 60 * 1000;
+            case '1d':
+            default:
+                return 24 * 60 * 60 * 1000;
+        }
     };
 
     const buildIndustryContext = (profile: IndustryProfile | null) => {
@@ -229,6 +310,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             loadSystemPrompts();
             // Load Industry Profile
             loadIndustryProfile();
+            loadPushSettings();
+            loadPushSymbol(props.symbol);
         }
     }, [props.isOpen, props.symbol]);
 
@@ -263,6 +346,81 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         }
     };
 
+    const loadPushSettings = async () => {
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/push/settings`);
+            if (!res.ok) return;
+            const data = await res.json();
+            const cfg = data?.data || {};
+            setPushSettings({
+                enabled: !!cfg.enabled,
+                intervalMinutes: Number(cfg.interval_minutes || 5),
+                chatId: cfg.chat_id || "",
+                token: cfg.token || ""
+            });
+        } catch (e) {
+            // ignore
+        }
+    };
+
+    const loadPushSymbol = async (symbol: string) => {
+        if (!symbol) return;
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/push/symbol?symbol=${encodeURIComponent(symbol)}`);
+            if (!res.ok) return;
+            const data = await res.json();
+            setPushSymbolEnabled(!!data?.data?.enabled);
+        } catch (e) {
+            // ignore
+        }
+    };
+
+    const savePushSettings = async () => {
+        setPushSettingsSaving(true);
+        setPushSettingsError("");
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/push/settings`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    enabled: pushSettings.enabled,
+                    interval_minutes: pushSettings.intervalMinutes,
+                    chat_id: pushSettings.chatId,
+                    token: pushSettings.token
+                })
+            });
+            if (!res.ok) {
+                const detail = await res.json().catch(() => ({}));
+                throw new Error(detail?.detail || "保存失败");
+            }
+            await loadPushSettings();
+        } catch (e: any) {
+            setPushSettingsError(e?.message || "保存失败");
+        } finally {
+            setPushSettingsSaving(false);
+        }
+    };
+
+    const savePushSymbol = async () => {
+        if (!props.symbol) return;
+        setPushSettingsSaving(true);
+        setPushSettingsError("");
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/push/symbol?symbol=${encodeURIComponent(props.symbol)}&enabled=${pushSymbolEnabled ? "true" : "false"}`, {
+                method: "PUT"
+            });
+            if (!res.ok) {
+                const detail = await res.json().catch(() => ({}));
+                throw new Error(detail?.detail || "保存失败");
+            }
+            await loadPushSymbol(props.symbol);
+        } catch (e: any) {
+            setPushSettingsError(e?.message || "保存失败");
+        } finally {
+            setPushSettingsSaving(false);
+        }
+    };
+
     useEffect(() => {
         if (Array.isArray(props.klines) && props.klines.length > 0) {
             latestKlinesRef.current = props.klines;
@@ -277,6 +435,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             setIndustryDraft(industryProfile?.industry || "");
             setProfileDraft(industryProfile?.profile_override || "");
             setIndustryEnabled(!!industryProfile?.enabled);
+            loadPushSettings();
+            loadPushSymbol(props.symbol);
         }
     }, [settingsOpen]);
 
@@ -285,6 +445,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         setIndustryDraft(industryProfile?.industry || "");
         setProfileDraft(industryProfile?.profile_override || "");
         setIndustryEnabled(!!industryProfile?.enabled);
+        loadPushSymbol(props.symbol);
     }, [industryProfile, settingsOpen]);
 
     const HISTORY_LIMIT = 5;
@@ -531,8 +692,9 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         transientContext?: string;
         disableHistory?: boolean;
         disableIndicatorContext?: boolean;
+        pushSummary?: string;
     }) => {
-        const { symbol, klines, userInput, displayUserContent, runMode, analysisMode, contextSettings, transientContext, disableHistory, disableIndicatorContext } = params;
+        const { symbol, klines, userInput, displayUserContent, runMode, analysisMode, contextSettings, transientContext, disableHistory, disableIndicatorContext, pushSummary } = params;
         if (!config?.configured) return;
         if (!symbol || klines.length === 0) {
             const msg = !symbol ? "No symbol selected" : "No kline data available";
@@ -704,6 +866,23 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             } else {
                 setAutoLoading(false);
             }
+            if (runMode === "auto" && !wasAborted && pushSettings.enabled && pushSymbolEnabled && aiContent.trim()) {
+                const summary = pushSummary ? `${pushSummary}` : "";
+                const formatted = formatPushText(aiContent.trim());
+                const trimmed = formatted.slice(0, 1200);
+                const text = [
+                    symbol,
+                    summary,
+                    `AI(${selectedModel || "model"}): ${trimmed}`
+                ].filter(Boolean).join("\n");
+                fetch(`${API_BASE_URL}/api/push/notify`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ symbol, text })
+                }).catch(() => {
+                    // ignore
+                });
+            }
             if (!wasAborted && analysisMode !== 'temporary') {
                 try {
                     loadHistory();
@@ -814,41 +993,193 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         }
     };
 
-    const runAutoEvaluation = async () => {
+    const runAutoEvaluation = async (options?: { allowAfterHours?: boolean }) => {
         if (autoRunningRef.current || isLoading || autoLoading) return;
         if (!props.symbol || !config?.configured) return;
 
         autoRunningRef.current = true;
         try {
-            const [dailyRes, realtimeRes] = await Promise.all([
-                fetch(`${API_BASE_URL}/api/klines/${encodeURIComponent(props.symbol)}?period=1d&limit=365`),
-                fetch(`${API_BASE_URL}/api/realtime/${encodeURIComponent(props.symbol)}`)
-            ]);
-
+            const market = getMarket();
             let dailyKlines: Kline[] = [];
-            if (dailyRes.ok) {
-                const dailyJson = await dailyRes.json();
-                dailyKlines = Array.isArray(dailyJson?.data) ? dailyJson.data : [];
-            }
-            if (dailyKlines.length === 0 && latestKlinesRef.current.length > 0) {
-                dailyKlines = latestKlinesRef.current;
-            }
-
             let realtimeSummary = '';
-            if (!realtimeRes.ok) {
-                setAutoError('自动评估跳过：实时行情获取失败');
-                return;
+
+            if (market === 'crypto') {
+                const tf = inferTimeframe(props.klines || []);
+                const nowMs = Date.now();
+                if (tf !== '1d') {
+                    const windowMs = 6 * 60 * 60 * 1000;
+                    const start = nowMs - windowMs;
+                    const tfMs = timeframeToMs(tf);
+                    const limit = Math.max(1, Math.ceil(windowMs / tfMs));
+                    const params = new URLSearchParams({
+                        symbol: props.symbol,
+                        interval: tf,
+                        startTime: String(start),
+                        endTime: String(nowMs),
+                        limit: String(limit)
+                    });
+                    const res = await fetch(`${API_BASE_URL}/api/crypto/klines?${params.toString()}`);
+                    if (!res.ok) {
+                        setAutoError('自动评估跳过：Crypto 分钟行情获取失败');
+                        return;
+                    }
+                    const rows = await res.json();
+                    if (!Array.isArray(rows) || rows.length === 0) {
+                        setAutoError('自动评估跳过：Crypto 分钟行情为空');
+                        return;
+                    }
+                    dailyKlines = rows.map((item: any[]) => ({
+                        time: item[0],
+                        open: Number(item[1]),
+                        high: Number(item[2]),
+                        low: Number(item[3]),
+                        close: Number(item[4]),
+                        volume: Number(item[5]),
+                        closeTime: item[6],
+                        isClosed: true
+                    })) as Kline[];
+                    const last = dailyKlines[dailyKlines.length - 1];
+                    realtimeSummary = buildRealtimeSummary({
+                        price: last.close,
+                        open: last.open,
+                        high: last.high,
+                        low: last.low,
+                        volume: last.volume,
+                        timestamp: last.closeTime || last.time,
+                        source: 'crypto'
+                    }, `${tf} 数据(近6小时)`);
+                } else {
+                    const start = nowMs - 365 * 24 * 60 * 60 * 1000;
+                    const params = new URLSearchParams({
+                        symbol: props.symbol,
+                        interval: '1d',
+                        startTime: String(start),
+                        endTime: String(nowMs),
+                        limit: '365'
+                    });
+                    const res = await fetch(`${API_BASE_URL}/api/crypto/klines?${params.toString()}`);
+                    if (!res.ok) {
+                        setAutoError('自动评估跳过：Crypto 日线获取失败');
+                        return;
+                    }
+                    const rows = await res.json();
+                    if (!Array.isArray(rows) || rows.length === 0) {
+                        setAutoError('自动评估跳过：Crypto 日线为空');
+                        return;
+                    }
+                    dailyKlines = rows.map((item: any[]) => ({
+                        time: item[0],
+                        open: Number(item[1]),
+                        high: Number(item[2]),
+                        low: Number(item[3]),
+                        close: Number(item[4]),
+                        volume: Number(item[5]),
+                        closeTime: item[6],
+                        isClosed: true
+                    })) as Kline[];
+                    const last = dailyKlines[dailyKlines.length - 1];
+                    realtimeSummary = buildRealtimeSummary({
+                        price: last.close,
+                        open: last.open,
+                        high: last.high,
+                        low: last.low,
+                        volume: last.volume,
+                        timestamp: last.closeTime || last.time,
+                        source: 'crypto'
+                    }, "日线数据");
+                }
+            } else {
+                let nonTradingDay = false;
+                let afterHours = false;
+                try {
+                    const statusRes = await fetch(`${API_BASE_URL}/api/paper/auto_status`);
+                    if (statusRes.ok) {
+                        const statusJson = await statusRes.json();
+                        if (!statusJson?.auto_run_allowed) {
+                            const reason = statusJson?.reason || "non_trading_time";
+                            if (reason === "non_trading_day") {
+                                nonTradingDay = true;
+                            } else if (reason === "after_hours") {
+                                afterHours = true;
+                            } else {
+                                const reasonText =
+                                    reason === "after_hours" ? "盘后" : reason;
+                                setAutoError(`自动评估跳过：${reasonText}`);
+                                return;
+                            }
+                            if (reason === "after_hours" && !options?.allowAfterHours) {
+                                setAutoError(`自动评估跳过：盘后`);
+                                return;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // ignore auto_status failures
+                }
+
+                const [dailyRes, realtimeRes] = await Promise.all([
+                    fetch(`${API_BASE_URL}/api/klines/${encodeURIComponent(props.symbol)}?period=1d&limit=365`),
+                    fetch(`${API_BASE_URL}/api/realtime/${encodeURIComponent(props.symbol)}`)
+                ]);
+
+                if (dailyRes.ok) {
+                    const dailyJson = await dailyRes.json();
+                    dailyKlines = Array.isArray(dailyJson?.data) ? dailyJson.data : [];
+                }
+                if (dailyKlines.length === 0 && latestKlinesRef.current.length > 0) {
+                    dailyKlines = latestKlinesRef.current;
+                }
+
+                const buildDailyFallback = (note: string) => {
+                    if (!dailyKlines.length) return "";
+                    const last = dailyKlines[dailyKlines.length - 1];
+                    return buildRealtimeSummary({
+                        price: last.close,
+                        open: last.open,
+                        high: last.high,
+                        low: last.low,
+                        volume: last.volume,
+                        timestamp: last.closeTime || last.time,
+                        source: 'daily'
+                    }, note);
+                };
+
+                let rt: any = null;
+                if (realtimeRes.ok) {
+                    try {
+                        rt = await realtimeRes.json();
+                    } catch (e) {
+                        rt = null;
+                    }
+                }
+
+                if (!realtimeRes.ok || !rt || rt?.price === undefined) {
+                    if (nonTradingDay || afterHours) {
+                        const fallbackNote = nonTradingDay
+                            ? "非交易日，使用最近日线收盘"
+                            : "盘后，使用最近日线收盘";
+                        const fallbackSummary = buildDailyFallback(fallbackNote);
+                        if (fallbackSummary) {
+                            realtimeSummary = fallbackSummary;
+                        } else {
+                            setAutoError('自动评估跳过：实时行情数据不完整');
+                            return;
+                        }
+                    } else {
+                        setAutoError('自动评估跳过：实时行情数据不完整');
+                        return;
+                    }
+                } else {
+                    if (rt?.stale && !nonTradingDay && !afterHours) {
+                        setAutoError('自动评估跳过：行情非当日数据');
+                        return;
+                    }
+                    const note = nonTradingDay
+                        ? "非交易日，使用最近交易日行情"
+                        : (afterHours ? "盘后，使用最近交易日行情" : "");
+                    realtimeSummary = buildRealtimeSummary(rt, note);
+                }
             }
-            const rt = await realtimeRes.json();
-            if (!rt || rt?.price === undefined) {
-                setAutoError('自动评估跳过：实时行情数据不完整');
-                return;
-            }
-            if (rt?.stale) {
-                setAutoError('自动评估跳过：行情非当日数据');
-                return;
-            }
-            realtimeSummary = buildRealtimeSummary(rt);
 
             const nowText = new Date().toLocaleString();
             const userInput = `自动评估。当前时间: ${nowText}。\n${realtimeSummary}\n请结合历史日线数据评估下一步动作（买/卖/观望），给出理由和风险提示。`;
@@ -875,7 +1206,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 analysisMode: "assistant",
                 contextSettings,
                 transientContext,
-                disableIndicatorContext: !!indicatorContext
+                disableIndicatorContext: !!indicatorContext,
+                pushSummary: realtimeSummary
             });
         } finally {
             autoRunningRef.current = false;
@@ -885,14 +1217,16 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     useEffect(() => {
         if (!props.isOpen) return;
         if (!autoEnabled) return;
-        runAutoEvaluation();
+        runAutoEvaluation({ allowAfterHours: true });
+        const intervalMinutes = Math.max(1, Number(pushSettings.intervalMinutes || 5));
+        const intervalMs = intervalMinutes * 60 * 1000;
         const interval = setInterval(() => {
             if (!autoRunningRef.current) {
                 runAutoEvaluation();
             }
-        }, 5 * 60 * 1000);
+        }, intervalMs);
         return () => clearInterval(interval);
-    }, [autoEnabled, props.isOpen, props.symbol, selectedModel]);
+    }, [autoEnabled, props.isOpen, props.symbol, selectedModel, pushSettings.intervalMinutes]);
 
     const [isExtracting, setIsExtracting] = useState(false);
 
@@ -1305,7 +1639,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                             {[
                                 { id: 'params', label: '参数' },
                                 { id: 'prompt', label: 'Prompt' },
-                                { id: 'industry', label: '行业数据' }
+                                { id: 'industry', label: '行业数据' },
+                                { id: 'push', label: '推送' }
                             ].map((tab) => {
                                 const active = settingsTab === tab.id;
                                 return (
@@ -1566,6 +1901,76 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                 )}
                                 {templatesError && (
                                     <div style={{ fontSize: '12px', color: '#c00' }}>{templatesError}</div>
+                                )}
+                            </div>
+                        )}
+
+                        {settingsTab === 'push' && (
+                            <div style={{ borderTop: '1px solid #eee', paddingTop: '12px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                                <div style={{ fontWeight: 600, fontSize: '12px' }}>手机推送（全局）</div>
+                                <label style={{ fontSize: '12px' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={pushSettings.enabled}
+                                        onChange={(e) => setPushSettings({ ...pushSettings, enabled: e.target.checked })}
+                                    /> 启用推送
+                                </label>
+                                <label style={{ fontSize: '12px' }}>
+                                    推送周期（分钟）
+                                    <input
+                                        type="number"
+                                        min={1}
+                                        value={pushSettings.intervalMinutes}
+                                        onChange={(e) => setPushSettings({ ...pushSettings, intervalMinutes: Number(e.target.value || 0) })}
+                                        style={inputStyle}
+                                    />
+                                </label>
+                                <label style={{ fontSize: '12px' }}>
+                                    Chat ID
+                                    <input
+                                        type="text"
+                                        value={pushSettings.chatId}
+                                        onChange={(e) => setPushSettings({ ...pushSettings, chatId: e.target.value })}
+                                        style={inputStyle}
+                                    />
+                                </label>
+                                <label style={{ fontSize: '12px' }}>
+                                    Token
+                                    <input
+                                        type="password"
+                                        value={pushSettings.token}
+                                        onChange={(e) => setPushSettings({ ...pushSettings, token: e.target.value })}
+                                        style={inputStyle}
+                                    />
+                                </label>
+                                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                    <Button
+                                        onPress={savePushSettings}
+                                        style={{ background: '#f3f3f3', border: '1px solid #ddd', padding: '6px 10px', borderRadius: '4px' }}
+                                        isDisabled={pushSettingsSaving}
+                                    >
+                                        保存全局推送
+                                    </Button>
+                                    <div style={{ fontSize: '11px', color: '#666' }}>周期对所有股票生效</div>
+                                </div>
+
+                                <div style={{ fontWeight: 600, fontSize: '12px', marginTop: '8px' }}>当前股票</div>
+                                <label style={{ fontSize: '12px' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={pushSymbolEnabled}
+                                        onChange={(e) => setPushSymbolEnabled(e.target.checked)}
+                                    /> 启用当前股票推送
+                                </label>
+                                <Button
+                                    onPress={savePushSymbol}
+                                    style={{ background: '#f3f3f3', border: '1px solid #ddd', padding: '6px 10px', borderRadius: '4px', alignSelf: 'flex-start' }}
+                                    isDisabled={pushSettingsSaving || !props.symbol}
+                                >
+                                    保存当前股票设置
+                                </Button>
+                                {pushSettingsError && (
+                                    <div style={{ fontSize: '12px', color: '#c00' }}>{pushSettingsError}</div>
                                 )}
                             </div>
                         )}

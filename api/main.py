@@ -42,12 +42,14 @@ from paper import router as paper_router
 from fundamentals import router as fundamentals_router
 from industry import router as industry_router
 from crypto import router as crypto_router
+from push import router as push_router
 
 app.include_router(actions_router, prefix="/api")
 app.include_router(paper_router, prefix="/api")
 app.include_router(fundamentals_router, prefix="/api")
 app.include_router(industry_router, prefix="/api")
 app.include_router(crypto_router, prefix="/api")
+app.include_router(push_router, prefix="/api")
 
 # CORS 配置
 app.add_middleware(
@@ -543,6 +545,34 @@ async def search_symbols(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/symbols/ensure")
+async def ensure_symbol(
+    symbol: str = Query(..., description="股票代码"),
+    name: str | None = Query(None, description="可选名称（手工补齐）"),
+):
+    """Ensure a symbol exists in DB; fill name if possible."""
+    from db import get_symbol_db, upsert_symbol_db
+    symbol = (symbol or "").upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol required")
+    if name:
+        upsert_symbol_db(symbol, name=name)
+        return {"symbol": symbol, "name": name, "source": "manual"}
+    existing = get_symbol_db(symbol)
+    if existing and existing.get("name"):
+        return {"symbol": symbol, "name": existing.get("name") or "", "source": "db"}
+    try:
+        data = await get_realtime(symbol)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        rt_name = data.get("name") or ""
+        if rt_name:
+            upsert_symbol_db(symbol, name=rt_name)
+            return {"symbol": symbol, "name": rt_name, "source": data.get("source") or "realtime"}
+    return {"symbol": symbol, "name": "", "source": "unknown"}
+
+
 @app.get("/api/symbols/list")
 def list_symbols_api(
     q: str = Query("", description="搜索关键词"),
@@ -650,12 +680,21 @@ async def get_realtime(symbol: str):
     try:
         from us_indices import is_us_index_symbol, resolve_us_index_ticker, get_us_index_label
         from yahoo import fetch_quote
+        from db import upsert_symbol_db
+
+        def _maybe_upsert_symbol(payload: dict):
+            try:
+                name = payload.get("name")
+                if name:
+                    upsert_symbol_db(payload.get("symbol") or symbol, name=name)
+            except Exception:
+                pass
 
         if is_us_index_symbol(symbol):
             ticker = resolve_us_index_ticker(symbol) or symbol
             quote = fetch_quote(ticker)
             if not quote:
-                return {
+                payload = {
                     "symbol": symbol,
                     "name": get_us_index_label(ticker) or ticker,
                     "price": 0,
@@ -671,12 +710,14 @@ async def get_realtime(symbol: str):
                     "stale": True,
                     "error": "yahoo_quote_failed"
                 }
+                _maybe_upsert_symbol(payload)
+                return payload
             ts = quote.get("time")
             try:
                 ts = int(float(ts) * 1000) if ts else int(datetime.utcnow().timestamp() * 1000)
             except Exception:
                 ts = int(datetime.utcnow().timestamp() * 1000)
-            return {
+            payload = {
                 "symbol": symbol,
                 "name": get_us_index_label(ticker) or ticker,
                 "price": quote.get("price") or 0,
@@ -691,6 +732,8 @@ async def get_realtime(symbol: str):
                 "source": "yahoo",
                 "stale": False
             }
+            _maybe_upsert_symbol(payload)
+            return payload
 
         code = format_symbol(symbol)
         
@@ -869,6 +912,7 @@ async def get_realtime(symbol: str):
             record_failure(f"realtime_tencent_failed: {t_err}", scope_tencent)
             tencent_data = None
         if tencent_data:
+            _maybe_upsert_symbol(tencent_data)
             return tencent_data
 
         if should_skip_remote(scope=scope):
@@ -906,7 +950,7 @@ async def get_realtime(symbol: str):
                 ratio = (amt_raw / vol_raw) / price
                 if ratio <= 2:
                     multiplier = 1
-            return {
+            payload = {
                 "symbol": symbol,
                 "name": r["名称"],
                 "price": price,
@@ -922,6 +966,8 @@ async def get_realtime(symbol: str):
                 "stale": False,
                 "api_status": get_status(scope),
             }
+            _maybe_upsert_symbol(payload)
+            return payload
         else:
             record_success(scope)
             price = _safe_float(r["最新价"] if "最新价" in r else 0)
@@ -932,7 +978,7 @@ async def get_realtime(symbol: str):
                 ratio = (amt_raw / vol_raw) / price
                 if ratio <= 2:
                     multiplier = 1
-            return {
+            payload = {
                 "symbol": symbol,
                 "name": r["名称"],
                 "price": price,
@@ -948,6 +994,8 @@ async def get_realtime(symbol: str):
                 "stale": False,
                 "api_status": get_status(scope),
             }
+            _maybe_upsert_symbol(payload)
+            return payload
 
     except HTTPException:
         raise

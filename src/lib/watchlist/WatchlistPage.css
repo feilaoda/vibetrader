@@ -108,6 +108,9 @@
 
 .watchlist-manage__name {
     color: #374151;
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 .watchlist-manage__market {
@@ -118,6 +121,11 @@
     display: flex;
     gap: 8px;
     justify-content: flex-end;
+}
+
+.watchlist-manage__pin {
+    padding: 4px 8px;
+    font-size: 11px;
 }
 
 .watchlist-manage__btn {

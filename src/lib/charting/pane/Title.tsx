@@ -229,8 +229,17 @@ export function StockNameDisplay(props: { symbol: string }) {
         const cached = getStockName(props.symbol);
         if (cached) {
             setName(cached);
-            return;
         }
+        const upperSymbol = props.symbol.toUpperCase();
+        const derivedCode = (() => {
+            if (upperSymbol.includes(".")) {
+                return upperSymbol.split(".")[0];
+            }
+            if (upperSymbol.startsWith("SH") || upperSymbol.startsWith("SZ") || upperSymbol.startsWith("US")) {
+                return upperSymbol.slice(2);
+            }
+            return upperSymbol;
+        })();
         let cancelled = false;
         const params = new URLSearchParams({ q: props.symbol, limit: "1" });
         fetch(`${API_BASE_URL}/api/symbols?${params.toString()}`)
@@ -238,12 +247,52 @@ export function StockNameDisplay(props: { symbol: string }) {
             .then(data => {
                 if (cancelled) return;
                 const items = Array.isArray(data?.data) ? data.data : [];
-                const match = items.find((item: { symbol?: string }) => item?.symbol === props.symbol) || items[0];
+                const match = items.find((item: { symbol?: string }) => item?.symbol?.toUpperCase() === upperSymbol);
                 const fetchedName = match?.name || null;
                 if (fetchedName) {
                     localStorage.setItem(`stock_name_${props.symbol}`, fetchedName);
                     setName(fetchedName);
+                    return;
                 }
+                if (!derivedCode) return;
+                const codeParams = new URLSearchParams({ q: derivedCode, limit: "5" });
+                fetch(`${API_BASE_URL}/api/symbols?${codeParams.toString()}`)
+                    .then(res => (res.ok ? res.json() : null))
+                    .then(codeData => {
+                        if (cancelled) return;
+                        const codeItems = Array.isArray(codeData?.data) ? codeData.data : [];
+                        const exact = codeItems.find((item: { symbol?: string; code?: string }) => {
+                            const itemSymbol = item?.symbol?.toUpperCase();
+                            const itemCode = item?.code?.toUpperCase();
+                            if (itemSymbol && itemSymbol === upperSymbol) return true;
+                            if (itemCode && itemCode === derivedCode) return true;
+                            return false;
+                        });
+                        const fallbackName = exact?.name || null;
+                        if (fallbackName) {
+                            localStorage.setItem(`stock_name_${props.symbol}`, fallbackName);
+                            setName(fallbackName);
+                            return;
+                        }
+                        fetch(`${API_BASE_URL}/api/symbols/ensure?symbol=${encodeURIComponent(props.symbol)}`)
+                            .then(res => (res.ok ? res.json() : null))
+                            .then(rt => {
+                                if (cancelled) return;
+                                const rtName = rt?.name || null;
+                                if (rtName) {
+                                    localStorage.setItem(`stock_name_${props.symbol}`, rtName);
+                                    setName(rtName);
+                                } else if (!cached) {
+                                    setName(null);
+                                }
+                            })
+                            .catch(() => {
+                                // ignore
+                            });
+                    })
+                    .catch(() => {
+                        // ignore
+                    });
             })
             .catch(() => {
                 // ignore

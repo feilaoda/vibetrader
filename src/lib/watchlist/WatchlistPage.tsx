@@ -154,15 +154,17 @@ export function WatchlistPage() {
                         <div key={`${item.symbol}-${item.market}`} className="watchlist-manage__row">
                             <div>{idx + 1}</div>
                             <div className="watchlist-manage__symbol">{item.symbol}</div>
-                            <div className="watchlist-manage__name">{name || "-"}</div>
-                            <div className="watchlist-manage__market">{marketLabel(item.market)}</div>
-                            <div className="watchlist-manage__ops">
+                            <div className="watchlist-manage__name">
+                                <span>{name || "-"}</span>
                                 <button
-                                    className="watchlist-manage__btn watchlist-manage__btn--ghost"
+                                    className="watchlist-manage__btn watchlist-manage__btn--ghost watchlist-manage__pin"
                                     onClick={() => handleMove(item, "top")}
                                 >
                                     置顶
                                 </button>
+                            </div>
+                            <div className="watchlist-manage__market">{marketLabel(item.market)}</div>
+                            <div className="watchlist-manage__ops">
                                 <button
                                     className="watchlist-manage__btn watchlist-manage__btn--ghost"
                                     onClick={() => handleMove(item, "up")}

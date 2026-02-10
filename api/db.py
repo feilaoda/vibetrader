@@ -1025,6 +1025,44 @@ def init_db():
                 PRIMARY KEY (symbol, market)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
+
+    # Push Settings (Global + per symbol)
+    if DB_BACKEND == "duckdb":
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS push_settings (
+                id INTEGER PRIMARY KEY,
+                enabled BOOLEAN DEFAULT FALSE,
+                interval_minutes INTEGER DEFAULT 5,
+                chat_id VARCHAR,
+                token VARCHAR,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_push_settings (
+                symbol VARCHAR PRIMARY KEY,
+                enabled BOOLEAN DEFAULT FALSE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+    else:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS push_settings (
+                id INT PRIMARY KEY,
+                enabled TINYINT(1) DEFAULT 0,
+                interval_minutes INT DEFAULT 5,
+                chat_id VARCHAR(128),
+                token VARCHAR(255),
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS symbol_push_settings (
+                symbol VARCHAR(32) PRIMARY KEY,
+                enabled TINYINT(1) DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
         
     conn.close()
 
@@ -1091,6 +1129,169 @@ def get_symbols_db():
     except Exception as e:
         print(f"[DB] Error loading symbols: {e}")
         return None
+    finally:
+        conn.close()
+
+def get_symbol_db(symbol: str) -> Optional[dict]:
+    """Get single symbol row from DB."""
+    if not symbol:
+        return None
+    conn = get_connection()
+    try:
+        res = conn.execute("SELECT symbol, code, name, market, type FROM symbols WHERE symbol = ?", (symbol.upper(),))
+        df = res.df()
+        if df is None or df.empty:
+            return None
+        return df.iloc[0].to_dict()
+    except Exception as e:
+        print(f"[DB] Error loading symbol {symbol}: {e}")
+        return None
+    finally:
+        conn.close()
+
+def upsert_symbol_db(symbol: str, code: Optional[str] = None, name: Optional[str] = None,
+                     market: Optional[str] = None, sym_type: Optional[str] = None) -> bool:
+    """Insert or update a single symbol row (best-effort)."""
+    if not symbol:
+        return False
+    symbol = symbol.upper()
+    if not code:
+        if "." in symbol:
+            code = symbol.split(".")[0]
+        elif symbol.startswith(("SH", "SZ", "US")):
+            code = symbol[2:]
+        else:
+            code = symbol
+    if not market:
+        if symbol.endswith(".US"):
+            market = "US"
+        elif symbol.endswith(".SH"):
+            market = "SH"
+        elif symbol.endswith(".SZ"):
+            market = "SZ"
+        else:
+            market = "BJ"
+    if not sym_type:
+        if market in ("SH", "SZ", "BJ"):
+            sym_type = "etf" if code and code.startswith(("5", "15", "16")) else "stock"
+        elif market == "US":
+            sym_type = "index"
+        else:
+            sym_type = "unknown"
+    name = name or ""
+    conn = get_connection()
+    try:
+        if DB_BACKEND == "duckdb":
+            conn.execute(
+                "INSERT OR REPLACE INTO symbols (symbol, code, name, market, type, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (symbol, code, name, market, sym_type)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO symbols (symbol, code, name, market, type, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON DUPLICATE KEY UPDATE code=VALUES(code), name=VALUES(name), market=VALUES(market), "
+                "type=VALUES(type), updated_at=CURRENT_TIMESTAMP",
+                (symbol, code, name, market, sym_type)
+            )
+        return True
+    except Exception as e:
+        print(f"[DB] Error upsert symbol {symbol}: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_push_settings() -> dict:
+    """Get global push settings (auto-create if missing)."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT enabled, interval_minutes, chat_id, token FROM push_settings WHERE id = 1").fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO push_settings (id, enabled, interval_minutes, chat_id, token, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (0, 5, "", "")
+            )
+            return {"enabled": False, "interval_minutes": 5, "chat_id": "", "token": ""}
+        return {
+            "enabled": bool(row[0]),
+            "interval_minutes": int(row[1] or 5),
+            "chat_id": row[2] or "",
+            "token": row[3] or ""
+        }
+    finally:
+        conn.close()
+
+
+def update_push_settings(update: dict) -> dict:
+    current = get_push_settings()
+    merged = {**current, **(update or {})}
+    enabled = 1 if merged.get("enabled") else 0
+    interval_minutes = int(merged.get("interval_minutes") or 5)
+    chat_id = (merged.get("chat_id") or "").strip()
+    token = (merged.get("token") or "").strip()
+    conn = get_connection()
+    try:
+        if DB_BACKEND == "duckdb":
+            conn.execute(
+                "INSERT OR REPLACE INTO push_settings (id, enabled, interval_minutes, chat_id, token, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (enabled, interval_minutes, chat_id, token)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO push_settings (id, enabled, interval_minutes, chat_id, token, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON DUPLICATE KEY UPDATE enabled=VALUES(enabled), interval_minutes=VALUES(interval_minutes), "
+                "chat_id=VALUES(chat_id), token=VALUES(token), updated_at=CURRENT_TIMESTAMP",
+                (enabled, interval_minutes, chat_id, token)
+            )
+    finally:
+        conn.close()
+    return {
+        "enabled": bool(enabled),
+        "interval_minutes": interval_minutes,
+        "chat_id": chat_id,
+        "token": token
+    }
+
+
+def get_symbol_push_setting(symbol: str) -> dict:
+    sym = (symbol or "").upper()
+    if not sym:
+        return {"symbol": "", "enabled": False}
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT enabled FROM symbol_push_settings WHERE symbol = ?", (sym,)).fetchone()
+        if not row:
+            return {"symbol": sym, "enabled": False}
+        return {"symbol": sym, "enabled": bool(row[0])}
+    finally:
+        conn.close()
+
+
+def set_symbol_push_setting(symbol: str, enabled: bool) -> bool:
+    sym = (symbol or "").upper()
+    if not sym:
+        return False
+    conn = get_connection()
+    try:
+        val = 1 if enabled else 0
+        if DB_BACKEND == "duckdb":
+            conn.execute(
+                "INSERT OR REPLACE INTO symbol_push_settings (symbol, enabled, updated_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (sym, val)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO symbol_push_settings (symbol, enabled, updated_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP) "
+                "ON DUPLICATE KEY UPDATE enabled=VALUES(enabled), updated_at=CURRENT_TIMESTAMP",
+                (sym, val)
+            )
+        return True
     finally:
         conn.close()
 

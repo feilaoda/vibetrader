@@ -6,10 +6,11 @@ const ind = (context) => {
     const ma1 = ta.sma(close, 9);
     const ma2 = ta.sma(close, 18);
     const ma3 = ta.sma(close, 36);
+    const ma4 = ta.sma(close, 60);
 
     plot(ma1, "SMA-9", { style: "line", color: "#1f77b4", linewidth: 1, force_overlay: true })
     plot(ma2, "SMA-18", { style: "line", color: "#aec7e8", linewidth: 1, force_overlay: true })
     plot(ma3, "SMA-36", { style: "line", color: "#ff7f0e", linewidth: 1, force_overlay: true })
+    plot(ma4, "SMA-60", { style: "line", color: "#2ca02c", linewidth: 1, force_overlay: true })
 }
-
 

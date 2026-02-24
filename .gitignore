@@ -1,6 +1,7 @@
 # Logs
 logs
 *.log
+*.csv
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -29,3 +30,4 @@ __datacache__
 *.json
 *.duckdb
 *.duckdb.wal
+.codex_last_message.txt

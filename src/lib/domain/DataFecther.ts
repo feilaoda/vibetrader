@@ -199,6 +199,6 @@ const fetchDataAShare = async (baseSer: TSer, symbol: string, tframe: TFrame, tz
         if (isMinutePeriod) {
             console.warn('[fetchDataAShare] 分钟级别数据获取失败');
         }
-        return fetchDataLocal(baseSer);
+        return undefined;
     }
 }

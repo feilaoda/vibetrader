@@ -40,10 +40,14 @@ def is_us_index_symbol(symbol: str) -> bool:
         return False
     if sym.startswith("^"):
         return True
-    if sym.endswith(".US") or sym.endswith(".IDX"):
+    if sym.endswith(".IDX"):
+        return True
+    if sym in _TICKER_MAP:
         return True
     base = sym.split(".", 1)[0]
-    return base in _TICKER_MAP
+    if sym.endswith(".US"):
+        return base in _TICKER_MAP
+    return base in _TICKER_MAP and "." not in sym
 
 
 def resolve_us_index_ticker(symbol: str) -> Optional[str]:

@@ -43,6 +43,7 @@ from fundamentals import router as fundamentals_router
 from industry import router as industry_router
 from crypto import router as crypto_router
 from push import router as push_router
+from screening import router as screening_router
 
 app.include_router(actions_router, prefix="/api")
 app.include_router(paper_router, prefix="/api")
@@ -50,6 +51,7 @@ app.include_router(fundamentals_router, prefix="/api")
 app.include_router(industry_router, prefix="/api")
 app.include_router(crypto_router, prefix="/api")
 app.include_router(push_router, prefix="/api")
+app.include_router(screening_router, prefix="/api")
 
 # CORS 配置
 app.add_middleware(
@@ -96,6 +98,26 @@ def get_market_prefix(symbol: str) -> str:
     elif code.startswith("8") or code.startswith("4"):
         return "bj"  # 北交所
     return "sh"
+
+
+def _is_us_equity_symbol(symbol: str) -> bool:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return False
+    if sym.endswith(".US"):
+        return True
+    if sym.endswith((".SH", ".SZ", ".BJ", ".HK", ".IDX")):
+        return False
+    if sym.endswith(("USDT", "USDC", "BUSD", "FDUSD", "PERP")):
+        return False
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", sym))
+
+
+def _resolve_us_ticker(symbol: str) -> str:
+    sym = (symbol or "").upper().strip()
+    if sym.endswith(".US"):
+        sym = sym[:-3]
+    return re.sub(r"[^A-Z0-9.\-]", "", sym)
 
 
 @app.get("/api/klines/{symbol}")
@@ -427,6 +449,16 @@ async def get_history(symbol: Optional[str] = None, limit: int = 50):
     history = get_history(symbol, limit)
     return {"data": [h.dict() for h in history]}
 
+@app.post("/api/memory/clear")
+async def clear_memory_api(symbol: str = Query(..., description="股票代码")):
+    """清空该标的的记忆摘要，不影响聊天记录"""
+    from db import save_memory, get_last_history_id
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Invalid symbol")
+    last_id = get_last_history_id(symbol)
+    save_memory(symbol, "", last_id)
+    return {"success": True, "last_message_id": last_id}
+
 @app.post("/api/history/{msg_id}/favorite")
 async def toggle_favorite(msg_id: int):
     """收藏/取消收藏消息"""
@@ -690,10 +722,63 @@ async def get_realtime(symbol: str):
             except Exception:
                 pass
 
+        def _build_us_summary_from_daily(sym: str, fallback_name: str = "") -> Optional[dict]:
+            try:
+                from cache import get_klines_with_cache
+                klines, src = get_klines_with_cache(
+                    symbol=sym,
+                    period="daily",
+                    limit=2,
+                    force_refresh=False,
+                    include_intraday=False
+                )
+            except Exception:
+                return None
+            if not klines:
+                return None
+            last = klines[-1]
+            prev_close = 0.0
+            if len(klines) >= 2:
+                try:
+                    prev_close = float(klines[-2].get("close") or 0)
+                except Exception:
+                    prev_close = 0.0
+            close = float(last.get("close") or 0)
+            open_p = float(last.get("open") or close)
+            high = float(last.get("high") or close)
+            low = float(last.get("low") or close)
+            volume = float(last.get("volume") or 0)
+            if prev_close > 0:
+                change = close - prev_close
+                change_pct = (change / prev_close * 100)
+            else:
+                change = close - open_p
+                change_pct = (change / open_p * 100) if open_p else 0
+            ts = int(last.get("closeTime") or last.get("openTime") or (datetime.utcnow().timestamp() * 1000))
+            return {
+                "symbol": sym,
+                "name": fallback_name or sym,
+                "price": close,
+                "change": change,
+                "changePercent": change_pct,
+                "open": open_p,
+                "high": high,
+                "low": low,
+                "volume": volume,
+                "amount": 0,
+                "timestamp": ts,
+                "source": f"{src}_summary" if src else "daily_summary",
+                "stale": True,
+            }
+
         if is_us_index_symbol(symbol):
             ticker = resolve_us_index_ticker(symbol) or symbol
             quote = fetch_quote(ticker)
             if not quote:
+                summary = _build_us_summary_from_daily(symbol, get_us_index_label(ticker) or ticker)
+                if summary:
+                    _maybe_upsert_symbol(summary)
+                    return summary
                 payload = {
                     "symbol": symbol,
                     "name": get_us_index_label(ticker) or ticker,
@@ -727,6 +812,58 @@ async def get_realtime(symbol: str):
                 "high": 0,
                 "low": 0,
                 "volume": 0,
+                "amount": 0,
+                "timestamp": ts,
+                "source": "yahoo",
+                "stale": False
+            }
+            _maybe_upsert_symbol(payload)
+            return payload
+
+        upper_symbol = (symbol or "").upper()
+        if _is_us_equity_symbol(upper_symbol):
+            ticker = _resolve_us_ticker(upper_symbol) or upper_symbol
+            quote = fetch_quote(ticker)
+            if not quote:
+                summary = _build_us_summary_from_daily(symbol, ticker)
+                if summary:
+                    _maybe_upsert_symbol(summary)
+                    return summary
+                payload = {
+                    "symbol": symbol,
+                    "name": ticker,
+                    "price": 0,
+                    "change": 0,
+                    "changePercent": 0,
+                    "open": 0,
+                    "high": 0,
+                    "low": 0,
+                    "volume": 0,
+                    "amount": 0,
+                    "timestamp": int(datetime.utcnow().timestamp() * 1000),
+                    "source": "yahoo",
+                    "stale": True,
+                    "error": "yahoo_quote_failed"
+                }
+                _maybe_upsert_symbol(payload)
+                return payload
+
+            ts = quote.get("time")
+            try:
+                ts = int(float(ts) * 1000) if ts else int(datetime.utcnow().timestamp() * 1000)
+            except Exception:
+                ts = int(datetime.utcnow().timestamp() * 1000)
+
+            payload = {
+                "symbol": symbol,
+                "name": quote.get("name") or ticker,
+                "price": quote.get("price") or 0,
+                "change": quote.get("change") or 0,
+                "changePercent": quote.get("changePercent") or 0,
+                "open": quote.get("open") or 0,
+                "high": quote.get("high") or 0,
+                "low": quote.get("low") or 0,
+                "volume": quote.get("volume") or 0,
                 "amount": 0,
                 "timestamp": ts,
                 "source": "yahoo",

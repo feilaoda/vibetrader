@@ -16,6 +16,7 @@ PUSH_API_URL = os.getenv("PUSH_API_URL", "http://127.0.0.1:8787/api/push")
 class PushSettingsUpdate(BaseModel):
     enabled: Optional[bool] = None
     interval_minutes: Optional[int] = None
+    auto_eval_interval_minutes: Optional[int] = None
     chat_id: Optional[str] = None
     token: Optional[str] = None
 

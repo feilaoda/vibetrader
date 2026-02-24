@@ -566,7 +566,8 @@ class KlineViewContainer extends Component<Props, State> {
     }
 
     fetchRealtimeQuote = async () => {
-        if (getMarket() !== 'ashare') return;
+        const market = getMarket();
+        if (market !== 'ashare' && market !== 'us') return;
         if (typeof document !== 'undefined' && document.hidden) return;
         if (!this.symbol) return;
 

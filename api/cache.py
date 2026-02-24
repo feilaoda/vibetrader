@@ -10,7 +10,7 @@ import json
 import os
 import re
 import urllib.request
-from datetime import datetime, date, timedelta, time as dtime
+from datetime import datetime, date, timedelta, time as dtime, timezone
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -236,8 +236,7 @@ def get_cache_path(symbol: str, period: str) -> Path:
     return CACHE_DIR / f"{safe_symbol}_{period}.json"
 
 
-def load_cache(symbol: str, period: str) -> Optional[Dict]:
-    """加载缓存数据"""
+def _load_cache_file(symbol: str, period: str) -> Optional[Dict]:
     cache_path = get_cache_path(symbol, period)
     if cache_path.exists():
         try:
@@ -248,8 +247,7 @@ def load_cache(symbol: str, period: str) -> Optional[Dict]:
     return None
 
 
-def save_cache(symbol: str, period: str, data: Dict):
-    """保存缓存数据"""
+def _save_cache_file(symbol: str, period: str, data: Dict):
     cache_path = get_cache_path(symbol, period)
     try:
         with open(cache_path, "w", encoding="utf-8") as f:
@@ -257,6 +255,51 @@ def save_cache(symbol: str, period: str, data: Dict):
         print(f"[Cache] Saved {len(data.get('klines', []))} klines to {cache_path.name}")
     except Exception as e:
         print(f"[Cache] Error saving cache: {e}")
+
+
+def _load_daily_cache_db(symbol: str, period: str) -> Optional[Dict]:
+    try:
+        from db import get_daily_klines_cache
+        return get_daily_klines_cache(symbol, period)
+    except Exception as e:
+        print(f"[Cache][DB] Error loading daily cache for {symbol}/{period}: {e}")
+        return None
+
+
+def _save_daily_cache_db(symbol: str, period: str, data: Dict) -> bool:
+    try:
+        from db import save_daily_klines_cache
+        return bool(save_daily_klines_cache(symbol, period, data))
+    except Exception as e:
+        print(f"[Cache][DB] Error saving daily cache for {symbol}/{period}: {e}")
+        return False
+
+
+def load_cache(symbol: str, period: str) -> Optional[Dict]:
+    """加载缓存数据（1d/1w/1M 走 DB，分钟级保留文件缓存）"""
+    if period in DAILY_PERIODS:
+        db_cache = _load_daily_cache_db(symbol, period)
+        if db_cache and isinstance(db_cache.get("klines"), list):
+            return db_cache
+        file_cache = _load_cache_file(symbol, period)
+        if file_cache:
+            if _save_daily_cache_db(symbol, period, file_cache):
+                migrated = _load_daily_cache_db(symbol, period)
+                if migrated and isinstance(migrated.get("klines"), list):
+                    print(f"[Cache][DB] Migrated {symbol}/{period} file cache to DB")
+                    return migrated
+            return file_cache
+        return db_cache
+    return _load_cache_file(symbol, period)
+
+
+def save_cache(symbol: str, period: str, data: Dict):
+    """保存缓存数据（1d/1w/1M 存 DB，失败回退文件缓存）"""
+    if period in DAILY_PERIODS:
+        if _save_daily_cache_db(symbol, period, data):
+            print(f"[Cache][DB] Saved {len(data.get('klines', []))} klines for {symbol}/{period}")
+            return
+    _save_cache_file(symbol, period, data)
 
 
 def should_refresh_cache(cache: Dict, period: str) -> Tuple[bool, str]:
@@ -341,6 +384,268 @@ def _needs_us_range_refresh(cached_klines: List[Dict], start_date: Optional[str]
     return False
 
 
+def _parse_iso_date(date_str: Optional[str]) -> Optional[date]:
+    iso = _normalize_ymd(date_str)
+    if not iso:
+        return None
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _needs_daily_range_refresh(
+    cached_klines: List[Dict],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    latest_date_iso: str,
+) -> bool:
+    if not cached_klines:
+        return True
+    first_iso = _kline_date_iso(cached_klines[0])
+    last_iso = _kline_date_iso(cached_klines[-1])
+    if not first_iso or not last_iso:
+        return True
+
+    start_iso = _normalize_ymd(start_date)
+    end_iso = _normalize_ymd(end_date) or latest_date_iso
+
+    if start_iso and start_iso < first_iso:
+        return True
+    if end_iso and end_iso > last_iso:
+        return True
+    return False
+
+
+def _has_missing_recent_trading_days(cached_klines: List[Dict], window: int = 30) -> bool:
+    if not cached_klines:
+        return True
+    if window <= 0:
+        return False
+    available = {k.get("date") for k in cached_klines if k.get("date")}
+    if not available:
+        return True
+
+    first_cached = _parse_iso_date(cached_klines[0].get("date"))
+    if not first_cached:
+        return True
+
+    required: List[str] = []
+    current = _latest_trading_date()
+    while len(required) < window:
+        if current.weekday() < 5:
+            required.append(current.strftime("%Y-%m-%d"))
+        current = current - timedelta(days=1)
+    if not required:
+        return False
+
+    oldest_required = _parse_iso_date(required[-1])
+    if oldest_required and first_cached > oldest_required:
+        # New listing or short-history symbol: do not treat missing older days as a gap.
+        return False
+    return any(day not in available for day in required)
+
+
+def _merge_klines(existing: List[Dict], incoming: List[Dict], period: str) -> List[Dict]:
+    if not existing:
+        return list(incoming or [])
+    if not incoming:
+        return list(existing or [])
+
+    if period in DAILY_PERIODS:
+        by_date: Dict[str, Dict] = {}
+        for item in existing:
+            day = _kline_date_iso(item)
+            if day:
+                by_date[day] = item
+        for item in incoming:
+            day = _kline_date_iso(item)
+            if day:
+                by_date[day] = item
+        merged = list(by_date.values())
+        merged.sort(key=lambda x: _kline_date_iso(x))
+        return merged
+
+    by_open_time: Dict[int, Dict] = {}
+    for item in existing:
+        ts = int(item.get("openTime", 0) or 0)
+        if ts > 0:
+            by_open_time[ts] = item
+    for item in incoming:
+        ts = int(item.get("openTime", 0) or 0)
+        if ts > 0:
+            by_open_time[ts] = item
+    merged = list(by_open_time.values())
+    merged.sort(key=lambda x: x.get("openTime", 0))
+    return merged
+
+
+def _to_iso_date_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    if not text:
+        return ""
+    if " " in text:
+        text = text.split(" ")[0]
+    if len(text) == 8 and text.isdigit():
+        return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return text
+    try:
+        dt = datetime.fromisoformat(text)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _aggregate_daily_klines(klines: List[Dict], period: str) -> List[Dict]:
+    if period == "daily":
+        return klines
+    if period not in ("weekly", "monthly"):
+        return klines
+    if not klines:
+        return []
+    groups: Dict[str, List[Dict]] = {}
+    for item in klines:
+        day = _kline_date_iso(item)
+        if not day:
+            continue
+        try:
+            dt = datetime.strptime(day, "%Y-%m-%d")
+        except Exception:
+            continue
+        if period == "weekly":
+            iso = dt.isocalendar()
+            key = f"{iso.year}-{iso.week:02d}"
+        else:
+            key = f"{dt.year}-{dt.month:02d}"
+        groups.setdefault(key, []).append(item)
+
+    merged: List[Dict] = []
+    for key in sorted(groups.keys()):
+        rows = sorted(groups[key], key=lambda x: x.get("openTime", 0))
+        if not rows:
+            continue
+        first = rows[0]
+        last = rows[-1]
+        high = max(_safe_float(r.get("high")) for r in rows)
+        low = min(_safe_float(r.get("low")) for r in rows)
+        volume = sum(_safe_float(r.get("volume")) for r in rows)
+        merged.append({
+            "date": first.get("date"),
+            "time": None,
+            "openTime": first.get("openTime", 0),
+            "open": _safe_float(first.get("open")),
+            "high": high,
+            "low": low,
+            "close": _safe_float(last.get("close")),
+            "volume": volume,
+            "closeTime": last.get("closeTime", first.get("openTime", 0)),
+        })
+    return merged
+
+
+def _parse_us_daily_df_to_klines(
+    df,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    period: str = "daily"
+) -> List[Dict]:
+    if df is None or df.empty:
+        return []
+
+    date_col = _pick_column(df, ["date", "日期", "index", "Date"])
+    open_col = _pick_column(df, ["open", "开盘", "Open"])
+    high_col = _pick_column(df, ["high", "最高", "High"])
+    low_col = _pick_column(df, ["low", "最低", "Low"])
+    close_col = _pick_column(df, ["close", "收盘", "Close"])
+    vol_col = _pick_column(df, ["volume", "成交量", "Volume"])
+
+    if not all([date_col, open_col, high_col, low_col, close_col]):
+        return []
+
+    start_iso = _normalize_ymd(start_date)
+    end_iso = _normalize_ymd(end_date)
+
+    out: List[Dict] = []
+    for _, row in df.iterrows():
+        date_iso = _to_iso_date_text(row[date_col])
+        if not date_iso:
+            continue
+        if start_iso and date_iso < start_iso:
+            continue
+        if end_iso and date_iso > end_iso:
+            continue
+        open_time = int(datetime.strptime(date_iso, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+        volume = _safe_float(row[vol_col]) if vol_col else 0.0
+        out.append({
+            "date": date_iso,
+            "time": None,
+            "openTime": open_time,
+            "open": _safe_float(row[open_col]),
+            "high": _safe_float(row[high_col]),
+            "low": _safe_float(row[low_col]),
+            "close": _safe_float(row[close_col]),
+            "volume": volume,
+            "closeTime": open_time + 86400000 - 1,
+        })
+
+    out.sort(key=lambda x: x.get("openTime", 0))
+    return _aggregate_daily_klines(out, period)
+
+
+def _us_index_ticker_to_sina_symbol(ticker: str) -> Optional[str]:
+    t = (ticker or "").upper().strip()
+    mapping = {
+        "^GSPC": ".INX",
+        "^IXIC": ".IXIC",
+        "^NDX": ".NDX",
+        "^DJI": ".DJI",
+    }
+    return mapping.get(t)
+
+
+def _fetch_us_index_daily_from_sina(
+    ticker: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    period: str = "daily"
+) -> List[Dict]:
+    sina_symbol = _us_index_ticker_to_sina_symbol(ticker)
+    if not sina_symbol:
+        return []
+    try:
+        throttle(scope="akshare_kline")
+        df = ak.index_us_stock_sina(symbol=sina_symbol)
+    except Exception as e:
+        print(f"[sina-us-index] Error fetching {ticker}: {e}")
+        return []
+    return _parse_us_daily_df_to_klines(df, start_date, end_date, period=period)
+
+
+def _fetch_us_equity_daily_from_sina(
+    ticker: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    period: str = "daily"
+) -> List[Dict]:
+    symbol = (ticker or "").upper().strip()
+    if not symbol:
+        return []
+    try:
+        throttle(scope="akshare_kline")
+        df = ak.stock_us_daily(symbol=symbol, adjust="")
+    except Exception as e:
+        print(f"[sina-us-equity] Error fetching {ticker}: {e}")
+        return []
+    return _parse_us_daily_df_to_klines(df, start_date, end_date, period=period)
+
+
 def get_us_index_klines_with_cache(
     symbol: str,
     period: str = "daily",
@@ -376,18 +681,24 @@ def get_us_index_klines_with_cache(
             fetch_start = (now - timedelta(days=365)).strftime("%Y%m%d")
 
     interval = _yahoo_interval(period)
-    new_klines = fetch_chart(ticker, fetch_start, fetch_end, interval=interval)
+    fetch_source = "yahoo"
+    try:
+        new_klines = fetch_chart(ticker, fetch_start, fetch_end, interval=interval)
+    except Exception as e:
+        print(f"[Cache][US] fetch_chart failed for {symbol} ({ticker}): {e}")
+        new_klines = []
+    if not new_klines:
+        fallback = _fetch_us_index_daily_from_sina(ticker, fetch_start, fetch_end, period=period)
+        if fallback:
+            new_klines = fallback
+            fetch_source = "sina_us"
 
     if not new_klines:
         filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
         return filtered[-limit:], "cache"
 
     if cached_klines and not force_refresh:
-        existing_times = {k.get("openTime") for k in cached_klines}
-        for kline in new_klines:
-            if kline.get("openTime") not in existing_times:
-                cached_klines.append(kline)
-        cached_klines.sort(key=lambda x: x.get("openTime", 0))
+        cached_klines = _merge_klines(cached_klines, new_klines, period)
     else:
         cached_klines = new_klines
 
@@ -396,11 +707,111 @@ def get_us_index_klines_with_cache(
         "period": period,
         "last_update_date": now.strftime("%Y%m%d"),
         "last_update_time": now.timestamp(),
+        "source": fetch_source,
         "klines": cached_klines,
     })
 
     filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
-    return filtered[-limit:], "yahoo"
+    return filtered[-limit:], fetch_source
+
+
+def _is_us_equity_symbol(symbol: str) -> bool:
+    sym = (symbol or "").upper().strip()
+    if not sym or is_us_index_symbol(sym):
+        return False
+    if sym.endswith(".US"):
+        return True
+    if sym.endswith((".SH", ".SZ", ".BJ", ".HK", ".IDX")):
+        return False
+    # Common crypto quote suffixes; avoid mistaking them as US tickers.
+    if sym.endswith(("USDT", "USDC", "BUSD", "FDUSD", "PERP")):
+        return False
+    # Allow bare tickers like AAPL / TSLA / BRK.B / BRK-B.
+    if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", sym):
+        return True
+    return False
+
+
+def _resolve_us_equity_ticker(symbol: str) -> Optional[str]:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return None
+    if sym.endswith(".US"):
+        ticker = sym[:-3].strip()
+    else:
+        ticker = sym
+    if not ticker:
+        return None
+    # Keep dot and dash for tickers like BRK.B / BRK-B.
+    return re.sub(r"[^A-Z0-9\.\-]", "", ticker)
+
+
+def get_us_equity_klines_with_cache(
+    symbol: str,
+    period: str = "daily",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 365,
+    force_refresh: bool = False
+) -> Tuple[List[Dict], str]:
+    ticker = _resolve_us_equity_ticker(symbol)
+    if not ticker:
+        return [], "unsupported"
+
+    if period not in DAILY_PERIODS:
+        period = "daily"
+
+    cache = load_cache(symbol, period)
+    cached_klines = cache.get("klines", []) if cache else []
+
+    need_refresh, _ = _should_refresh_us_cache(cache)
+    range_refresh = _needs_us_range_refresh(cached_klines, start_date, end_date)
+    if not force_refresh and not need_refresh and not range_refresh:
+        filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
+        return filtered[-limit:], "cache"
+
+    now = datetime.utcnow()
+    fetch_start = _to_ymd_compact(start_date)
+    fetch_end = _to_ymd_compact(end_date) or now.strftime("%Y%m%d")
+    if not fetch_start:
+        if cached_klines and not force_refresh:
+            last_date = cached_klines[-1].get("date")
+            fetch_start = _to_ymd_compact(last_date) or (now - timedelta(days=365)).strftime("%Y%m%d")
+        else:
+            fetch_start = (now - timedelta(days=365)).strftime("%Y%m%d")
+
+    interval = _yahoo_interval(period)
+    fetch_source = "yahoo"
+    try:
+        new_klines = fetch_chart(ticker, fetch_start, fetch_end, interval=interval)
+    except Exception as e:
+        print(f"[Cache][US] fetch_chart failed for {symbol} ({ticker}): {e}")
+        new_klines = []
+    if not new_klines:
+        fallback = _fetch_us_equity_daily_from_sina(ticker, fetch_start, fetch_end, period=period)
+        if fallback:
+            new_klines = fallback
+            fetch_source = "sina_us"
+    if not new_klines:
+        filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
+        return filtered[-limit:], "cache"
+
+    if cached_klines and not force_refresh:
+        cached_klines = _merge_klines(cached_klines, new_klines, period)
+    else:
+        cached_klines = new_klines
+
+    save_cache(symbol, period, {
+        "symbol": symbol,
+        "period": period,
+        "last_update_date": now.strftime("%Y%m%d"),
+        "last_update_time": now.timestamp(),
+        "source": fetch_source,
+        "klines": cached_klines,
+    })
+
+    filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
+    return filtered[-limit:], fetch_source
 
 
 def is_etf(code: str) -> bool:
@@ -1040,6 +1451,15 @@ def get_klines_with_cache(
             limit=limit,
             force_refresh=force_refresh
         )
+    if _is_us_equity_symbol(symbol):
+        return get_us_equity_klines_with_cache(
+            symbol=symbol,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            force_refresh=force_refresh
+        )
     now = _now_cn()
     today = now.date()
     today_str = today.strftime("%Y%m%d")
@@ -1061,9 +1481,24 @@ def get_klines_with_cache(
             if k.get("date") == effective_iso:
                 cached_today = k
                 break
+
+    daily_gap_window = max(1, int(os.getenv("DAILY_GAP_CHECK_WINDOW", "30") or 30))
+    daily_backfill_days = max(1, int(os.getenv("DAILY_SYNC_LOOKBACK_DAYS", "40") or 40))
+    daily_range_refresh = False
+    daily_gap_refresh = False
+    if period in DAILY_PERIODS:
+        daily_range_refresh = _needs_daily_range_refresh(cached_klines, start_date, end_date, trade_iso)
+        daily_gap_refresh = _has_missing_recent_trading_days(cached_klines, daily_gap_window)
     
     if not force_refresh:
         need_refresh, reason = should_refresh_cache(cache, period)
+        if period in DAILY_PERIODS:
+            if daily_range_refresh:
+                need_refresh = True
+                reason = "range_missing"
+            elif daily_gap_refresh:
+                need_refresh = True
+                reason = f"missing_recent_{daily_gap_window}"
         if not need_refresh:
             print(f"[Cache] Using cache for {symbol} ({reason})")
             filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
@@ -1076,15 +1511,34 @@ def get_klines_with_cache(
     print(f"[Cache] Refreshing {symbol} (reason: {reason})")
     
     if cached_klines and not force_refresh:
-        last_date = cached_klines[-1].get("date", "")
-        if last_date:
-            fetch_start = _to_ymd_compact(last_date)
+        if period in DAILY_PERIODS:
+            start_iso = _normalize_ymd(start_date)
+            first_cached = _kline_date_iso(cached_klines[0]) if cached_klines else ""
+            last_cached = _kline_date_iso(cached_klines[-1]) if cached_klines else ""
+            fetch_start_iso = None
+            if start_iso and first_cached and start_iso < first_cached:
+                fetch_start_iso = start_iso
+            if not fetch_start_iso:
+                anchor_date = _parse_iso_date(last_cached or effective_iso)
+                if anchor_date:
+                    fetch_start_iso = (anchor_date - timedelta(days=daily_backfill_days)).strftime("%Y-%m-%d")
+                else:
+                    fetch_start_iso = start_iso or (effective_date - timedelta(days=365)).strftime("%Y-%m-%d")
+                if start_iso and start_iso < fetch_start_iso:
+                    fetch_start_iso = start_iso
+            fetch_start = _to_ymd_compact(fetch_start_iso) or (effective_date - timedelta(days=365)).strftime("%Y%m%d")
         else:
-            fetch_start = _to_ymd_compact(start_date) or (effective_date - timedelta(days=365)).strftime("%Y%m%d")
+            last_date = cached_klines[-1].get("date", "")
+            if last_date:
+                fetch_start = _to_ymd_compact(last_date)
+            else:
+                fetch_start = _to_ymd_compact(start_date) or (effective_date - timedelta(days=365)).strftime("%Y%m%d")
     else:
         fetch_start = _to_ymd_compact(start_date) or (effective_date - timedelta(days=365)).strftime("%Y%m%d")
     
     fetch_end = _to_ymd_compact(end_date) or effective_str
+    if period in DAILY_PERIODS and fetch_end > effective_str:
+        fetch_end = effective_str
     
     print(f"[Cache] Fetching {code} from {fetch_start} to {fetch_end}")
     
@@ -1119,11 +1573,7 @@ def get_klines_with_cache(
     source = get_data_source() # capture source for return
     
     if cached_klines and new_klines and not force_refresh:
-        existing_times = {k.get("openTime") for k in cached_klines}
-        for kline in new_klines:
-            if kline.get("openTime") not in existing_times:
-                cached_klines.append(kline)
-        cached_klines.sort(key=lambda x: x.get("openTime", 0))
+        cached_klines = _merge_klines(cached_klines, new_klines, period)
     elif new_klines:
         cached_klines = new_klines
 
@@ -1159,6 +1609,7 @@ def get_klines_with_cache(
         "period": period,
         "last_update_date": effective_str,
         "last_update_time": now.timestamp(),
+        "source": source,
         "klines": cached_klines,
     })
     

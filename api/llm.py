@@ -2,7 +2,7 @@ import os
 import re
 from typing import List, Dict, Optional
 from openai import OpenAI
-from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, PROVIDERS, AVAILABLE_MODELS
+from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MEMORY_PAIRS_LIMIT, PROVIDERS, AVAILABLE_MODELS
 from prompts import DEFAULT_SYSTEM_PROMPT_NAME, SYSTEM_PROMPT_TEMPLATES
 
 class LLMService:
@@ -116,27 +116,39 @@ class LLMService:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [m for _, m in scored[:top_k]]
 
-    def _summarize_memory(self, client: OpenAI, model_id: str, symbol: str, existing_summary: str, new_messages: List[Dict]) -> Optional[str]:
+    def _summarize_memory(self, client: OpenAI, model_id: str, symbol: str, existing_summary: str, new_messages: List[Dict], include_assistant: bool = False) -> Optional[str]:
         if not client or not new_messages:
             return existing_summary
         new_lines = []
         for msg in new_messages:
-            role = msg.get("role") or "user"
+            role = (msg.get("role") or "user").lower()
+            if role not in ("user", "assistant"):
+                continue
+            if role == "assistant" and not include_assistant:
+                continue
             content = msg.get("content") or ""
             if not content:
                 continue
+            content = re.sub(r"\s+", " ", content).strip()
             new_lines.append(f"{role}: {content}")
         if not new_lines:
             return existing_summary
-        system_prompt = "你是交易助理的记忆整理器。请把对话中的关键信息压缩为简洁要点。"
+        system_prompt = "你是交易助理的记忆整理器。请基于用户问题与AI结论摘要提炼记忆要点。"
+        include_hint = (
+            "必须包含一行以“用户:”开头的要点，以及一行以“AI:”开头的要点。\n"
+            if include_assistant
+            else "必须包含一行以“用户:”开头的要点。\n"
+        )
         user_prompt = (
             f"股票: {symbol}\n"
             f"已有记忆:\n{existing_summary or '(无)'}\n\n"
             "新增对话内容:\n" + "\n".join(new_lines) + "\n\n"
             "请输出更新后的记忆摘要，要求：\n"
             "- 只输出要点（不超过 8 条）\n"
+            "- 包含用户问题与AI结论的摘要要点\n"
             "- 包含偏好、风险、仓位、关注标的、关键结论\n"
-            "- 不要输出解释或多余文字"
+            "- 不要输出解释或多余文字\n"
+            + include_hint
         )
         try:
             resp = client.chat.completions.create(
@@ -152,6 +164,128 @@ class LLMService:
         except Exception:
             return existing_summary
 
+    def _fallback_memory_summary(self, existing_summary: str, new_messages: List[Dict]) -> str:
+        lines: List[str] = []
+        if existing_summary:
+            lines.append(existing_summary.strip())
+        for msg in new_messages:
+            role = (msg.get("role") or "user").lower()
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+            content = re.sub(r"\s+", " ", content)
+            if len(content) > 200:
+                content = content[:200] + "..."
+            prefix = "用户" if role == "user" else "AI"
+            lines.append(f"{prefix}: {content}")
+        if len(lines) > 8:
+            lines = lines[-8:]
+        return "\n".join([ln for ln in lines if ln]).strip()
+
+    def _extract_ai_summary(self, content: str) -> str:
+        if not content:
+            return ""
+        text = content.strip()
+        if not text:
+            return ""
+        lines = [ln.strip() for ln in text.splitlines()]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            return ""
+        keywords = ("总结", "结论", "最终建议", "操作建议", "建议", "综上", "简短总结")
+        start_idx = None
+        for idx, ln in enumerate(lines):
+            for kw in keywords:
+                if kw in ln:
+                    start_idx = idx
+                    break
+            if start_idx is not None:
+                break
+        if start_idx is not None:
+            summary_lines = lines[start_idx:]
+            return "\n".join(summary_lines[:20])
+        # fallback: use tail
+        tail = lines[-12:]
+        return "\n".join(tail)
+
+    def _summary_to_messages(self, summary: str, max_chars: int = 1200) -> List[Dict]:
+        if not summary:
+            return []
+        lines = [ln.strip() for ln in summary.splitlines() if ln and ln.strip()]
+        if not lines:
+            return []
+        messages: List[Dict] = []
+        current_role: Optional[str] = None
+        buffer: List[str] = []
+
+        def _flush():
+            nonlocal buffer, current_role
+            if current_role and buffer:
+                content = " ".join(buffer).strip()
+                if max_chars and len(content) > max_chars:
+                    content = content[-max_chars:]
+                if content:
+                    messages.append({"role": current_role, "content": content})
+            buffer = []
+
+        def _strip_prefix(text: str) -> str:
+            return re.sub(r"^[\-\*\d\.\)\s]+", "", text).strip()
+
+        for raw in lines:
+            clean = _strip_prefix(raw)
+            lowered = clean.lower()
+            role = None
+            payload = None
+            if clean.startswith("用户:") or clean.startswith("用户："):
+                role = "user"
+            elif lowered.startswith("ai:") or lowered.startswith("assistant:") or clean.startswith("助手:") or lowered.startswith("ai：") or lowered.startswith("assistant：") or clean.startswith("助手："):
+                role = "assistant"
+            if role:
+                parts = re.split(r"[:：]", clean, 1)
+                payload = parts[1].strip() if len(parts) > 1 else ""
+                _flush()
+                current_role = role
+                if payload:
+                    buffer.append(payload)
+                continue
+            if current_role:
+                buffer.append(clean)
+        _flush()
+        return messages
+
+    def _build_memory_pairs(self, history: List, max_pairs: int = 5, max_user_chars: int = 600, max_ai_chars: int = 800) -> List[Dict]:
+        if not history:
+            return []
+        pairs = []
+        pending_user = None
+        for msg in history:
+            role = getattr(msg, "role", None)
+            content = getattr(msg, "content", "") or ""
+            content = content.strip()
+            if role == "user" and content:
+                pending_user = content
+                continue
+            if role == "assistant" and pending_user and content:
+                ai_summary = self._extract_ai_summary(content) or content
+                pairs.append((pending_user, ai_summary))
+                pending_user = None
+        if not pairs:
+            return []
+        pairs = pairs[-max_pairs:]
+        messages: List[Dict] = []
+        for user_text, ai_text in pairs:
+            user_text = re.sub(r"\s+", " ", user_text).strip()
+            ai_text = re.sub(r"\s+", " ", ai_text).strip()
+            if max_user_chars and len(user_text) > max_user_chars:
+                user_text = user_text[-max_user_chars:]
+            if max_ai_chars and len(ai_text) > max_ai_chars:
+                ai_text = ai_text[-max_ai_chars:]
+            if user_text:
+                messages.append({"role": "user", "content": user_text})
+            if ai_text:
+                messages.append({"role": "assistant", "content": ai_text})
+        return messages
+
     def analyze_stock(
         self,
         symbol: str,
@@ -165,6 +299,10 @@ class LLMService:
         """调用 LLM 分析股票 (支持对话模式)"""
         target_model = model or self.default_model
         client = self._get_client(target_model)
+
+        debug_ctx = os.getenv("LLM_DEBUG_CONTEXT", "").lower() in ("1", "true", "yes", "on")
+        debug_verbose = os.getenv("LLM_DEBUG_CONTEXT_VERBOSE", "").lower() in ("1", "true", "yes", "on")
+        debug_full = os.getenv("LLM_DEBUG_CONTEXT_FULL", "").lower() in ("1", "true", "yes", "on")
         
         if not client:
             yield f"Error: LLM API Key not configured for model {target_model}. Please check your .env configuration."
@@ -199,9 +337,13 @@ class LLMService:
         SUMMARY_MIN = _to_int("summary_min", 10, 0, 200)
         SUMMARY_STEP = _to_int("summary_step", 6, 1, 50)
         MAX_MESSAGE_CHARS = _to_int("max_message_chars", 1200, 200, 4000)
+        MEMORY_PAIRS_LIMIT = _to_int("memory_pairs_limit", LLM_MEMORY_PAIRS_LIMIT, 1, 50)
         RELEVANT_TOP_K = _to_int("relevant_top_k", 4, 0, 10)
         ENABLE_MEMORY = _to_bool("enable_memory", True)
+        MEMORY_INCLUDE_ASSISTANT = _to_bool("memory_include_assistant", False)
         ENABLE_RETRIEVAL = _to_bool("enable_retrieval", True)
+        RETRIEVAL_INCLUDE_ASSISTANT = _to_bool("retrieval_include_assistant", False)
+        HISTORY_INCLUDE_ASSISTANT = _to_bool("history_include_assistant", False)
         DISABLE_HISTORY = _to_bool("disable_history", False)
         DISABLE_INDICATOR_CONTEXT = _to_bool("disable_indicator_context", False)
         SAVE_HISTORY = _to_bool("save_history", True)
@@ -210,7 +352,24 @@ class LLMService:
 
         active_prompt = db.get_active_system_prompt(symbol) if symbol else None
         system_prompt = self.build_system_prompt(symbol, active_prompt.get("prompt") if active_prompt else None)
-        if DISABLE_HISTORY:
+        short_query = False
+        if user_input:
+            try:
+                short_query = len(user_input.strip()) <= 6
+            except Exception:
+                short_query = False
+
+        effective_summary_min = SUMMARY_MIN
+        effective_summary_step = SUMMARY_STEP
+        if MEMORY_INCLUDE_ASSISTANT:
+            effective_summary_min = min(SUMMARY_MIN, 2)
+            effective_summary_step = 1
+
+        raw_history = []
+        if not DISABLE_HISTORY:
+            raw_history = db.get_history(symbol, HISTORY_LIMIT)
+
+        if DISABLE_HISTORY or (short_query and not MEMORY_INCLUDE_ASSISTANT):
             ENABLE_MEMORY = False
             ENABLE_RETRIEVAL = False
             HISTORY_LIMIT = 0
@@ -219,17 +378,23 @@ class LLMService:
             summary = ""
             last_summary_id = 0
         else:
-            history = db.get_history(symbol, HISTORY_LIMIT)
+            history = list(raw_history)
             memory = db.get_memory(symbol) if symbol else None
             summary = memory.get("summary") if memory else ""
             last_summary_id = memory.get("last_message_id") if memory else 0
+            if memory is not None and last_summary_id:
+                history = [msg for msg in history if msg.id > last_summary_id]
 
-        if ENABLE_MEMORY and history and len(history) >= SUMMARY_MIN:
+        if ENABLE_MEMORY and history and len(history) >= effective_summary_min:
             last_id = history[-1].id
-            if not summary or (last_summary_id and last_id - last_summary_id >= SUMMARY_STEP) or (not last_summary_id and last_id >= SUMMARY_STEP):
+            if not summary or (last_summary_id and last_id - last_summary_id >= effective_summary_step) or (not last_summary_id and last_id >= effective_summary_step):
                 new_msgs = []
                 for msg in history:
                     if last_summary_id and msg.id <= last_summary_id:
+                        continue
+                    if msg.role == "assistant" and not MEMORY_INCLUDE_ASSISTANT:
+                        continue
+                    if msg.role not in ("user", "assistant"):
                         continue
                     new_msgs.append({
                         "role": msg.role,
@@ -237,14 +402,20 @@ class LLMService:
                     })
                 if len(new_msgs) > 20:
                     new_msgs = new_msgs[-20:]
-                updated = self._summarize_memory(client, target_model, symbol, summary or "", new_msgs)
+                updated = self._summarize_memory(client, target_model, symbol, summary or "", new_msgs, include_assistant=MEMORY_INCLUDE_ASSISTANT)
                 if updated:
                     summary = updated
                     if SAVE_HISTORY:
                         db.save_memory(symbol, summary, last_id)
+                    if debug_ctx:
+                        print(f"[LLM][Memory] summary_updated=history len={len(summary)} last_id={last_id}")
 
-        recent_msgs = history[-RECENT_LIMIT:] if history and RECENT_LIMIT > 0 else []
-        older_msgs = history[:-RECENT_LIMIT] if history and RECENT_LIMIT > 0 else history
+        context_history = history
+        if history and not HISTORY_INCLUDE_ASSISTANT:
+            context_history = [msg for msg in history if msg.role == "user"]
+
+        recent_msgs = context_history[-RECENT_LIMIT:] if context_history and RECENT_LIMIT > 0 else []
+        older_msgs = context_history[:-RECENT_LIMIT] if context_history and RECENT_LIMIT > 0 else context_history
 
         def _trim(content: str) -> str:
             if not content:
@@ -255,22 +426,39 @@ class LLMService:
             return text
 
         relevant_msgs = []
-        if ENABLE_RETRIEVAL and user_input and older_msgs:
-            older_dicts = [{"role": m.role, "content": m.content} for m in older_msgs]
+        if ENABLE_RETRIEVAL and user_input and history:
+            retrieval_history = history if RETRIEVAL_INCLUDE_ASSISTANT else [m for m in history if m.role == "user"]
+            if RECENT_LIMIT > 0:
+                retrieval_older = retrieval_history[:-RECENT_LIMIT]
+            else:
+                retrieval_older = retrieval_history
+            older_dicts = [{"role": m.role, "content": m.content} for m in retrieval_older]
             relevant_msgs = self._select_relevant_messages(user_input, older_dicts, top_k=RELEVANT_TOP_K)
 
         messages = [{"role": "system", "content": system_prompt}]
-        if summary and ENABLE_MEMORY:
-            messages.append({"role": "system", "content": f"对话记忆（仅供参考，不要逐字复述）:\n{summary}"})
-        if relevant_msgs and ENABLE_RETRIEVAL:
-            rel_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in relevant_msgs if m.get("content")])
-            if rel_text:
-                messages.append({"role": "system", "content": f"相关历史对话片段:\n{rel_text}"})
-        for msg in recent_msgs:
-            role = msg.role if msg.role in ("user", "assistant") else "user"
-            content = _trim(msg.content)
-            if content:
-                messages.append({"role": role, "content": content})
+        memory_messages: List[Dict] = []
+        if ENABLE_MEMORY:
+            if MEMORY_INCLUDE_ASSISTANT:
+                memory_messages = self._build_memory_pairs(raw_history, max_pairs=MEMORY_PAIRS_LIMIT, max_user_chars=MAX_MESSAGE_CHARS, max_ai_chars=MAX_MESSAGE_CHARS)
+            elif summary:
+                memory_messages = self._summary_to_messages(summary, MAX_MESSAGE_CHARS)
+                if not memory_messages:
+                    memory_messages = [{"role": "assistant", "content": f"对话记忆（仅供参考，不要逐字复述）:\n{summary}"}]
+        suppress_recent = MEMORY_INCLUDE_ASSISTANT and bool(memory_messages)
+        if memory_messages:
+            messages.extend(memory_messages)
+        if relevant_msgs and ENABLE_RETRIEVAL and not suppress_recent:
+            for m in relevant_msgs:
+                role = m.get("role") if m.get("role") in ("user", "assistant") else "user"
+                content = _trim(m.get("content") or "")
+                if content:
+                    messages.append({"role": role, "content": content})
+        if not suppress_recent:
+            for msg in recent_msgs:
+                role = msg.role if msg.role in ("user", "assistant") else "user"
+                content = _trim(msg.content)
+                if content:
+                    messages.append({"role": role, "content": content})
 
         kline_limit = KLINE_ROWS_ASSISTANT if mode == "assistant" else KLINE_ROWS_CHAT
         data_context = self._format_kline_data(klines, max_rows=kline_limit) if klines else ""
@@ -291,11 +479,17 @@ class LLMService:
 
         if user_input:
             full_prompt = (
-                f"{context_block}{extra_block}"
                 f"用户问题: \"{user_input}\"\n"
-                "请结合对话上下文与数据进行回答。"
+                "请结合对话上下文与数据进行回答。\n\n"
+                f"{extra_block}{context_block}"
             )
             user_msg_content = user_input
+            if MEMORY_INCLUDE_ASSISTANT:
+                full_prompt = (
+                    f"用户问题: \"{user_input}\"\n"
+                    "请先给出完整分析，最后必须包含“总结/结论/最终建议”小节。\n\n"
+                    f"{extra_block}{context_block}"
+                )
         else:
             full_prompt = (
                 f"{context_block}{extra_block}"
@@ -313,9 +507,6 @@ class LLMService:
 
         try:
             messages.append({"role": "user", "content": full_prompt})
-            debug_ctx = os.getenv("LLM_DEBUG_CONTEXT", "").lower() in ("1", "true", "yes", "on")
-            debug_verbose = os.getenv("LLM_DEBUG_CONTEXT_VERBOSE", "").lower() in ("1", "true", "yes", "on")
-            debug_full = os.getenv("LLM_DEBUG_CONTEXT_FULL", "").lower() in ("1", "true", "yes", "on")
             if debug_ctx:
                 print(
                     "[LLM][Context] "
@@ -326,6 +517,20 @@ class LLMService:
                     f"relevant={len(relevant_msgs)} "
                     f"kline_rows={kline_limit}"
                 )
+                print(
+                    "[LLM][Context] "
+                    f"memory_ai={'on' if MEMORY_INCLUDE_ASSISTANT else 'off'} "
+                    f"summary_min={effective_summary_min} summary_step={effective_summary_step} "
+                    f"memory_pairs_limit={MEMORY_PAIRS_LIMIT}"
+                )
+                if memory_messages:
+                    print(f"[LLM][Context] memory_pairs={len(memory_messages)}")
+                if active_prompt:
+                    print(
+                        "[LLM][Context] "
+                        f"prompt_id={active_prompt.get('id')} "
+                        f"prompt_name={active_prompt.get('name')}"
+                    )
                 if summary and ENABLE_MEMORY:
                     print(f"[LLM][Context] summary_len={len(summary)}")
             if debug_verbose:
@@ -357,6 +562,33 @@ class LLMService:
                 # 5. Save Assistant Response to DB
                 if full_response and SAVE_HISTORY:
                     db.add_message(symbol, "assistant", full_response, target_model)
+                    if ENABLE_MEMORY and MEMORY_INCLUDE_ASSISTANT:
+                        try:
+                            memory = db.get_memory(symbol) if symbol else None
+                            existing_summary = memory.get("summary") if memory else ""
+                            ai_summary = self._extract_ai_summary(full_response)
+                            if ai_summary:
+                                new_msgs = []
+                                if user_msg_content:
+                                    new_msgs.append({"role": "user", "content": user_msg_content})
+                                new_msgs.append({"role": "assistant", "content": ai_summary})
+                                updated = self._summarize_memory(
+                                    client,
+                                    target_model,
+                                    symbol,
+                                    existing_summary or "",
+                                    new_msgs,
+                                    include_assistant=True
+                                )
+                                if not updated:
+                                    updated = self._fallback_memory_summary(existing_summary or "", new_msgs)
+                                if updated:
+                                    last_id = db.get_last_history_id(symbol) if symbol else 0
+                                    db.save_memory(symbol, updated, last_id)
+                                    if debug_ctx:
+                                        print(f"[LLM][Memory] summary_updated=assistant len={len(updated)} last_id={last_id}")
+                        except Exception:
+                            pass
             finally:
                 try:
                     if response is not None and hasattr(response, "close"):

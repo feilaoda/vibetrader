@@ -1,7 +1,8 @@
 import os
 import re
+import json
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 import pymysql
 from strategy_defaults import (
     DEFAULT_OBJECTIVES,
@@ -234,6 +235,32 @@ def init_db():
                 PRIMARY KEY(symbol, date)
             );
 
+            CREATE TABLE IF NOT EXISTS daily_klines (
+                symbol VARCHAR,
+                period VARCHAR,
+                date VARCHAR,
+                open_time BIGINT,
+                close_time BIGINT,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume DOUBLE,
+                source VARCHAR,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, period, date)
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_kline_sync_state (
+                symbol VARCHAR,
+                period VARCHAR,
+                last_update_date VARCHAR,
+                last_update_time DOUBLE,
+                source VARCHAR,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, period)
+            );
+
             CREATE TABLE IF NOT EXISTS symbol_industry (
                 symbol VARCHAR PRIMARY KEY,
                 industry VARCHAR,
@@ -436,6 +463,34 @@ def init_db():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
+            CREATE TABLE IF NOT EXISTS daily_klines (
+                symbol VARCHAR(32),
+                period VARCHAR(16),
+                date VARCHAR(10),
+                open_time BIGINT,
+                close_time BIGINT,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume DOUBLE,
+                source VARCHAR(32),
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, period, date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS daily_kline_sync_state (
+                symbol VARCHAR(32),
+                period VARCHAR(16),
+                last_update_date VARCHAR(8),
+                last_update_time DOUBLE,
+                source VARCHAR(32),
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, period)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
             CREATE TABLE IF NOT EXISTS symbol_industry (
                 symbol VARCHAR(32) PRIMARY KEY,
                 industry VARCHAR(128),
@@ -578,6 +633,14 @@ def init_db():
     try:
         if not _col_exists("screening_results", "model_id"):
             conn.execute("ALTER TABLE screening_results ADD COLUMN model_id VARCHAR")
+    except Exception:
+        pass
+    try:
+        if not _col_exists("push_settings", "auto_eval_interval_minutes"):
+            if DB_BACKEND == "duckdb":
+                conn.execute("ALTER TABLE push_settings ADD COLUMN auto_eval_interval_minutes INTEGER DEFAULT 5")
+            else:
+                conn.execute("ALTER TABLE push_settings ADD COLUMN auto_eval_interval_minutes INT DEFAULT 5")
     except Exception:
         pass
 
@@ -1033,6 +1096,7 @@ def init_db():
                 id INTEGER PRIMARY KEY,
                 enabled BOOLEAN DEFAULT FALSE,
                 interval_minutes INTEGER DEFAULT 5,
+                auto_eval_interval_minutes INTEGER DEFAULT 5,
                 chat_id VARCHAR,
                 token VARCHAR,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1051,6 +1115,7 @@ def init_db():
                 id INT PRIMARY KEY,
                 enabled TINYINT(1) DEFAULT 0,
                 interval_minutes INT DEFAULT 5,
+                auto_eval_interval_minutes INT DEFAULT 5,
                 chat_id VARCHAR(128),
                 token VARCHAR(255),
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1202,23 +1267,240 @@ def upsert_symbol_db(symbol: str, code: Optional[str] = None, name: Optional[str
         conn.close()
 
 
+def _normalize_kline_period(period: str) -> str:
+    text = (period or "daily").strip().lower()
+    if text in ("1d", "d"):
+        return "daily"
+    if text in ("1w", "w"):
+        return "weekly"
+    if text in ("1m", "m"):
+        return "monthly"
+    return text or "daily"
+
+
+def _safe_float_value(value: Any) -> float:
+    try:
+        if value is None:
+            return 0.0
+        if isinstance(value, str):
+            text = value.strip().replace(",", "")
+            if text in ("", "--", "None", "nan"):
+                return 0.0
+            return float(text)
+        num = float(value)
+        if num != num or num in (float("inf"), float("-inf")):
+            return 0.0
+        return num
+    except Exception:
+        return 0.0
+
+
+def _safe_int_value(value: Any) -> int:
+    try:
+        if value is None:
+            return 0
+        return int(float(value))
+    except Exception:
+        return 0
+
+
+def _normalize_ymd(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if " " in text:
+        text = text.split(" ")[0]
+    if len(text) == 8 and text.isdigit():
+        return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
+    return text
+
+
+def _to_ymd_compact(value: Any) -> str:
+    text = _normalize_ymd(value)
+    return text.replace("-", "") if text else ""
+
+
+def get_daily_klines_cache(symbol: str, period: str = "daily") -> Optional[Dict[str, Any]]:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return None
+    per = _normalize_kline_period(period)
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT date, open_time, close_time, open, high, low, close, volume, source "
+            "FROM daily_klines WHERE symbol = ? AND period = ? ORDER BY date ASC",
+            (sym, per)
+        ).fetchall()
+        state = conn.execute(
+            "SELECT last_update_date, last_update_time, source FROM daily_kline_sync_state "
+            "WHERE symbol = ? AND period = ?",
+            (sym, per)
+        ).fetchone()
+        if not rows and not state:
+            return None
+
+        klines: List[Dict[str, Any]] = []
+        for row in rows:
+            date_iso = _normalize_ymd(row[0])
+            if not date_iso:
+                continue
+            open_time = _safe_int_value(row[1])
+            close_time = _safe_int_value(row[2])
+            if open_time <= 0:
+                try:
+                    open_time = int(datetime.strptime(date_iso, "%Y-%m-%d").timestamp() * 1000)
+                except Exception:
+                    open_time = 0
+            if close_time <= 0:
+                close_time = open_time + 86400000 - 1 if open_time > 0 else 0
+            klines.append({
+                "date": date_iso,
+                "time": None,
+                "openTime": open_time,
+                "open": _safe_float_value(row[3]),
+                "high": _safe_float_value(row[4]),
+                "low": _safe_float_value(row[5]),
+                "close": _safe_float_value(row[6]),
+                "volume": _safe_float_value(row[7]),
+                "closeTime": close_time,
+                "source": (row[8] or "") if len(row) > 8 else "",
+            })
+
+        last_update_date = _to_ymd_compact(state[0]) if state else ""
+        if not last_update_date and klines:
+            last_update_date = _to_ymd_compact(klines[-1].get("date"))
+        last_update_time = _safe_float_value(state[1]) if state else 0.0
+        state_source = (state[2] or "") if state and len(state) > 2 else ""
+
+        return {
+            "symbol": sym,
+            "period": per,
+            "last_update_date": last_update_date,
+            "last_update_time": last_update_time,
+            "source": state_source,
+            "klines": klines,
+        }
+    except Exception as e:
+        print(f"[DB] Error loading daily klines cache {sym}/{per}: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def save_daily_klines_cache(symbol: str, period: str, data: Dict[str, Any]) -> bool:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return False
+    per = _normalize_kline_period(period)
+    payload = data or {}
+    raw_klines = payload.get("klines") if isinstance(payload, dict) else []
+    if not isinstance(raw_klines, list):
+        raw_klines = []
+    state_source = (payload.get("source") or "").strip() if isinstance(payload, dict) else ""
+
+    rows: List[tuple] = []
+    for item in raw_klines:
+        if not isinstance(item, dict):
+            continue
+        date_iso = _normalize_ymd(item.get("date"))
+        if not date_iso:
+            continue
+        source = (item.get("source") or state_source or "").strip()
+        rows.append((
+            sym,
+            per,
+            date_iso,
+            _safe_int_value(item.get("openTime")),
+            _safe_int_value(item.get("closeTime")),
+            _safe_float_value(item.get("open")),
+            _safe_float_value(item.get("high")),
+            _safe_float_value(item.get("low")),
+            _safe_float_value(item.get("close")),
+            _safe_float_value(item.get("volume")),
+            source,
+        ))
+
+    rows.sort(key=lambda x: x[2])
+
+    last_update_date = ""
+    if isinstance(payload, dict):
+        last_update_date = _to_ymd_compact(payload.get("last_update_date"))
+    if not last_update_date and rows:
+        last_update_date = _to_ymd_compact(rows[-1][2])
+    last_update_time = _safe_float_value(payload.get("last_update_time")) if isinstance(payload, dict) else 0.0
+    if not last_update_time:
+        last_update_time = time.time()
+
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM daily_klines WHERE symbol = ? AND period = ?", (sym, per))
+        if rows:
+            conn.executemany(
+                "INSERT INTO daily_klines "
+                "(symbol, period, date, open_time, close_time, open, high, low, close, volume, source, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                rows
+            )
+        if DB_BACKEND == "duckdb":
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_kline_sync_state "
+                "(symbol, period, last_update_date, last_update_time, source, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (sym, per, last_update_date, float(last_update_time), state_source)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO daily_kline_sync_state "
+                "(symbol, period, last_update_date, last_update_time, source, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON DUPLICATE KEY UPDATE last_update_date=VALUES(last_update_date), "
+                "last_update_time=VALUES(last_update_time), source=VALUES(source), "
+                "updated_at=CURRENT_TIMESTAMP",
+                (sym, per, last_update_date, float(last_update_time), state_source)
+            )
+        conn.execute("COMMIT")
+        return True
+    except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        print(f"[DB] Error saving daily klines cache {sym}/{per}: {e}")
+        return False
+    finally:
+        conn.close()
+
+
 def get_push_settings() -> dict:
     """Get global push settings (auto-create if missing)."""
     conn = get_connection()
     try:
-        row = conn.execute("SELECT enabled, interval_minutes, chat_id, token FROM push_settings WHERE id = 1").fetchone()
+        row = conn.execute(
+            "SELECT enabled, interval_minutes, auto_eval_interval_minutes, chat_id, token FROM push_settings WHERE id = 1"
+        ).fetchone()
         if not row:
             conn.execute(
-                "INSERT INTO push_settings (id, enabled, interval_minutes, chat_id, token, updated_at) "
-                "VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                (0, 5, "", "")
+                "INSERT INTO push_settings (id, enabled, interval_minutes, auto_eval_interval_minutes, chat_id, token, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (0, 5, 5, "", "")
             )
-            return {"enabled": False, "interval_minutes": 5, "chat_id": "", "token": ""}
+            return {
+                "enabled": False,
+                "interval_minutes": 5,
+                "auto_eval_interval_minutes": 5,
+                "chat_id": "",
+                "token": ""
+            }
         return {
             "enabled": bool(row[0]),
             "interval_minutes": int(row[1] or 5),
-            "chat_id": row[2] or "",
-            "token": row[3] or ""
+            "auto_eval_interval_minutes": int(row[2] or 5),
+            "chat_id": row[3] or "",
+            "token": row[4] or ""
         }
     finally:
         conn.close()
@@ -1229,29 +1511,32 @@ def update_push_settings(update: dict) -> dict:
     merged = {**current, **(update or {})}
     enabled = 1 if merged.get("enabled") else 0
     interval_minutes = int(merged.get("interval_minutes") or 5)
+    auto_eval_interval_minutes = int(merged.get("auto_eval_interval_minutes") or 5)
     chat_id = (merged.get("chat_id") or "").strip()
     token = (merged.get("token") or "").strip()
     conn = get_connection()
     try:
         if DB_BACKEND == "duckdb":
             conn.execute(
-                "INSERT OR REPLACE INTO push_settings (id, enabled, interval_minutes, chat_id, token, updated_at) "
-                "VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                (enabled, interval_minutes, chat_id, token)
+                "INSERT OR REPLACE INTO push_settings (id, enabled, interval_minutes, auto_eval_interval_minutes, chat_id, token, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (enabled, interval_minutes, auto_eval_interval_minutes, chat_id, token)
             )
         else:
             conn.execute(
-                "INSERT INTO push_settings (id, enabled, interval_minutes, chat_id, token, updated_at) "
-                "VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "INSERT INTO push_settings (id, enabled, interval_minutes, auto_eval_interval_minutes, chat_id, token, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
                 "ON DUPLICATE KEY UPDATE enabled=VALUES(enabled), interval_minutes=VALUES(interval_minutes), "
-                "chat_id=VALUES(chat_id), token=VALUES(token), updated_at=CURRENT_TIMESTAMP",
-                (enabled, interval_minutes, chat_id, token)
+                "auto_eval_interval_minutes=VALUES(auto_eval_interval_minutes), chat_id=VALUES(chat_id), "
+                "token=VALUES(token), updated_at=CURRENT_TIMESTAMP",
+                (enabled, interval_minutes, auto_eval_interval_minutes, chat_id, token)
             )
     finally:
         conn.close()
     return {
         "enabled": bool(enabled),
         "interval_minutes": interval_minutes,
+        "auto_eval_interval_minutes": auto_eval_interval_minutes,
         "chat_id": chat_id,
         "token": token
     }
@@ -1336,6 +1621,21 @@ def get_history(symbol: str = None, limit: int = 50):
         ))
     return messages
 
+def get_last_history_id(symbol: str) -> int:
+    conn = get_connection()
+    try:
+        if not symbol:
+            return 0
+        row = conn.execute(
+            "SELECT MAX(id) FROM chat_history WHERE symbol = ?",
+            (symbol,)
+        ).fetchone()
+        if not row or row[0] is None:
+            return 0
+        return int(row[0])
+    finally:
+        conn.close()
+
 def toggle_favorite(message_id: int) -> bool:
     conn = get_connection()
     curr = conn.execute("SELECT is_favorite FROM chat_history WHERE id = ?", (message_id,)).fetchone()
@@ -1374,6 +1674,17 @@ def save_memory(symbol: str, summary: str, last_message_id: int):
             "INSERT INTO chat_memory (symbol, summary, last_message_id, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
             (symbol, summary, int(last_message_id))
         )
+    finally:
+        conn.close()
+
+def clear_memory(symbol: str) -> bool:
+    conn = get_connection()
+    try:
+        sym = (symbol or "").upper()
+        if not sym:
+            return False
+        conn.execute("DELETE FROM chat_memory WHERE symbol = ?", (sym,))
+        return True
     finally:
         conn.close()
 
@@ -1482,7 +1793,7 @@ def get_prompt_template_by_name(name: str) -> dict | None:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT id, name, prompt, is_builtin FROM prompt_templates WHERE name = ? LIMIT 1",
+            "SELECT id, name, prompt, is_builtin FROM prompt_templates WHERE name = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
             ((name or "").strip(),)
         ).fetchone()
         if not row:

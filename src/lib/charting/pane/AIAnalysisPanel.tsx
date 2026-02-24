@@ -75,7 +75,11 @@ interface ChatMessage {
 
 type ContextSettings = {
     enableMemory: boolean;
+    memoryIncludeAssistant: boolean;
     enableRetrieval: boolean;
+    retrievalIncludeAssistant: boolean;
+    historyIncludeAssistant: boolean;
+    contextOnlyCurrent: boolean;
     chatUseDaily: boolean;
     saveHistory: boolean;
     showIndustryInChat: boolean;
@@ -92,9 +96,13 @@ type ContextSettings = {
 const SETTINGS_KEY = "vibetrader.ai.context.settings";
 const DEFAULT_SETTINGS: ContextSettings = {
     enableMemory: true,
+    memoryIncludeAssistant: false,
     enableRetrieval: true,
+    retrievalIncludeAssistant: false,
+    historyIncludeAssistant: false,
+    contextOnlyCurrent: false,
     chatUseDaily: true,
-    saveHistory: true,
+    saveHistory: false,
     showIndustryInChat: true,
     historyLimit: 60,
     recentLimit: 8,
@@ -109,6 +117,7 @@ const DEFAULT_SETTINGS: ContextSettings = {
 type PushSettings = {
     enabled: boolean;
     intervalMinutes: number;
+    autoEvalIntervalMinutes: number;
     chatId: string;
     token: string;
 };
@@ -116,6 +125,7 @@ type PushSettings = {
 const DEFAULT_PUSH_SETTINGS: PushSettings = {
     enabled: false,
     intervalMinutes: 5,
+    autoEvalIntervalMinutes: 5,
     chatId: "",
     token: ""
 };
@@ -130,6 +140,20 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const [settingsTab, setSettingsTab] = useState<'params' | 'prompt' | 'industry' | 'push'>('params');
     const [contextSettings, setContextSettings] = useState<ContextSettings>(DEFAULT_SETTINGS);
     const [pushSettings, setPushSettings] = useState<PushSettings>(DEFAULT_PUSH_SETTINGS);
+
+    const resolveModelLabel = (modelId?: string) => {
+        if (!modelId) return "";
+        const lower = modelId.toLowerCase();
+        if (lower.includes("gemini")) return "Gemini";
+        if (lower.includes("deepseek")) return "DeepSeek";
+        if (lower.includes("claude")) return "Claude";
+        const found = config?.models?.find(m => m.id === modelId);
+        const name = found?.name || "";
+        if (name.includes("Gemini")) return "Gemini";
+        if (name.includes("DeepSeek")) return "DeepSeek";
+        if (name.includes("Claude")) return "Claude";
+        return modelId;
+    };
     const [pushSymbolEnabled, setPushSymbolEnabled] = useState(false);
     const [pushSettingsError, setPushSettingsError] = useState("");
     const [pushSettingsSaving, setPushSettingsSaving] = useState(false);
@@ -141,6 +165,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const [autoLoading, setAutoLoading] = useState(false);
     const [autoError, setAutoError] = useState("");
     const [autoLastRun, setAutoLastRun] = useState<number | null>(null);
+    const [memoryClearing, setMemoryClearing] = useState(false);
+    const [memoryNotice, setMemoryNotice] = useState("");
     const autoRunningRef = useRef(false);
     const latestKlinesRef = useRef<Kline[]>([]);
     const abortControllerRef = useRef<AbortController | null>(null);
@@ -355,6 +381,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             setPushSettings({
                 enabled: !!cfg.enabled,
                 intervalMinutes: Number(cfg.interval_minutes || 5),
+                autoEvalIntervalMinutes: Number(cfg.auto_eval_interval_minutes || 5),
                 chatId: cfg.chat_id || "",
                 token: cfg.token || ""
             });
@@ -385,6 +412,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 body: JSON.stringify({
                     enabled: pushSettings.enabled,
                     interval_minutes: pushSettings.intervalMinutes,
+                    auto_eval_interval_minutes: pushSettings.autoEvalIntervalMinutes,
                     chat_id: pushSettings.chatId,
                     token: pushSettings.token
                 })
@@ -450,6 +478,24 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
     const HISTORY_LIMIT = 5;
 
+    const mergeHistory = (localMsgs: ChatMessage[], serverMsgs: ChatMessage[]) => {
+        if (!Array.isArray(serverMsgs) || serverMsgs.length === 0) return serverMsgs;
+        if (!Array.isArray(localMsgs) || localMsgs.length === 0) return serverMsgs;
+        const merged = serverMsgs.map(msg => ({ ...msg }));
+        const localLastUser = [...localMsgs].reverse().find(msg => msg.role === "user");
+        if (localLastUser) {
+            for (let i = merged.length - 1; i >= 0; i -= 1) {
+                if (merged[i].role !== "user") continue;
+                const timeDelta = Math.abs((merged[i].timestamp || 0) - (localLastUser.timestamp || 0));
+                if (timeDelta <= 6 && localLastUser.content && localLastUser.content !== merged[i].content) {
+                    merged[i] = { ...merged[i], content: localLastUser.content };
+                }
+                break;
+            }
+        }
+        return merged;
+    };
+
     const loadHistory = () => {
         if (analysisMode === 'temporary') {
             setMessages([]);
@@ -457,7 +503,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         }
         fetch(`${API_BASE_URL}/api/history?symbol=${props.symbol}&limit=${HISTORY_LIMIT}`)
             .then(res => res.json())
-            .then(data => setMessages(data.data))
+            .then(data => setMessages(prev => mergeHistory(prev, data.data)))
             .catch(console.error);
     };
 
@@ -759,7 +805,10 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                     mode: analysisMode,
                     context_config: {
                         enable_memory: contextSettings.enableMemory,
+                        memory_include_assistant: contextSettings.memoryIncludeAssistant,
                         enable_retrieval: contextSettings.enableRetrieval,
+                        retrieval_include_assistant: contextSettings.retrievalIncludeAssistant,
+                        history_include_assistant: contextSettings.historyIncludeAssistant,
                         save_history: contextSettings.saveHistory,
                         chat_use_daily: contextSettings.chatUseDaily,
                         history_limit: contextSettings.historyLimit,
@@ -883,7 +932,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                     // ignore
                 });
             }
-            if (!wasAborted && analysisMode !== 'temporary') {
+            if (!wasAborted && analysisMode !== 'temporary' && contextSettings.saveHistory && !disableHistory) {
                 try {
                     loadHistory();
                 } catch (e) {
@@ -902,7 +951,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
         let klinesToUse = props.klines;
         let realtimeSummary = '';
-        const wantDaily = analysisMode === 'assistant' || ((analysisMode === 'chat' || analysisMode === 'temporary') && contextSettings.chatUseDaily);
+        const wantDaily = contextSettings.chatUseDaily && (analysisMode === 'assistant' || analysisMode === 'chat' || analysisMode === 'temporary');
         if (wantDaily) {
             try {
                 const limit = analysisMode === 'assistant'
@@ -953,18 +1002,20 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         const displayUserContent = displayParts.join("\n\n");
 
         const useTempMode = analysisMode === 'temporary';
+        const forceNoHistory = contextSettings.contextOnlyCurrent;
+        const effectiveSaveHistory = useTempMode ? contextSettings.saveHistory : true;
         const effectiveContextSettings = useTempMode
             ? {
                 ...contextSettings,
                 enableMemory: false,
                 enableRetrieval: false,
-                saveHistory: false,
+                saveHistory: effectiveSaveHistory,
                 historyLimit: 0,
                 recentLimit: 0,
                 summaryMin: 0,
                 summaryStep: 0
             }
-            : contextSettings;
+            : { ...contextSettings, saveHistory: true };
         try {
             await streamAnalyze({
                 symbol: props.symbol,
@@ -976,7 +1027,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 contextSettings: effectiveContextSettings,
                 transientContext,
                 disableIndicatorContext: !!indicatorContext,
-                disableHistory: useTempMode
+                disableHistory: useTempMode || forceNoHistory
             });
         } finally {
             // no-op
@@ -990,6 +1041,26 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             abortControllerRef.current.abort();
         } catch (e) {
             // ignore
+        }
+    };
+
+    const handleClearMemory = async () => {
+        if (!props.symbol) return;
+        if (!window.confirm("确认清空该标的记忆摘要？聊天记录仍会保留。")) return;
+        setMemoryClearing(true);
+        setMemoryNotice("");
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/memory/clear?symbol=${encodeURIComponent(props.symbol)}`, {
+                method: "POST"
+            });
+            if (!res.ok) {
+                throw new Error("clear_failed");
+            }
+            setMemoryNotice("记忆已清空（聊天记录保留）");
+        } catch (e) {
+            setMemoryNotice("清空记忆失败");
+        } finally {
+            setMemoryClearing(false);
         }
     };
 
@@ -1197,6 +1268,10 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             }
             const displayUserContent = displayParts.join("\n\n");
 
+            const effectiveContext = {
+                ...contextSettings,
+                saveHistory: true
+            };
             await streamAnalyze({
                 symbol: props.symbol,
                 klines: dailyKlines,
@@ -1204,7 +1279,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 displayUserContent,
                 runMode: "auto",
                 analysisMode: "assistant",
-                contextSettings,
+                contextSettings: effectiveContext,
                 transientContext,
                 disableIndicatorContext: !!indicatorContext,
                 pushSummary: realtimeSummary
@@ -1218,7 +1293,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         if (!props.isOpen) return;
         if (!autoEnabled) return;
         runAutoEvaluation({ allowAfterHours: true });
-        const intervalMinutes = Math.max(1, Number(pushSettings.intervalMinutes || 5));
+        const intervalMinutes = Math.max(1, Number(pushSettings.autoEvalIntervalMinutes || 5));
         const intervalMs = intervalMinutes * 60 * 1000;
         const interval = setInterval(() => {
             if (!autoRunningRef.current) {
@@ -1226,7 +1301,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             }
         }, intervalMs);
         return () => clearInterval(interval);
-    }, [autoEnabled, props.isOpen, props.symbol, selectedModel, pushSettings.intervalMinutes]);
+    }, [autoEnabled, props.isOpen, props.symbol, selectedModel, pushSettings.autoEvalIntervalMinutes]);
 
     const [isExtracting, setIsExtracting] = useState(false);
 
@@ -1369,8 +1444,11 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 )}
 
                 {messages.map((msg) => {
+                    const modelLabel = msg.role === 'assistant' && msg.model
+                        ? resolveModelLabel(msg.model)
+                        : "";
                     const displayContent = (msg.role === 'assistant' && msg.model)
-                        ? `${msg.content}\n\n(Model: ${msg.model})`
+                        ? `${msg.content}\n\n(${modelLabel || msg.model})`
                         : msg.content;
                     return (
                     <div key={msg.id} style={{
@@ -1530,6 +1608,30 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                             {!config?.configured && (
                                 <span style={{ color: 'red', fontSize: '10px' }}>API Key Missing</span>
                             )}
+
+                            {analysisMode === 'chat' && (
+                                <Button
+                                    onPress={handleClearMemory}
+                                    isDisabled={memoryClearing || !props.symbol}
+                                    style={{
+                                        background: '#f5f5f5',
+                                        color: '#333',
+                                        border: '1px solid #ddd',
+                                        borderRadius: '4px',
+                                        padding: '4px 8px',
+                                        fontSize: '11px',
+                                        cursor: memoryClearing ? 'wait' : 'pointer'
+                                    }}
+                                >
+                                    {memoryClearing ? '清空中...' : '清空记忆'}
+                                </Button>
+                            )}
+
+                            {memoryNotice && (
+                                <span style={{ fontSize: '10px', color: memoryNotice.includes('失败') ? '#c00' : '#2b7' }}>
+                                    {memoryNotice}
+                                </span>
+                            )}
                         </div>
 
                         {/* Send + Auto Evaluate */}
@@ -1676,9 +1778,37 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                     <label style={{ fontSize: '12px' }}>
                                         <input
                                             type="checkbox"
+                                            checked={contextSettings.memoryIncludeAssistant}
+                                            onChange={(e) => persistSettings({ ...contextSettings, memoryIncludeAssistant: e.target.checked })}
+                                        /> 记忆包含AI总结
+                                    </label>
+                                    <label style={{ fontSize: '12px' }}>
+                                        <input
+                                            type="checkbox"
                                             checked={contextSettings.enableRetrieval}
                                             onChange={(e) => persistSettings({ ...contextSettings, enableRetrieval: e.target.checked })}
                                         /> 启用相关检索
+                                    </label>
+                                    <label style={{ fontSize: '12px' }}>
+                                        <input
+                                            type="checkbox"
+                                            checked={contextSettings.contextOnlyCurrent}
+                                            onChange={(e) => persistSettings({ ...contextSettings, contextOnlyCurrent: e.target.checked })}
+                                        /> 仅用当前输入
+                                    </label>
+                                    <label style={{ fontSize: '12px' }}>
+                                        <input
+                                            type="checkbox"
+                                            checked={contextSettings.historyIncludeAssistant}
+                                            onChange={(e) => persistSettings({ ...contextSettings, historyIncludeAssistant: e.target.checked })}
+                                        /> 上下文包含AI消息
+                                    </label>
+                                    <label style={{ fontSize: '12px' }}>
+                                        <input
+                                            type="checkbox"
+                                            checked={contextSettings.retrievalIncludeAssistant}
+                                            onChange={(e) => persistSettings({ ...contextSettings, retrievalIncludeAssistant: e.target.checked })}
+                                        /> 检索包含AI消息
                                     </label>
                                     <label style={{ fontSize: '12px' }}>
                                         <input
@@ -1687,12 +1817,15 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                             onChange={(e) => persistSettings({ ...contextSettings, saveHistory: !e.target.checked })}
                                         /> 临时对话不入库
                                     </label>
+                                    <span style={{ fontSize: '10px', color: '#999', alignSelf: 'center' }}>
+                                        仅临时模式生效
+                                    </span>
                                     <label style={{ fontSize: '12px' }}>
                                         <input
                                             type="checkbox"
                                             checked={contextSettings.chatUseDaily}
                                             onChange={(e) => persistSettings({ ...contextSettings, chatUseDaily: e.target.checked })}
-                                        /> 对话模式使用日线
+                                        /> 使用日线数据
                                     </label>
                                 </div>
 
@@ -1922,6 +2055,16 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                         min={1}
                                         value={pushSettings.intervalMinutes}
                                         onChange={(e) => setPushSettings({ ...pushSettings, intervalMinutes: Number(e.target.value || 0) })}
+                                        style={inputStyle}
+                                    />
+                                </label>
+                                <label style={{ fontSize: '12px' }}>
+                                    自动评估周期（分钟）
+                                    <input
+                                        type="number"
+                                        min={1}
+                                        value={pushSettings.autoEvalIntervalMinutes}
+                                        onChange={(e) => setPushSettings({ ...pushSettings, autoEvalIntervalMinutes: Number(e.target.value || 0) })}
                                         style={inputStyle}
                                     />
                                 </label>

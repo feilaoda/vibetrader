@@ -17,6 +17,10 @@ if env_path.exists():
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-reasoner")
+try:
+    LLM_MEMORY_PAIRS_LIMIT = int(os.getenv("LLM_MEMORY_PAIRS_LIMIT", "5"))
+except Exception:
+    LLM_MEMORY_PAIRS_LIMIT = 5
 # GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL")
 # Provider Specific Configs

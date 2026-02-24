@@ -1,6 +1,8 @@
 import json
+import os
 import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
 
@@ -35,26 +37,76 @@ def _parse_ymd(date_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
+YAHOO_BASE_URLS = [
+    "https://query1.finance.yahoo.com",
+    "https://query2.finance.yahoo.com",
+]
+YAHOO_PROXY = os.getenv("YAHOO_PROXY", "http://127.0.0.1:33210").strip()
+
+
+def _yahoo_json(path: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://finance.yahoo.com/",
+    }
+    opener = None
+    if YAHOO_PROXY:
+        try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({
+                    "http": YAHOO_PROXY,
+                    "https": YAHOO_PROXY,
+                })
+            )
+        except Exception as e:
+            print(f"[yahoo] proxy init failed {YAHOO_PROXY}: {e}")
+            opener = None
+
+    for base in YAHOO_BASE_URLS:
+        url = f"{base}{path}"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            if opener is not None:
+                resp_ctx = opener.open(req, timeout=timeout)
+            else:
+                resp_ctx = urllib.request.urlopen(req, timeout=timeout)
+            with resp_ctx as resp:
+                if resp.status != 200:
+                    continue
+                raw = resp.read()
+            return json.loads(raw.decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # query1 在部分网络会 403，自动切 query2
+            print(f"[yahoo] HTTPError {e.code} {url}")
+            continue
+        except Exception as e:
+            print(f"[yahoo] request failed {url}: {e}")
+            continue
+    return None
+
+
 def fetch_quote(ticker: str) -> Optional[Dict[str, Any]]:
     if not ticker:
         return None
     safe = urllib.parse.quote(ticker, safe="")
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={safe}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        if resp.status != 200:
-            return None
-        raw = resp.read()
-    data = json.loads(raw.decode("utf-8"))
+    data = _yahoo_json(f"/v7/finance/quote?symbols={safe}", timeout=10)
+    if not data:
+        return None
     items = data.get("quoteResponse", {}).get("result", [])
     if not items:
         return None
     q = items[0] or {}
     return {
         "ticker": ticker,
+        "name": q.get("shortName") or q.get("longName") or ticker,
         "price": q.get("regularMarketPrice"),
         "change": q.get("regularMarketChange"),
         "changePercent": q.get("regularMarketChangePercent"),
+        "open": q.get("regularMarketOpen"),
+        "high": q.get("regularMarketDayHigh"),
+        "low": q.get("regularMarketDayLow"),
+        "volume": q.get("regularMarketVolume"),
         "time": q.get("regularMarketTime"),
         "currency": q.get("currency"),
         "source": "yahoo"
@@ -83,17 +135,14 @@ def fetch_chart(
     end_ts = int((end_dt + timedelta(days=1)).replace(tzinfo=timezone.utc).timestamp())
 
     safe = urllib.parse.quote(ticker, safe="")
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{safe}"
+    path = (
+        f"/v8/finance/chart/{safe}"
         f"?period1={start_ts}&period2={end_ts}&interval={interval}"
         f"&includePrePost=false&events=div%2Csplits"
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        if resp.status != 200:
-            return []
-        raw = resp.read()
-    data = json.loads(raw.decode("utf-8"))
+    data = _yahoo_json(path, timeout=10)
+    if not data:
+        return []
     result = (data.get("chart") or {}).get("result") or []
     if not result:
         return []

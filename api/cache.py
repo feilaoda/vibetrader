@@ -9,7 +9,6 @@
 import json
 import os
 import re
-import urllib.request
 from datetime import datetime, date, timedelta, time as dtime, timezone
 try:
     from zoneinfo import ZoneInfo
@@ -17,10 +16,11 @@ except Exception:
     ZoneInfo = None
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Literal
-import akshare as ak
-from akshare_guard import should_skip_remote, record_failure, record_success, throttle
+from akshare_guard import should_skip_remote, record_failure, record_success
+from data_sources import DataType
+from data_sources.router import fetch as router_fetch
+from data_sources.tencent import build_daily_from_quote
 from us_indices import is_us_index_symbol, resolve_us_index_ticker
-from yahoo import fetch_chart
 
 # 配置代理
 # PROXY = "http://127.0.0.1:33210"
@@ -76,6 +76,51 @@ def _should_skip_source(source: str, force_remote: bool = False) -> bool:
     if _source_disabled(source):
         return True
     return should_skip_remote(force_remote, scope=_source_scope(source))
+
+
+CN_INDEX_SH_CODES = {
+    "000001", "000016", "000300", "000852", "000905", "000985", "000688",
+}
+CN_INDEX_SZ_CODES = {
+    "399001", "399006", "399005",
+}
+
+
+def _normalize_cn_index_symbol(symbol: str) -> Optional[str]:
+    if not symbol:
+        return None
+    sym = symbol.strip().upper()
+    if sym.endswith(".IDX"):
+        sym = sym[:-4]
+    code = sym.replace(".SH", "").replace(".SZ", "").replace(".", "")
+    if not code:
+        return None
+    code = code.zfill(6)
+    if code in CN_INDEX_SH_CODES:
+        return f"sh{code}"
+    if code in CN_INDEX_SZ_CODES:
+        return f"sz{code}"
+    # If suffix is explicit, respect it for known prefixes.
+    if sym.endswith(".SH"):
+        return f"sh{code}"
+    if sym.endswith(".SZ"):
+        return f"sz{code}"
+    return None
+
+
+def is_cn_index_symbol(symbol: str) -> bool:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return False
+    code = sym.replace(".SH", "").replace(".SZ", "").replace(".IDX", "").replace(".", "")
+    if not code:
+        return False
+    code = code.zfill(6)
+    if code in CN_INDEX_SH_CODES:
+        return sym.endswith(".SH") or "." not in sym
+    if code in CN_INDEX_SZ_CODES:
+        return sym.endswith(".SZ") or "." not in sym
+    return False
 
 
 def _record_source_failure(source: str, error: str) -> None:
@@ -599,52 +644,6 @@ def _parse_us_daily_df_to_klines(
     return _aggregate_daily_klines(out, period)
 
 
-def _us_index_ticker_to_sina_symbol(ticker: str) -> Optional[str]:
-    t = (ticker or "").upper().strip()
-    mapping = {
-        "^GSPC": ".INX",
-        "^IXIC": ".IXIC",
-        "^NDX": ".NDX",
-        "^DJI": ".DJI",
-    }
-    return mapping.get(t)
-
-
-def _fetch_us_index_daily_from_sina(
-    ticker: str,
-    start_date: Optional[str],
-    end_date: Optional[str],
-    period: str = "daily"
-) -> List[Dict]:
-    sina_symbol = _us_index_ticker_to_sina_symbol(ticker)
-    if not sina_symbol:
-        return []
-    try:
-        throttle(scope="akshare_kline")
-        df = ak.index_us_stock_sina(symbol=sina_symbol)
-    except Exception as e:
-        print(f"[sina-us-index] Error fetching {ticker}: {e}")
-        return []
-    return _parse_us_daily_df_to_klines(df, start_date, end_date, period=period)
-
-
-def _fetch_us_equity_daily_from_sina(
-    ticker: str,
-    start_date: Optional[str],
-    end_date: Optional[str],
-    period: str = "daily"
-) -> List[Dict]:
-    symbol = (ticker or "").upper().strip()
-    if not symbol:
-        return []
-    try:
-        throttle(scope="akshare_kline")
-        df = ak.stock_us_daily(symbol=symbol, adjust="")
-    except Exception as e:
-        print(f"[sina-us-equity] Error fetching {ticker}: {e}")
-        return []
-    return _parse_us_daily_df_to_klines(df, start_date, end_date, period=period)
-
 
 def get_us_index_klines_with_cache(
     symbol: str,
@@ -682,16 +681,17 @@ def get_us_index_klines_with_cache(
 
     interval = _yahoo_interval(period)
     fetch_source = "yahoo"
-    try:
-        new_klines = fetch_chart(ticker, fetch_start, fetch_end, interval=interval)
-    except Exception as e:
-        print(f"[Cache][US] fetch_chart failed for {symbol} ({ticker}): {e}")
-        new_klines = []
-    if not new_klines:
-        fallback = _fetch_us_index_daily_from_sina(ticker, fetch_start, fetch_end, period=period)
-        if fallback:
-            new_klines = fallback
-            fetch_source = "sina_us"
+    data, channel = router_fetch(
+        DataType.KLINE_DAILY,
+        market="us",
+        symbol=ticker,
+        start=fetch_start,
+        end=fetch_end,
+        interval=interval,
+    )
+    new_klines = data or []
+    if channel:
+        fetch_source = channel
 
     if not new_klines:
         filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
@@ -713,6 +713,117 @@ def get_us_index_klines_with_cache(
 
     filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
     return filtered[-limit:], fetch_source
+
+
+def _fetch_cn_index_daily(symbol: str, fetch_start: str, fetch_end: str) -> Optional[List[Dict]]:
+    idx_symbol = _normalize_cn_index_symbol(symbol)
+    if not idx_symbol:
+        return None
+    code = idx_symbol[2:]
+    try:
+        data, _ = router_fetch(
+            DataType.KLINE_DAILY,
+            channels=["tencent"],
+            symbol=code,
+            period="daily",
+            start=fetch_start,
+            end=fetch_end,
+        )
+        return data
+    except Exception as e:
+        print(f"[index_daily] Tencent fetch failed for {idx_symbol}: {e}")
+        return None
+
+
+def get_cn_index_klines_with_cache(
+    symbol: str,
+    period: str = "daily",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 365,
+    force_refresh: bool = False
+) -> Tuple[List[Dict], str]:
+    if period not in DAILY_PERIODS:
+        period = "daily"
+
+    now = _now_cn()
+    trade_date = _latest_trading_date(now)
+    trade_iso = trade_date.strftime("%Y-%m-%d")
+    trade_str = trade_date.strftime("%Y%m%d")
+
+    cache = load_cache(symbol, period)
+    cached_klines = cache.get("klines", []) if cache else []
+
+    daily_gap_window = max(1, int(os.getenv("DAILY_GAP_CHECK_WINDOW", "30") or 30))
+    daily_backfill_days = max(1, int(os.getenv("DAILY_SYNC_LOOKBACK_DAYS", "40") or 40))
+    daily_range_refresh = _needs_daily_range_refresh(cached_klines, start_date, end_date, trade_iso)
+    daily_gap_refresh = _has_missing_recent_trading_days(cached_klines, daily_gap_window)
+
+    if not force_refresh:
+        need_refresh, reason = should_refresh_cache(cache, period)
+        if daily_range_refresh:
+            need_refresh = True
+            reason = "range_missing"
+        elif daily_gap_refresh:
+            need_refresh = True
+            reason = f"missing_recent_{daily_gap_window}"
+        if not need_refresh:
+            filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
+            filtered = _strip_future_klines(filtered, trade_iso)
+            return filtered[-limit:], "cache"
+    else:
+        reason = "force_refresh"
+
+    print(f"[Cache] Refreshing {symbol} (reason: {reason})")
+
+    if cached_klines and not force_refresh:
+        start_iso = _normalize_ymd(start_date)
+        first_cached = _kline_date_iso(cached_klines[0]) if cached_klines else ""
+        last_cached = _kline_date_iso(cached_klines[-1]) if cached_klines else ""
+        fetch_start_iso = None
+        if start_iso and first_cached and start_iso < first_cached:
+            fetch_start_iso = start_iso
+        if not fetch_start_iso:
+            anchor_date = _parse_iso_date(last_cached or trade_iso)
+            if anchor_date:
+                fetch_start_iso = (anchor_date - timedelta(days=daily_backfill_days)).strftime("%Y-%m-%d")
+            else:
+                fetch_start_iso = start_iso or (trade_date - timedelta(days=365)).strftime("%Y-%m-%d")
+            if start_iso and start_iso < fetch_start_iso:
+                fetch_start_iso = start_iso
+        fetch_start = _to_ymd_compact(fetch_start_iso) or (trade_date - timedelta(days=365)).strftime("%Y%m%d")
+    else:
+        fetch_start = _to_ymd_compact(start_date) or (trade_date - timedelta(days=365)).strftime("%Y%m%d")
+
+    fetch_end = _to_ymd_compact(end_date) or trade_str
+    if fetch_end > trade_str:
+        fetch_end = trade_str
+
+    print(f"[Cache] Fetching index {symbol} from {fetch_start} to {fetch_end}")
+    new_klines = _fetch_cn_index_daily(symbol, fetch_start, fetch_end)
+    if new_klines is None:
+        temp_klines = cached_klines
+        temp_klines = _strip_future_klines(temp_klines, trade_iso)
+        filtered = _filter_klines_by_date(temp_klines, start_date, end_date)
+        return filtered[-limit:], "cache"
+
+    if cached_klines and not force_refresh:
+        cached_klines = _merge_klines(cached_klines, new_klines, period)
+    else:
+        cached_klines = new_klines
+
+    cached_klines = _strip_future_klines(cached_klines, trade_iso)
+    save_cache(symbol, period, {
+        "symbol": symbol,
+        "period": period,
+        "last_update_date": trade_str,
+        "last_update_time": now.timestamp(),
+        "source": "cn_index",
+        "klines": cached_klines,
+    })
+
+    filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
+    return filtered[-limit:], "cn_index"
 
 
 def _is_us_equity_symbol(symbol: str) -> bool:
@@ -782,16 +893,17 @@ def get_us_equity_klines_with_cache(
 
     interval = _yahoo_interval(period)
     fetch_source = "yahoo"
-    try:
-        new_klines = fetch_chart(ticker, fetch_start, fetch_end, interval=interval)
-    except Exception as e:
-        print(f"[Cache][US] fetch_chart failed for {symbol} ({ticker}): {e}")
-        new_klines = []
-    if not new_klines:
-        fallback = _fetch_us_equity_daily_from_sina(ticker, fetch_start, fetch_end, period=period)
-        if fallback:
-            new_klines = fallback
-            fetch_source = "sina_us"
+    data, channel = router_fetch(
+        DataType.KLINE_DAILY,
+        market="us",
+        symbol=ticker,
+        start=fetch_start,
+        end=fetch_end,
+        interval=interval,
+    )
+    new_klines = data or []
+    if channel:
+        fetch_source = channel
     if not new_klines:
         filtered = _filter_klines_by_date(cached_klines, start_date, end_date)
         return filtered[-limit:], "cache"
@@ -830,16 +942,6 @@ def format_sina_symbol(symbol: str) -> str:
         return f"sh{code}"
 
 
-def _get_market_prefix_from_code(code: str) -> str:
-    if code.startswith(("6", "9", "5")):
-        return "sh"
-    if code.startswith(("0", "2", "3", "1")):
-        return "sz"
-    if code.startswith(("8", "4")):
-        return "bj"
-    return "sh"
-
-
 def _get_tencent_prefer_etf_codes() -> set:
     raw = os.getenv("TENCENT_DAILY_ETF_CODES", "159941")
     items = re.split(r"[,\s]+", raw.strip()) if raw else []
@@ -851,138 +953,6 @@ def _get_tencent_prefer_etf_codes() -> set:
         if code:
             codes.add(code)
     return codes
-
-
-def _ymd_compact_to_iso(date_str: Optional[str]) -> Optional[str]:
-    if not date_str:
-        return None
-    if "-" in date_str:
-        return date_str
-    if len(date_str) == 8 and date_str.isdigit():
-        return f"{date_str[0:4]}-{date_str[4:6]}-{date_str[6:8]}"
-    return date_str
-
-
-def fetch_from_tencent(code: str, period: str, fetch_start: str, fetch_end: str) -> Optional[List[Dict]]:
-    """从腾讯获取日线数据（ETF 兜底）"""
-    if period not in DAILY_PERIODS:
-        return None
-    start_iso = _ymd_compact_to_iso(fetch_start)
-    end_iso = _ymd_compact_to_iso(fetch_end)
-    if not start_iso or not end_iso:
-        return None
-    market_prefix = _get_market_prefix_from_code(code)
-    key = f"{market_prefix}{code}"
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={key},day,{start_iso},{end_iso},640,qfq"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            raw = resp.read()
-        data = json.loads(raw.decode("utf-8"))
-        node = data.get("data", {}).get(key) or {}
-        series = node.get("qfqday") or node.get("day") or []
-        if not series:
-            return None
-        klines = []
-        for row in series:
-            if not row or len(row) < 6:
-                continue
-            date_str = row[0]
-            timestamp = _to_timestamp_cn(date_str, "%Y-%m-%d")
-            volume_raw = _safe_float(row[5])
-            volume = volume_raw * 100 if volume_raw else 0
-            klines.append({
-                "date": date_str,
-                "time": None,
-                "openTime": timestamp,
-                "open": _safe_float(row[1]),
-                "high": _safe_float(row[3]),
-                "low": _safe_float(row[4]),
-                "close": _safe_float(row[2]),
-                "volume": float(volume),
-                "closeTime": timestamp + 86400000 - 1,
-            })
-        return klines
-    except Exception as e:
-        print(f"[tencent] Error: {e}")
-        return None
-
-
-def _fetch_tencent_quote(code: str) -> Optional[Dict]:
-    market_prefix = _get_market_prefix_from_code(code)
-    url = f"https://qt.gtimg.cn/q={market_prefix}{code}"
-
-    def _do():
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.read()
-
-    raw = _do()
-    if not raw:
-        return None
-    try:
-        text = raw.decode("gbk", errors="ignore")
-    except Exception:
-        text = raw.decode("utf-8", errors="ignore")
-    match = re.search(r'="([^"]+)"', text)
-    if not match:
-        return None
-    parts = match.group(1).split("~")
-    if len(parts) < 35:
-        return None
-    price = _safe_float(parts[3] if len(parts) > 3 else 0)
-    prev_close = _safe_float(parts[4] if len(parts) > 4 else 0)
-    open_p = _safe_float(parts[5] if len(parts) > 5 else 0)
-    volume_lot = _safe_float(parts[6] if len(parts) > 6 else 0)
-    high = _safe_float(parts[33] if len(parts) > 33 else 0)
-    low = _safe_float(parts[34] if len(parts) > 34 else 0)
-    time_str = parts[30] if len(parts) > 30 else ""
-    ts = int(_now_cn().timestamp() * 1000)
-    if time_str and ":" in time_str:
-        try:
-            dt = datetime.strptime(f"{_now_cn().strftime('%Y-%m-%d')} {time_str}", "%Y-%m-%d %H:%M:%S")
-            if CN_TZ:
-                dt = dt.replace(tzinfo=CN_TZ)
-            ts = int(dt.timestamp() * 1000)
-        except Exception:
-            pass
-    return {
-        "price": price,
-        "open": open_p,
-        "high": high,
-        "low": low,
-        "volume": volume_lot * 100,
-        "timestamp": ts,
-        "prev_close": prev_close
-    }
-
-
-def build_daily_kline_from_tencent(code: str, date_ymd: str) -> Optional[Dict]:
-    if not date_ymd:
-        return None
-    quote = _fetch_tencent_quote(code)
-    if not quote:
-        return None
-    close_price = _safe_float(quote.get("price"))
-    if close_price <= 0:
-        return None
-    open_price = _safe_float(quote.get("open")) or close_price
-    high_price = _safe_float(quote.get("high")) or max(open_price, close_price)
-    low_price = _safe_float(quote.get("low")) or min(open_price, close_price)
-    volume = _safe_float(quote.get("volume"))
-    date_iso = datetime.strptime(date_ymd, "%Y%m%d").strftime("%Y-%m-%d")
-    timestamp = _to_timestamp_cn(date_iso, "%Y-%m-%d")
-    return {
-        "date": date_iso,
-        "time": None,
-        "openTime": timestamp,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "close": close_price,
-        "volume": volume,
-        "closeTime": timestamp + 86400000 - 1,
-    }
 
 
 def _pick_column(df, candidates: List[str]) -> Optional[str]:
@@ -1007,6 +977,8 @@ def _safe_float(value) -> float:
         return num
     except Exception:
         return 0
+
+
 
 
 def _to_timestamp_cn(date_str: str, fmt: str) -> int:
@@ -1079,6 +1051,31 @@ def _normalize_intraday_volume(kline: Dict, history: List[Dict]) -> Dict:
     return kline
 
 
+def _env_enabled(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_intraday_daily_kline(
+    code: str,
+    date_ymd: str,
+    history: List[Dict],
+    force_remote: bool = False
+) -> Optional[Dict]:
+    # Prefer Tencent quote-derived daily bar to avoid unstable minute API timeouts.
+    tencent_kline = build_daily_from_quote(code, date_ymd)
+    if tencent_kline:
+        return _normalize_intraday_volume(tencent_kline, history)
+
+    if not _env_enabled("INTRADAY_MINUTE_FALLBACK", "0"):
+        return None
+
+    minute_kline = build_daily_kline_from_minutes(code, date_ymd, force_remote=force_remote)
+    if minute_kline:
+        return _normalize_intraday_volume(minute_kline, history)
+    return None
+
+
 def build_daily_kline_from_minutes(code: str, date_ymd: str, force_remote: bool = False) -> Optional[Dict]:
     """Build a daily kline for date_ymd (YYYYMMDD) from 1m data."""
     if _should_skip_source("eastmoney", force_remote):
@@ -1088,54 +1085,28 @@ def build_daily_kline_from_minutes(code: str, date_ymd: str, force_remote: bool 
         print("[Backoff] Skip minute data fetch")
         return None
 
+    data, channel = router_fetch(
+        DataType.KLINE_MINUTE,
+        symbol=code,
+        period="1",
+        start=date_ymd,
+        end=date_ymd,
+    )
+    if not data:
+        return None
+    minute_klines = list(data)
+    minute_klines.sort(key=lambda x: x.get("openTime") or 0)
+    if not minute_klines:
+        return None
+
     try:
-        if is_etf(code):
-            if hasattr(ak, "fund_etf_hist_min_em"):
-                throttle(scope="akshare_minute")
-                df = ak.fund_etf_hist_min_em(
-                    symbol=code,
-                    period="1",
-                    start_date=f"{date_ymd} 09:30:00",
-                    end_date=f"{date_ymd} 15:00:00",
-                    adjust="qfq",
-                )
-            else:
-                return None
-        else:
-            throttle(scope="akshare_minute")
-            df = ak.stock_zh_a_hist_min_em(
-                symbol=code,
-                period="1",
-                start_date=f"{date_ymd} 09:30:00",
-                end_date=f"{date_ymd} 15:00:00",
-                adjust="qfq",
-            )
-    except Exception as e:
-        print(f"[intraday] Error fetching minute data: {e}")
-        record_failure(f"minute_kline_failed: {e}")
-        _record_source_failure("eastmoney", f"minute_kline_failed: {e}")
+        open_price = _safe_float(minute_klines[0].get("open"))
+        close_price = _safe_float(minute_klines[-1].get("close"))
+        high_price = max(_safe_float(item.get("high")) for item in minute_klines)
+        low_price = min(_safe_float(item.get("low")) for item in minute_klines)
+        volume = sum(_safe_float(item.get("volume")) for item in minute_klines)
+    except Exception:
         return None
-
-    if df is None or df.empty:
-        return None
-
-    open_col = _pick_column(df, ["开盘", "open"])
-    close_col = _pick_column(df, ["收盘", "close"])
-    high_col = _pick_column(df, ["最高", "high"])
-    low_col = _pick_column(df, ["最低", "low"])
-    vol_col = _pick_column(df, ["成交量", "volume"])
-    amt_col = _pick_column(df, ["成交额", "amount"])
-
-    if not all([open_col, close_col, high_col, low_col]):
-        return None
-
-    open_price = _safe_float(df.iloc[0][open_col])
-    close_price = _safe_float(df.iloc[-1][close_col])
-    high_price = _safe_float(df[high_col].max())
-    low_price = _safe_float(df[low_col].min())
-    volume_raw = _safe_float(df[vol_col].sum()) if vol_col else 0
-    multiplier = _infer_volume_multiplier(df, vol_col, amt_col, close_col)
-    volume = volume_raw * multiplier if volume_raw else 0
 
     date_iso = datetime.strptime(date_ymd, "%Y%m%d").strftime("%Y-%m-%d")
     timestamp = _to_timestamp_cn(date_iso, "%Y-%m-%d")
@@ -1152,7 +1123,8 @@ def build_daily_kline_from_minutes(code: str, date_ymd: str, force_remote: bool 
         "closeTime": timestamp + 86400000 - 1,
     }
     record_success()
-    _record_source_success("eastmoney")
+    if channel:
+        _record_source_success(channel)
     return kline
 
 
@@ -1162,104 +1134,19 @@ def fetch_from_eastmoney(code: str, period: str, fetch_start: str, fetch_end: st
         print("[Backoff] Skip eastmoney kline fetch")
         return None
     print(f"[DataSource] Using eastmoney for {code}")
-    try:
-        if is_etf(code):
-             # ETF 数据
-            if period in DAILY_PERIODS:
-                throttle(scope="akshare_kline")
-                df = ak.fund_etf_hist_em(
-                    symbol=code,
-                    period=period,
-                    start_date=fetch_start,
-                    end_date=fetch_end,
-                    adjust="qfq",
-                )
-            else:
-                # 分钟数据 (ETF 优先使用专用接口，失败再回退到股票接口)
-                df = None
-                if hasattr(ak, "fund_etf_hist_min_em"):
-                    try:
-                        throttle(scope="akshare_minute")
-                        df = ak.fund_etf_hist_min_em(
-                            symbol=code,
-                            period=period,
-                            start_date=f"{fetch_start} 09:30:00",
-                            end_date=f"{fetch_end} 15:00:00",
-                            adjust="qfq",
-                        )
-                    except Exception:
-                        df = None
-                if df is None:
-                    throttle(scope="akshare_minute")
-                    df = ak.stock_zh_a_hist_min_em(
-                        symbol=code,
-                        period=period,
-                        start_date=f"{fetch_start} 09:30:00",
-                        end_date=f"{fetch_end} 15:00:00",
-                        adjust="qfq",
-                    )
-        else:
-            # 股票数据
-            if period in DAILY_PERIODS:
-                throttle(scope="akshare_kline")
-                df = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period=period,
-                    start_date=fetch_start,
-                    end_date=fetch_end,
-                    adjust="qfq",
-                )
-            else:
-                throttle(scope="akshare_minute")
-                df = ak.stock_zh_a_hist_min_em(
-                    symbol=code,
-                    period=period,
-                    start_date=f"{fetch_start} 09:30:00",
-                    end_date=f"{fetch_end} 15:00:00",
-                    adjust="qfq",
-                )
-        
-        if df is None or df.empty:
-            return None
-
-        vol_col = _pick_column(df, ["成交量", "volume"])
-        amt_col = _pick_column(df, ["成交额", "amount"])
-        close_col = _pick_column(df, ["收盘", "close"])
-        multiplier = _infer_volume_multiplier(df, vol_col, amt_col, close_col) if vol_col else 100
-        
-        klines = []
-        for _, row in df.iterrows():
-            try:
-                if period in DAILY_PERIODS:
-                    date_str = str(row["日期"])
-                    timestamp = _to_timestamp_cn(date_str, "%Y-%m-%d")
-                else:
-                    date_str = str(row["时间"])
-                    timestamp = _to_timestamp_cn(date_str, "%Y-%m-%d %H:%M:%S")
-                
-                volume_raw = _safe_float(row["成交量"])
-                # Convert to shares using inferred multiplier (hands -> shares).
-                volume = volume_raw * multiplier if volume_raw else 0
-                klines.append({
-                    "date": date_str.split(" ")[0] if " " in date_str else date_str,
-                    "time": date_str if " " in date_str else None,
-                    "openTime": timestamp,
-                    "open": float(row["开盘"]),
-                    "high": float(row["最高"]),
-                    "low": float(row["最低"]),
-                    "close": float(row["收盘"]),
-                    "volume": float(volume),
-                    "closeTime": timestamp + (86400000 if period in DAILY_PERIODS else 60000) - 1,
-                })
-            except Exception as e:
-                print(f"[eastmoney] Error parsing row: {e}")
-                continue
-        _record_source_success("eastmoney")
-        return klines
-    except Exception as e:
-        print(f"[eastmoney] Error: {e}")
-        _record_source_failure("eastmoney", f"eastmoney_failed: {e}")
-        return None
+    data_type = DataType.KLINE_DAILY if period in DAILY_PERIODS else DataType.KLINE_MINUTE
+    data, channel = router_fetch(
+        data_type,
+        channels=["akshare"],
+        symbol=code,
+        period=period,
+        start=fetch_start,
+        end=fetch_end,
+        provider="eastmoney",
+    )
+    if channel:
+        _record_source_success(channel)
+    return data
 
 
 def fetch_from_sina(code: str, period: str, fetch_start: str, fetch_end: str) -> Optional[List[Dict]]:
@@ -1269,120 +1156,19 @@ def fetch_from_sina(code: str, period: str, fetch_start: str, fetch_end: str) ->
         return None
     sina_symbol = format_sina_symbol(code)
     print(f"[DataSource] Using sina for {sina_symbol}")
-    
-    try:
-        if period in DAILY_PERIODS:
-            if is_etf(code):
-                 # ETF (Sina)
-                 throttle(scope="akshare_kline")
-                 df = ak.fund_etf_hist_sina(
-                    symbol=sina_symbol,
-                )
-                 # SINA ETF 接口可能不支持时间范围筛选，需要手动过滤
-                 # 且列名可能不同
-                 if df is not None and not df.empty:
-                    df['date'] = df['date'].astype(str)
-                    mask = (df['date'] >= datetime.strptime(fetch_start, "%Y%m%d").strftime("%Y-%m-%d")) & \
-                           (df['date'] <= datetime.strptime(fetch_end, "%Y%m%d").strftime("%Y-%m-%d"))
-                    df = df.loc[mask]
-            else:
-                throttle(scope="akshare_kline")
-                df = ak.stock_zh_a_daily(
-                    symbol=sina_symbol,
-                    start_date=fetch_start,
-                    end_date=fetch_end,
-                    adjust="qfq",
-                )
-        else:
-            # 新浪不支持分钟级别，回退到东方财富
-            print(f"[sina] Minute data not supported, falling back to eastmoney")
-            return fetch_from_eastmoney(code, period, fetch_start, fetch_end)
-        
-        if df is None or df.empty:
-            return None
-        
-        vol_col = _pick_column(df, ["volume", "成交量"])
-        amt_col = _pick_column(df, ["amount", "成交额"])
-        close_col = _pick_column(df, ["close", "收盘"])
-        multiplier = 100
-        if vol_col:
-            if amt_col:
-                multiplier = _infer_volume_multiplier(df, vol_col, amt_col, close_col)
-            else:
-                try:
-                    median_vol = _safe_float(df[vol_col].median())
-                except Exception:
-                    median_vol = 0
-                # Heuristic: Sina daily volume may already be in shares.
-                # If median is very large, assume shares to avoid 100x inflation.
-                if median_vol >= 5e7:
-                    multiplier = 1
-
-        klines = []
-        for _, row in df.iterrows():
-            try:
-                # 新浪数据使用英文字段名: date, open, high, low, close, volume
-                date_str = str(row["date"])
-                timestamp = _to_timestamp_cn(date_str, "%Y-%m-%d")
-                
-                volume_raw = _safe_float(row[vol_col]) if vol_col else 0
-                # Convert to shares using inferred/heuristic multiplier.
-                volume = volume_raw * multiplier if volume_raw else 0
-                klines.append({
-                    "date": date_str,
-                    "time": None,
-                    "openTime": timestamp,
-                    "open": float(row["open"]),
-                    "high": float(row["high"]),
-                    "low": float(row["low"]),
-                    "close": float(row["close"]),
-                    "volume": float(volume),
-                    "closeTime": timestamp + 86400000 - 1,
-                })
-            except Exception as e:
-                print(f"[sina] Error parsing row: {e}")
-                continue
-
-        # Check if missing today
-        if klines and period in DAILY_PERIODS:
-            try:
-                last_date = klines[-1]['date']
-                now = _now_cn()
-                # Check if it's a weekday and time is > 09:30? No need, logic is if date < today
-                today_str = now.strftime("%Y-%m-%d")
-                
-                if last_date < today_str:
-                    if _should_skip_source("eastmoney"):
-                        print("[Backoff] Skip eastmoney fetch for today")
-                    else:
-                        print(f"[sina] Last date {last_date} < {today_str}, trying to fetch today from eastmoney...")
-                    t_str = now.strftime("%Y%m%d")
-                    
-                    # Retry logic for today's data
-                    if not _should_skip_source("eastmoney"):
-                        for retry in range(3):
-                            try:
-                                # Try fetch just today
-                                todays_data = fetch_from_eastmoney(code, period, t_str, t_str)
-                                if todays_data:
-                                    # Append unique
-                                    if todays_data[0]['date'] > last_date:
-                                        klines.extend(todays_data)
-                                        print(f"[sina] Appended today's candle (Retry {retry+1}): {todays_data[0]['date']} {todays_data[0]['close']}")
-                                        break
-                            except Exception as e:
-                                print(f"[sina] Retry {retry+1} failed to fetch today: {e}")
-                                import time
-                                time.sleep(1)
-            except Exception as e:
-                print(f"[sina] Error checking today: {e}")
-        
-        _record_source_success("sina")
-        return klines
-    except Exception as e:
-        print(f"[sina] Error: {e}")
-        _record_source_failure("sina", f"sina_failed: {e}")
-        return None
+    data_type = DataType.KLINE_DAILY if period in DAILY_PERIODS else DataType.KLINE_MINUTE
+    data, channel = router_fetch(
+        data_type,
+        channels=["sina"],
+        symbol=code,
+        period=period,
+        start=fetch_start,
+        end=fetch_end,
+        provider="sina",
+    )
+    if channel:
+        _record_source_success(channel)
+    return data
 
 
 def fetch_klines_from_source(code: str, period: str, fetch_start: str, fetch_end: str, force_remote: bool = False) -> Optional[List[Dict]]:
@@ -1390,46 +1176,41 @@ def fetch_klines_from_source(code: str, period: str, fetch_start: str, fetch_end
     if should_skip_remote(force_remote):
         print("[Backoff] Skip remote kline fetch")
         return None
-
     if period in DAILY_PERIODS and is_etf(code):
         prefer_codes = _get_tencent_prefer_etf_codes()
         if code in prefer_codes:
             print(f"[DataSource] Prefer tencent for ETF {code}")
-            tencent = fetch_from_tencent(code, period, fetch_start, fetch_end)
-            if tencent is not None:
+            data, channel = router_fetch(
+                DataType.KLINE_DAILY,
+                channels=["tencent", "sina", "akshare"],
+                symbol=code,
+                period=period,
+                start=fetch_start,
+                end=fetch_end,
+                provider="eastmoney",
+            )
+            if data is not None:
                 record_success()
-                return tencent
+                return data
 
     source = get_data_source()
-    
-    if source == "sina":
-        result = fetch_from_sina(code, period, fetch_start, fetch_end)
-        if result is None:
-            if _should_skip_source("eastmoney"):
-                print("[Backoff] Skip eastmoney fallback")
-            else:
-                print(f"[DataSource] Sina failed, trying eastmoney...")
-                result = fetch_from_eastmoney(code, period, fetch_start, fetch_end)
-    else:
-        result = fetch_from_eastmoney(code, period, fetch_start, fetch_end)
-        if result is None:
-            if _should_skip_source("sina"):
-                print("[Backoff] Skip sina fallback")
-            else:
-                print(f"[DataSource] Eastmoney failed, trying sina...")
-                result = fetch_from_sina(code, period, fetch_start, fetch_end)
-    if result is None:
-        if period in DAILY_PERIODS and is_etf(code):
-            print(f"[DataSource] Eastmoney/Sina failed, trying tencent for {code}")
-            tencent = fetch_from_tencent(code, period, fetch_start, fetch_end)
-            if tencent is not None:
-                record_success()
-                return tencent
+    channels = ["sina", "akshare", "tencent"] if source == "sina" else ["akshare", "sina", "tencent"]
+    data_type = DataType.KLINE_DAILY if period in DAILY_PERIODS else DataType.KLINE_MINUTE
+    data, channel = router_fetch(
+        data_type,
+        channels=channels,
+        symbol=code,
+        period=period,
+        start=fetch_start,
+        end=fetch_end,
+        provider="eastmoney" if source != "sina" else "sina",
+    )
+    if data is None:
         record_failure("klines_fetch_failed")
         return None
 
     record_success()
-    return result
+    return data
 
 
 def get_klines_with_cache(
@@ -1442,6 +1223,15 @@ def get_klines_with_cache(
     include_intraday: bool = True
 ) -> Tuple[List[Dict], str]:
     """获取K线数据（带缓存）"""
+    if is_cn_index_symbol(symbol):
+        return get_cn_index_klines_with_cache(
+            symbol=symbol,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            force_refresh=force_refresh,
+        )
     if is_us_index_symbol(symbol):
         return get_us_index_klines_with_cache(
             symbol=symbol,
@@ -1549,24 +1339,28 @@ def get_klines_with_cache(
         temp_klines = cached_klines
         intraday_enabled = period in DAILY_PERIODS and include_intraday and _now_cn().weekday() < 5 and trade_date == today
         if intraday_enabled:
-            today_kline = build_daily_kline_from_minutes(code, effective_str, force_remote=force_refresh)
+            today_kline = _build_intraday_daily_kline(code, effective_str, temp_klines, force_remote=force_refresh)
             if today_kline:
                 today_date = today_kline.get("date")
-                today_kline = _normalize_intraday_volume(today_kline, temp_klines)
                 temp_klines = [k for k in temp_klines if k.get("date") != today_date]
                 temp_klines.append(today_kline)
                 temp_klines.sort(key=lambda x: x.get("openTime", 0))
-            else:
-                tencent_kline = build_daily_kline_from_tencent(code, effective_str)
-                if tencent_kline:
-                    today_date = tencent_kline.get("date")
-                    tencent_kline = _normalize_intraday_volume(tencent_kline, temp_klines)
-                    temp_klines = [k for k in temp_klines if k.get("date") != today_date]
-                    temp_klines.append(tencent_kline)
-                    temp_klines.sort(key=lambda x: x.get("openTime", 0))
         source = "backoff" if should_skip_remote(force_refresh) else "cache"
         if period in DAILY_PERIODS:
             temp_klines = _strip_future_klines(temp_klines, trade_iso)
+        # Persist refreshed intraday bar / heartbeat update even when remote fetch returns no rows.
+        # This keeps downstream context builders (e.g. market thermometer) reading the latest cache state.
+        try:
+            save_cache(symbol, period, {
+                "symbol": symbol,
+                "period": period,
+                "last_update_date": effective_str,
+                "last_update_time": now.timestamp(),
+                "source": source,
+                "klines": temp_klines,
+            })
+        except Exception:
+            pass
         filtered = _filter_klines_by_date(temp_klines, start_date, end_date)
         return filtered[-limit:], source
     
@@ -1580,24 +1374,16 @@ def get_klines_with_cache(
     # Add or refresh today's daily kline using minute data (intraday view).
     intraday_enabled = period in DAILY_PERIODS and include_intraday and _now_cn().weekday() < 5 and trade_date == today
     if intraday_enabled:
-        today_kline = build_daily_kline_from_minutes(code, effective_str, force_remote=force_refresh)
+        today_kline = _build_intraday_daily_kline(code, effective_str, cached_klines, force_remote=force_refresh)
         if today_kline:
             today_date = today_kline.get("date")
-            today_kline = _normalize_intraday_volume(today_kline, cached_klines)
             cached_klines = [k for k in cached_klines if k.get("date") != today_date]
             cached_klines.append(today_kline)
             cached_klines.sort(key=lambda x: x.get("openTime", 0))
         else:
             has_today = any(k.get("date") == effective_iso for k in cached_klines)
             if not has_today:
-                tencent_kline = build_daily_kline_from_tencent(code, effective_str)
-                if tencent_kline:
-                    today_date = tencent_kline.get("date")
-                    tencent_kline = _normalize_intraday_volume(tencent_kline, cached_klines)
-                    cached_klines = [k for k in cached_klines if k.get("date") != today_date]
-                    cached_klines.append(tencent_kline)
-                    cached_klines.sort(key=lambda x: x.get("openTime", 0))
-                elif cached_today:
+                if cached_today:
                     cached_klines.append(cached_today)
                     cached_klines.sort(key=lambda x: x.get("openTime", 0))
 
@@ -1617,7 +1403,9 @@ def get_klines_with_cache(
     return filtered[-limit:], source
 
 
-def force_sync(symbol: str, period: str = "daily") -> Tuple[List[Dict], str]:
+def force_sync(symbol: str, period: str = "daily", include_intraday: Optional[bool] = None) -> Tuple[List[Dict], str]:
     """强制同步数据"""
+    if include_intraday is None:
+        include_intraday = period not in DAILY_PERIODS
     print(f"[Cache] Force sync triggered for {symbol}")
-    return get_klines_with_cache(symbol, period, force_refresh=True)
+    return get_klines_with_cache(symbol, period, force_refresh=True, include_intraday=bool(include_intraday))

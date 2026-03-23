@@ -1,20 +1,59 @@
-from fastapi import APIRouter, HTTPException, Query
-from typing import Optional, Dict, Any
+from fastapi import APIRouter, HTTPException
+from typing import Optional, Dict, Any, List
+from threading import Thread
+from pydantic import BaseModel
 from db import (
     list_screening_runs, 
     list_screening_results, 
     get_latest_screening_run,
     get_screening_run,
-    get_screening_summary
+    get_screening_summary,
+    get_screening_stats,
+    create_screening_run
 )
+from quant.recommendation import run_recommendation_job
+from config import LLM_MODEL
 
 router = APIRouter()
+
+
+class ScreeningRunRequest(BaseModel):
+    engine: str = "fusion"
+    universe: str = "watchlist"
+    market: str = "all"
+    limit: Optional[int] = None
+    rule_min_score: float = 60
+    ai_top_k: int = 20
+    use_web: bool = False
+    web_top_k: int = 5
+    model: Optional[str] = None
+    bars: int = 200
+    sleep_sec: float = 0.0
+    include_pass: bool = False
+    symbols: Optional[List[str]] = None
 
 @router.get("/screening/runs", response_model=Dict[str, Any])
 def get_runs(limit: int = 20):
     """Get list of historical screening runs"""
     rows = list_screening_runs(limit)
     return {"data": rows}
+
+
+@router.post("/screening/run", response_model=Dict[str, Any])
+def start_screening(request: ScreeningRunRequest):
+    """Start a new screening run (rule/ai/fusion)."""
+    params = request.dict()
+    engine = (params.get("engine") or "rule").strip().lower()
+    model_id = params.get("model") or (LLM_MODEL if engine in ("ai", "fusion") else "rule")
+    run_id = create_screening_run(
+        model_id=model_id,
+        universe=params.get("universe") or "watchlist",
+        params=params,
+        total=0,
+    )
+    worker = Thread(target=run_recommendation_job, args=(run_id, params), daemon=True)
+    worker.start()
+    return {"run_id": run_id}
 
 @router.get("/screening/latest", response_model=Dict[str, Any])
 def get_latest_results(action: Optional[str] = None):
@@ -65,3 +104,8 @@ def get_run_details(run_id: int, action: Optional[str] = None):
     results = results_rows or []
     
     return {"run": run_row, "results": results}
+
+
+@router.get("/screening/stats", response_model=Dict[str, Any])
+def get_screening_stats_api(run_id: int):
+    return {"data": get_screening_stats(run_id)}

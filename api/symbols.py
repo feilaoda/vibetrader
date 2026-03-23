@@ -1,13 +1,8 @@
 
-import json
-import time
 import pandas as pd
-import akshare as ak
-from pathlib import Path
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
 from db import save_symbols_db, get_symbols_db
-from akshare_guard import throttle
+from data_sources import DataType
+from data_sources.router import fetch as router_fetch
 from us_indices import US_INDEX_SYMBOLS
 
 
@@ -29,27 +24,24 @@ def save_symbols_to_disk(df):
 
 def fetch_all_symbols_remote():
     """Fetch all symbols from AkShare (Stocks + ETFs)"""
-    print("[Symbols] Fetching fresh data from AkShare...")
-    
-    # 1. Fetch A-Shares
-    try:
-        throttle(scope="akshare_symbols")
-        df_stock = ak.stock_info_a_code_name()
-    except Exception as e:
-        print(f"[Symbols] Error fetching stocks: {e}")
+    print("[Symbols] Fetching fresh data from channel router...")
+    data, channel = router_fetch(DataType.SYMBOLS, channels=["local", "akshare"])
+    df_stock = None
+    df_etf = None
+    if isinstance(data, dict):
+        df_stock = data.get("stocks")
+        df_etf = data.get("etfs")
+    if df_stock is None:
         df_stock = pd.DataFrame(columns=["code", "name"])
-
-    # 2. Fetch ETFs (Try API then Fallback)
-    try:
-        # Try EastMoney API
-        throttle(scope="akshare_symbols")
-        df_etf = ak.fund_etf_spot_em()
-        df_etf = df_etf[["代码", "名称"]].rename(columns={"代码": "code", "名称": "name"})
-    except Exception as e:
-        print(f"[Symbols] Error fetching ETFs (API): {e}")
-        # Use Fallback
+    if df_etf is None:
         from fallback_data import get_fallback_etfs
         df_etf = get_fallback_etfs()
+    else:
+        try:
+            if "代码" in df_etf.columns and "名称" in df_etf.columns:
+                df_etf = df_etf[["代码", "名称"]].rename(columns={"代码": "code", "名称": "name"})
+        except Exception:
+            pass
 
     # 3. Merge
     df = pd.concat([df_stock, df_etf], ignore_index=True)

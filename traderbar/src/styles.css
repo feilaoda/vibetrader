@@ -1,0 +1,304 @@
+:root {
+  color-scheme: light;
+  font-family: "SF Pro Rounded", "Avenir Next", "PingFang SC", sans-serif;
+  line-height: 1.4;
+  font-weight: 500;
+  color: #102038;
+  background:
+    radial-gradient(circle at top left, rgba(255, 214, 153, 0.35), transparent 42%),
+    radial-gradient(circle at top right, rgba(104, 163, 255, 0.28), transparent 36%),
+    linear-gradient(180deg, #f6f1e8 0%, #eef2f8 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  border: 0;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 14px;
+}
+
+.glass-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: calc(100vh - 28px);
+  padding: 16px;
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  box-shadow:
+    0 18px 50px rgba(27, 40, 68, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(24px);
+}
+
+.topbar,
+.section-header,
+.field-grid,
+.switch-row,
+.stock-row,
+.stock-name-line {
+  display: flex;
+  align-items: center;
+}
+
+.topbar,
+.section-header,
+.switch-row,
+.stock-row {
+  justify-content: space-between;
+}
+
+.topbar h1,
+.section h2 {
+  margin: 0;
+}
+
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #7b8698;
+}
+
+.topbar h1 {
+  margin-top: 4px;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.status-pill {
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(16, 32, 56, 0.08);
+  color: #304255;
+  font-size: 12px;
+}
+
+.status-pill.offline {
+  background: rgba(178, 48, 54, 0.12);
+  color: #9e3036;
+}
+
+.headline-card {
+  padding: 16px;
+  border-radius: 20px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.88), rgba(238, 244, 255, 0.72)),
+    linear-gradient(180deg, #faf6ef, #eef4ff);
+  border: 1px solid rgba(136, 160, 192, 0.22);
+}
+
+.headline-label {
+  font-size: 12px;
+  color: #78869a;
+}
+
+.headline-symbol {
+  margin-top: 6px;
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.headline-price {
+  margin-top: 10px;
+  font-size: 36px;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+}
+
+.headline-change {
+  margin-top: 6px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.up {
+  color: #c64338;
+}
+
+.down {
+  color: #1f8b5a;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.section h2 {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.ghost-btn {
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: rgba(16, 32, 56, 0.06);
+  color: #304255;
+  cursor: pointer;
+  transition: background 120ms ease, transform 120ms ease;
+}
+
+.ghost-btn:hover {
+  background: rgba(16, 32, 56, 0.1);
+  transform: translateY(-1px);
+}
+
+.list-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.stock-row {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(124, 148, 188, 0.18);
+  cursor: pointer;
+  text-align: left;
+  transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.stock-row:hover,
+.stock-row.active {
+  transform: translateY(-1px);
+  border-color: rgba(76, 125, 215, 0.34);
+  box-shadow: 0 10px 20px rgba(59, 95, 155, 0.12);
+}
+
+.stock-main,
+.stock-side,
+.field {
+  display: flex;
+  flex-direction: column;
+}
+
+.stock-main {
+  gap: 4px;
+}
+
+.stock-side {
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.stock-name-line {
+  gap: 8px;
+}
+
+.stock-symbol,
+.stock-price {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.stock-name,
+.stock-change,
+.muted,
+.footnote {
+  font-size: 12px;
+  color: #728198;
+}
+
+.market-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(54, 90, 160, 0.08);
+  color: #365aa0;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.settings-section {
+  margin-top: auto;
+}
+
+.field {
+  gap: 8px;
+}
+
+.field span {
+  font-size: 12px;
+  color: #6d7b92;
+}
+
+.field input,
+.field select {
+  height: 40px;
+  padding: 0 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(124, 148, 188, 0.18);
+  background: rgba(255, 255, 255, 0.78);
+  color: #102038;
+  outline: none;
+}
+
+.field input:focus,
+.field select:focus {
+  border-color: rgba(76, 125, 215, 0.38);
+  box-shadow: 0 0 0 3px rgba(76, 125, 215, 0.12);
+}
+
+.field-grid {
+  gap: 10px;
+}
+
+.field-grid > * {
+  flex: 1;
+}
+
+.switch-row {
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.62);
+  border: 1px solid rgba(124, 148, 188, 0.18);
+  font-size: 13px;
+}
+
+.empty-state {
+  padding: 18px 14px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.66);
+  border: 1px dashed rgba(124, 148, 188, 0.24);
+}
+
+.footnote {
+  line-height: 1.5;
+}

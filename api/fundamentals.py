@@ -3,13 +3,13 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import json
-import akshare as ak
-
 from db import get_connection
 from watchlist import load_watchlist
-from akshare_guard import should_skip_remote, record_failure, record_success, throttle
+from akshare_guard import should_skip_remote, record_failure, record_success
 from cache import is_etf
 from trading_time import now_cn
+from data_sources import DataType
+from data_sources.router import fetch as router_fetch
 
 router = APIRouter()
 
@@ -73,19 +73,13 @@ def _sync_fundamentals(symbols: List[str], force: bool = False) -> Dict[str, Any
         else:
             stock_codes.append(code)
 
-    stock_df = None
-    etf_df = None
-    try:
-        if stock_codes:
-            throttle(scope="akshare_fundamentals")
-            stock_df = ak.stock_zh_a_spot_em()
-        if etf_codes:
-            throttle(scope="akshare_fundamentals")
-            etf_df = ak.fund_etf_spot_em()
-    except Exception as e:
-        record_failure(f"fundamentals_fetch_failed: {e}", scope="fundamentals")
-        raise HTTPException(status_code=500, detail=str(e))
-
+    data, channel = router_fetch(DataType.FUNDAMENTALS, channels=["akshare"], symbols=symbols)
+    if not data:
+        today = now_cn().strftime("%Y-%m-%d")
+        record_failure("fundamentals_fetch_failed", scope="fundamentals")
+        return {"date": today, "count": 0, "note": "no_data"}
+    stock_df = data.get("stocks")
+    etf_df = data.get("etfs")
     record_success(scope="fundamentals")
 
     today = now_cn().strftime("%Y-%m-%d")

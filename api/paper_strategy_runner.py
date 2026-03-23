@@ -8,13 +8,13 @@ from config import LLM_MODEL
 from db import get_connection
 from llm import LLMService
 from cache import get_klines_with_cache
+from data_sources import DataType
+from data_sources.router import fetch as router_fetch
 from paper import OrderCreate, place_order, format_symbol, get_last_close, get_spot_maps, safe_float, _get_cash_balance, _get_initial_capital
 from strategy_universe import fetch_symbols_for_strategy
 from strategy_defaults import normalize_params, normalize_constraints
 from strategy_rules import compute_baseline_signal, serialize_baseline
 from trading_time import should_auto_run, now_cn
-import re
-import urllib.request
 
 _scheduler_started = False
 
@@ -36,91 +36,15 @@ def _estimate_fee(side: str, price: float, qty: int) -> float:
     return round(amount * 0.014, 2)
 
 
-def _get_market_prefix(symbol: str) -> str:
+def _fetch_realtime(symbol: str) -> Optional[Dict[str, Any]]:
     code = format_symbol(symbol)
-    if code.startswith(("6", "9")):
-        return "sh"
-    if code.startswith(("0", "2", "3", "1")):
-        return "sz"
-    if code.startswith(("8", "4")):
-        return "bj"
-    return "sh"
-
-
-def _safe_float_local(value) -> float:
-    try:
-        if value is None:
-            return 0
-        if isinstance(value, str):
-            text = value.strip().replace(",", "")
-            if text in ("", "--", "None", "nan"):
-                return 0
-            return float(text)
-        num = float(value)
-        if num != num or num in (float("inf"), float("-inf")):
-            return 0
-        return num
-    except Exception:
-        return 0
-
-
-def _fetch_tencent_quote(symbol: str) -> Optional[Dict[str, Any]]:
-    code = format_symbol(symbol)
-    market_prefix = _get_market_prefix(symbol)
-    url = f"https://qt.gtimg.cn/q={market_prefix}{code}"
-
-    def _do():
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0"
-        })
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.read()
-
-    raw = _do()
-    if not raw:
-        return None
-    try:
-        text = raw.decode("gbk", errors="ignore")
-    except Exception:
-        text = raw.decode("utf-8", errors="ignore")
-    match = re.search(r'="([^"]+)"', text)
-    if not match:
-        return None
-    parts = match.group(1).split("~")
-    if len(parts) < 35:
-        return None
-    name = parts[1] if len(parts) > 1 else None
-    price = _safe_float_local(parts[3] if len(parts) > 3 else 0)
-    prev_close = _safe_float_local(parts[4] if len(parts) > 4 else 0)
-    open_p = _safe_float_local(parts[5] if len(parts) > 5 else 0)
-    volume_lot = _safe_float_local(parts[6] if len(parts) > 6 else 0)
-    change = _safe_float_local(parts[31] if len(parts) > 31 else (price - prev_close))
-    change_pct = _safe_float_local(parts[32] if len(parts) > 32 else ((change / prev_close * 100) if prev_close else 0))
-    high = _safe_float_local(parts[33] if len(parts) > 33 else 0)
-    low = _safe_float_local(parts[34] if len(parts) > 34 else 0)
-    amount = _safe_float_local(parts[37] if len(parts) > 37 else 0) * 10000
-    time_str = parts[30] if len(parts) > 30 else ""
-    ts = int(now_cn().timestamp() * 1000)
-    if time_str and ":" in time_str:
-        try:
-            dt = datetime.strptime(f"{now_cn().strftime('%Y-%m-%d')} {time_str}", "%Y-%m-%d %H:%M:%S")
-            ts = int(dt.timestamp() * 1000)
-        except Exception:
-            pass
-    return {
-        "symbol": symbol,
-        "name": name,
-        "price": price,
-        "change": change,
-        "changePercent": change_pct,
-        "open": open_p,
-        "high": high,
-        "low": low,
-        "volume": volume_lot * 100,
-        "amount": amount,
-        "timestamp": ts,
-        "source": "tencent"
-    }
+    data, _ = router_fetch(
+        DataType.REALTIME,
+        channels=["tencent", "akshare"],
+        symbol=symbol,
+        code=code,
+    )
+    return data
 
 
 
@@ -183,7 +107,7 @@ def _estimate_positions_value(positions_map: Dict[str, Dict[str, float]]) -> flo
 
 
 def _get_latest_price(symbol: str) -> float:
-    qt = _fetch_tencent_quote(symbol)
+    qt = _fetch_realtime(symbol)
     if qt:
         price = _safe_float_local(qt.get("price"))
         if price > 0:
@@ -253,7 +177,7 @@ def _run_strategy_for_symbol(
 ) -> Tuple[int, str, str, float]:
     data_note = ""
     klines, _ = get_klines_with_cache(symbol, period="daily", limit=200)
-    quote = _fetch_tencent_quote(symbol)
+    quote = _fetch_realtime(symbol)
     if quote:
         ts = quote.get("timestamp")
         ts_text = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S") if ts else "N/A"

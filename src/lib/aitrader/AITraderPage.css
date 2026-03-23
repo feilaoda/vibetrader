@@ -1,0 +1,453 @@
+.aitrader-page {
+    height: 100vh;
+    background: #f4f6fb;
+    padding: 20px;
+    color: #1f2937;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+.aitrader-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+    gap: 12px;
+}
+
+.aitrader-title {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.aitrader-headline {
+    font-size: 18px;
+    font-weight: 700;
+}
+
+.aitrader-sub {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #6b7280;
+}
+
+.aitrader-back {
+    border: none;
+    background: none;
+    color: #2563eb;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.aitrader-body {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    gap: 12px;
+    flex: 1;
+    min-height: 0;
+}
+
+.aitrader-left,
+.aitrader-right {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    min-height: 0;
+}
+
+.aitrader-left {
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.aitrader-left-toolbar {
+    padding: 10px;
+    border-bottom: 1px solid #eef2f7;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.aitrader-search,
+.aitrader-select {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid #d1d5db;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+    background: #fff;
+}
+
+.aitrader-list {
+    overflow-y: auto;
+    flex: 1;
+}
+
+.aitrader-item {
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: #fff;
+    padding: 10px 12px;
+    border-bottom: 1px solid #f3f4f6;
+    cursor: pointer;
+}
+
+.aitrader-item:hover {
+    background: #f9fafb;
+}
+
+.aitrader-item.active {
+    background: #ecf5ff;
+    border-left: 3px solid #3b82f6;
+    padding-left: 9px;
+}
+
+.aitrader-item-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.aitrader-indicators {
+    margin-top: 12px;
+    border: 1px dashed #e5e7eb;
+    background: #f8fafc;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+}
+
+.aitrader-indicators-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+}
+
+.aitrader-indicators-filter {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 400;
+}
+
+.aitrader-indicators-toggle {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: #4b5563;
+}
+
+.aitrader-indicators-filter input,
+.aitrader-indicators-filter select {
+    padding: 4px 6px;
+    font-size: 11px;
+}
+
+.aitrader-indicators-table {
+    margin-top: 8px;
+    font-size: 11px;
+}
+
+.aitrader-indicators-row {
+    display: grid;
+    grid-template-columns: 200px 80px 1fr 140px;
+    gap: 8px;
+    padding: 4px 0;
+    border-top: 1px solid #e5e7eb;
+}
+
+.aitrader-indicators-row.head {
+    font-weight: 600;
+    color: #6b7280;
+    border-top: none;
+}
+
+.aitrader-item-symbol {
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.aitrader-item-market {
+    font-size: 11px;
+    color: #6b7280;
+}
+
+.aitrader-item-name {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #4b5563;
+}
+
+.aitrader-empty {
+    padding: 16px;
+    text-align: center;
+    color: #6b7280;
+    font-size: 12px;
+}
+
+.aitrader-right {
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow: hidden;
+}
+
+.aitrader-controls {
+    border: 1px solid #edf0f5;
+    border-radius: 10px;
+    padding: 10px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+}
+
+.aitrader-selected {
+    font-size: 13px;
+    min-width: 220px;
+}
+
+.aitrader-selected-name {
+    margin-left: 6px;
+    color: #6b7280;
+    font-size: 12px;
+}
+
+.aitrader-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #4b5563;
+}
+
+.aitrader-inline input,
+.aitrader-inline select {
+    border: 1px solid #d1d5db;
+    border-radius: 8px;
+    padding: 6px 8px;
+    font-size: 12px;
+    background: #fff;
+}
+
+.aitrader-inline input {
+    width: 90px;
+}
+
+.aitrader-actions {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.aitrader-error {
+    border: 1px solid #fecaca;
+    background: #fef2f2;
+    border-radius: 8px;
+    color: #b91c1c;
+    font-size: 12px;
+    padding: 8px 10px;
+}
+
+.aitrader-panels {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 10px;
+    flex: 1;
+    min-height: 0;
+}
+
+.aitrader-panel {
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #fff;
+    display: flex;
+    flex-direction: column;
+}
+
+.aitrader-panel-head {
+    padding: 10px 12px;
+    border-bottom: 1px solid #eef2f7;
+    background: #f8fafc;
+}
+
+.aitrader-panel-title {
+    font-size: 14px;
+    font-weight: 700;
+}
+
+.aitrader-panel-meta {
+    margin-top: 3px;
+    font-size: 11px;
+    color: #6b7280;
+}
+
+.aitrader-panel-content {
+    padding: 12px;
+    overflow-y: auto;
+    flex: 1;
+    background: #fff;
+}
+
+.aitrader-history-row {
+    border: 1px solid #edf0f5;
+    border-radius: 10px;
+    padding: 8px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.aitrader-rule-profile-row {
+    border: 1px solid #edf0f5;
+    border-radius: 10px;
+    padding: 8px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.aitrader-rule-profile-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: #1f2937;
+    margin-right: 4px;
+}
+
+.aitrader-inline-check input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    margin: 0;
+}
+
+.aitrader-rule-profile-actions {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.aitrader-rule-profile-msg {
+    width: 100%;
+    font-size: 12px;
+    color: #2563eb;
+}
+
+.aitrader-section {
+    border: 1px solid #eef2f7;
+    border-radius: 8px;
+    padding: 10px;
+    margin-bottom: 10px;
+    background: #fff;
+}
+
+.aitrader-section:last-child {
+    margin-bottom: 0;
+}
+
+.aitrader-section.is-diff {
+    border-color: #f8c471;
+    background: #fff7eb;
+}
+
+.aitrader-section-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #1f2937;
+}
+
+.aitrader-diff-tag {
+    font-size: 10px;
+    color: #92400e;
+    border: 1px solid #f59e0b;
+    border-radius: 999px;
+    padding: 1px 6px;
+    background: #fff;
+}
+
+.aitrader-md {
+    font-size: 12px;
+    line-height: 1.6;
+    color: #111827;
+    word-break: break-word;
+}
+
+.aitrader-md > :first-child {
+    margin-top: 0;
+}
+
+.aitrader-md > :last-child {
+    margin-bottom: 0;
+}
+
+.aitrader-md p,
+.aitrader-md ul,
+.aitrader-md ol,
+.aitrader-md blockquote,
+.aitrader-md table {
+    margin: 0 0 8px 0;
+}
+
+.aitrader-md ul,
+.aitrader-md ol {
+    padding-left: 18px;
+}
+
+.aitrader-md table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 12px;
+}
+
+.aitrader-md th,
+.aitrader-md td {
+    border: 1px solid #e5e7eb;
+    padding: 4px 6px;
+    text-align: left;
+}
+
+.aitrader-md code {
+    background: #f3f4f6;
+    border-radius: 4px;
+    padding: 1px 4px;
+}
+
+@media (max-width: 1160px) {
+    .aitrader-body {
+        grid-template-columns: 1fr;
+    }
+
+    .aitrader-left {
+        min-height: 260px;
+    }
+
+    .aitrader-panels {
+        grid-template-columns: 1fr;
+    }
+
+    .aitrader-actions {
+        margin-left: 0;
+    }
+}

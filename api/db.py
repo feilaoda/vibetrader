@@ -25,6 +25,62 @@ MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "vibetrader")
 
+AITRADER_RULE_MARKETS = ("ashare", "etf", "us", "crypto")
+DEFAULT_RULE_INDICATOR_WEIGHTS: Dict[str, float] = {
+    "大盘": 0.5,
+    "个股基础": 0.4,
+    "趋势动量": 0.8,
+    "量能": 0.7,
+    "板块相对": 0.6,
+    "左侧潜伏": 0.9,
+    "右侧突破": 1.0,
+    "风险观察": 0.7,
+    "止盈止损": 0.6,
+    "时间周期": 0.3,
+}
+DEFAULT_AITRADER_RULE_PROFILES: Dict[str, Dict[str, Any]] = {
+    "ashare": {
+        "rr_buy_downtrend": 1.5,
+        "rr_buy_uptrend": 1.3,
+        "require_close_above_ma20_downtrend": True,
+        "buy_position_downtrend": "试错小仓(≤10%)，仅右侧确认后执行",
+        "watch_position_downtrend": "空仓或轻仓(≤10%)，防守优先",
+        "buy_position_uptrend": "分批建仓(10%-25%)",
+        "watch_position_uptrend": "等待更优盈亏比后再进场",
+        "watch_position_range": "控制仓位，等待方向确认",
+    },
+    "etf": {
+        "rr_buy_downtrend": 1.4,
+        "rr_buy_uptrend": 1.2,
+        "require_close_above_ma20_downtrend": True,
+        "buy_position_downtrend": "试错小仓(≤12%)，仅右侧确认后执行",
+        "watch_position_downtrend": "空仓或轻仓(≤12%)，防守优先",
+        "buy_position_uptrend": "分批建仓(10%-30%)",
+        "watch_position_uptrend": "等待更优盈亏比后再进场",
+        "watch_position_range": "控制仓位，等待方向确认",
+    },
+    "us": {
+        "rr_buy_downtrend": 1.4,
+        "rr_buy_uptrend": 1.2,
+        "require_close_above_ma20_downtrend": False,
+        "buy_position_downtrend": "试错小仓(≤12%)，仅右侧确认后执行",
+        "watch_position_downtrend": "空仓或轻仓(≤12%)，防守优先",
+        "buy_position_uptrend": "分批建仓(10%-30%)",
+        "watch_position_uptrend": "等待更优盈亏比后再进场",
+        "watch_position_range": "控制仓位，等待方向确认",
+    },
+    "crypto": {
+        "rr_buy_downtrend": 1.6,
+        "rr_buy_uptrend": 1.4,
+        "require_close_above_ma20_downtrend": True,
+        "buy_position_downtrend": "试错小仓(≤8%)，仅右侧确认后执行",
+        "watch_position_downtrend": "空仓或轻仓(≤8%)，防守优先",
+        "buy_position_uptrend": "分批建仓(8%-20%)",
+        "watch_position_uptrend": "等待更优盈亏比后再进场",
+        "watch_position_range": "控制仓位，等待方向确认",
+    },
+}
+
 
 def _normalize_query(sql: str) -> str:
     if not sql:
@@ -34,6 +90,22 @@ def _normalize_query(sql: str) -> str:
     if "?" in text:
         text = text.replace("?", "%s")
     return text
+
+
+def _parse_json_field(raw: Any) -> dict:
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+    return {}
 
 
 class _MySQLResult:
@@ -288,6 +360,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS symbol_industry_settings (
                 symbol VARCHAR PRIMARY KEY,
                 enabled BOOLEAN DEFAULT FALSE,
+                market_broad_index VARCHAR,
+                market_style_index VARCHAR,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -306,13 +380,56 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE SEQUENCE IF NOT EXISTS seq_symbol_note_id;
+            CREATE TABLE IF NOT EXISTS symbol_notes (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_symbol_note_id'),
+                symbol VARCHAR,
+                note_date VARCHAR,
+                content TEXT,
+                is_global BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_symbol_notes_symbol_date
+                ON symbol_notes(symbol, note_date);
+
             CREATE SEQUENCE IF NOT EXISTS seq_prompt_template_id;
             CREATE TABLE IF NOT EXISTS prompt_templates (
                 id INTEGER PRIMARY KEY DEFAULT nextval('seq_prompt_template_id'),
                 name VARCHAR,
                 prompt TEXT,
+                params TEXT,
                 is_builtin BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS rule_indicators (
+                indicator_id VARCHAR PRIMARY KEY,
+                name VARCHAR,
+                category VARCHAR,
+                description TEXT,
+                formula TEXT,
+                data_source TEXT,
+                params_json TEXT,
+                default_enabled BOOLEAN DEFAULT TRUE,
+                sort_order INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS rule_indicator_settings (
+                indicator_id VARCHAR,
+                market VARCHAR,
+                enabled BOOLEAN DEFAULT TRUE,
+                params_json TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (indicator_id, market)
+            );
+
+            CREATE TABLE IF NOT EXISTS rule_indicator_bucket_mapping (
+                category VARCHAR PRIMARY KEY,
+                bucket VARCHAR,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -354,8 +471,66 @@ def init_db():
                 reason TEXT,
                 model_id VARCHAR,
                 raw_json TEXT,
+                rule_action VARCHAR,
+                rule_stage VARCHAR,
+                rule_rr DOUBLE,
+                rule_confidence DOUBLE,
+                rule_trend_score DOUBLE,
+                rule_structure_score DOUBLE,
+                rule_volume_score DOUBLE,
+                rule_rr_score DOUBLE,
+                rule_total_score DOUBLE,
+                rule_risk_gates TEXT,
+                ai_action VARCHAR,
+                ai_reason TEXT,
+                ai_risk TEXT,
+                ai_model VARCHAR,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(run_id, symbol)
+            );
+
+            CREATE SEQUENCE IF NOT EXISTS seq_aitrader_history_id;
+            CREATE TABLE IF NOT EXISTS aitrader_analysis_history (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_aitrader_history_id'),
+                symbol VARCHAR,
+                engine VARCHAR,
+                model_id VARCHAR,
+                bars INTEGER,
+                start_date VARCHAR,
+                end_date VARCHAR,
+                source VARCHAR,
+                analysis TEXT,
+                analysis_meta_json TEXT,
+                snapshot_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS aitrader_rule_profiles (
+                market VARCHAR PRIMARY KEY,
+                rr_buy_downtrend DOUBLE,
+                rr_buy_uptrend DOUBLE,
+                require_close_above_ma20_downtrend BOOLEAN DEFAULT TRUE,
+                buy_position_downtrend TEXT,
+                watch_position_downtrend TEXT,
+                buy_position_uptrend TEXT,
+                watch_position_uptrend TEXT,
+                watch_position_range TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS aitrader_signal_calibration (
+                symbol VARCHAR,
+                market VARCHAR,
+                bucket VARCHAR,
+                horizon_days INTEGER,
+                sample_size INTEGER,
+                hit_rate DOUBLE,
+                avg_return DOUBLE,
+                mfe DOUBLE,
+                mae DOUBLE,
+                confidence DOUBLE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, bucket, horizon_days)
             );
         """)
     else:
@@ -521,6 +696,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS symbol_industry_settings (
                 symbol VARCHAR(32) PRIMARY KEY,
                 enabled BOOLEAN DEFAULT FALSE,
+                market_broad_index VARCHAR(32),
+                market_style_index VARCHAR(32),
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
@@ -542,12 +719,57 @@ def init_db():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
+            CREATE TABLE IF NOT EXISTS symbol_notes (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                symbol VARCHAR(32),
+                note_date VARCHAR(10),
+                content TEXT,
+                is_global BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_symbol_notes_symbol_date (symbol, note_date, id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
             CREATE TABLE IF NOT EXISTS prompt_templates (
                 id INTEGER PRIMARY KEY AUTO_INCREMENT,
                 name VARCHAR(128),
                 prompt TEXT,
+                params TEXT,
                 is_builtin BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rule_indicators (
+                indicator_id VARCHAR(64) PRIMARY KEY,
+                name VARCHAR(128),
+                category VARCHAR(64),
+                description TEXT,
+                formula TEXT,
+                data_source TEXT,
+                params_json TEXT,
+                default_enabled BOOLEAN DEFAULT TRUE,
+                sort_order INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rule_indicator_settings (
+                indicator_id VARCHAR(64),
+                market VARCHAR(16),
+                enabled BOOLEAN DEFAULT TRUE,
+                params_json TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (indicator_id, market)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rule_indicator_bucket_mapping (
+                category VARCHAR(64) PRIMARY KEY,
+                bucket VARCHAR(16),
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
@@ -591,8 +813,73 @@ def init_db():
                 reason TEXT,
                 model_id VARCHAR(64),
                 raw_json TEXT,
+                rule_action VARCHAR(16),
+                rule_stage VARCHAR(64),
+                rule_rr DOUBLE,
+                rule_rr_up DOUBLE,
+                rule_rr_down DOUBLE,
+                rule_rr_threshold DOUBLE,
+                rule_confidence DOUBLE,
+                rule_trend_score DOUBLE,
+                rule_structure_score DOUBLE,
+                rule_volume_score DOUBLE,
+                rule_rr_score DOUBLE,
+                rule_total_score DOUBLE,
+                rule_risk_gates TEXT,
+                ai_action VARCHAR(16),
+                ai_reason TEXT,
+                ai_risk TEXT,
+                ai_model VARCHAR(64),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(run_id, symbol)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS aitrader_analysis_history (
+                id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                symbol VARCHAR(32),
+                engine VARCHAR(16),
+                model_id VARCHAR(64),
+                bars INTEGER,
+                start_date VARCHAR(10),
+                end_date VARCHAR(10),
+                source VARCHAR(32),
+                analysis LONGTEXT,
+                analysis_meta_json LONGTEXT,
+                snapshot_json LONGTEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_aitrader_symbol_created (symbol, created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS aitrader_rule_profiles (
+                market VARCHAR(16) PRIMARY KEY,
+                rr_buy_downtrend DOUBLE,
+                rr_buy_uptrend DOUBLE,
+                require_close_above_ma20_downtrend BOOLEAN DEFAULT TRUE,
+                buy_position_downtrend TEXT,
+                watch_position_downtrend TEXT,
+                buy_position_uptrend TEXT,
+                watch_position_uptrend TEXT,
+                watch_position_range TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS aitrader_signal_calibration (
+                symbol VARCHAR(32),
+                market VARCHAR(16),
+                bucket VARCHAR(64),
+                horizon_days INTEGER,
+                sample_size INTEGER,
+                hit_rate DOUBLE,
+                avg_return DOUBLE,
+                mfe DOUBLE,
+                mae DOUBLE,
+                confidence DOUBLE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, bucket, horizon_days),
+                INDEX idx_signal_calibration_updated (updated_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
         ]
@@ -636,11 +923,82 @@ def init_db():
     except Exception:
         pass
     try:
+        if not _col_exists("prompt_templates", "params"):
+            if DB_BACKEND == "duckdb":
+                conn.execute("ALTER TABLE prompt_templates ADD COLUMN params TEXT")
+            else:
+                conn.execute("ALTER TABLE prompt_templates ADD COLUMN params TEXT")
+    except Exception:
+        pass
+    try:
+        screening_cols = [
+            ("rule_action", "VARCHAR"),
+            ("rule_stage", "VARCHAR"),
+            ("rule_rr", "DOUBLE"),
+            ("rule_rr_up", "DOUBLE"),
+            ("rule_rr_down", "DOUBLE"),
+            ("rule_rr_threshold", "DOUBLE"),
+            ("rule_confidence", "DOUBLE"),
+            ("rule_trend_score", "DOUBLE"),
+            ("rule_structure_score", "DOUBLE"),
+            ("rule_volume_score", "DOUBLE"),
+            ("rule_rr_score", "DOUBLE"),
+            ("rule_total_score", "DOUBLE"),
+            ("rule_risk_gates", "TEXT"),
+            ("ai_action", "VARCHAR"),
+            ("ai_reason", "TEXT"),
+            ("ai_risk", "TEXT"),
+            ("ai_model", "VARCHAR"),
+        ]
+        for col, col_type in screening_cols:
+            if _col_exists("screening_results", col):
+                continue
+            if DB_BACKEND == "duckdb":
+                conn.execute(f"ALTER TABLE screening_results ADD COLUMN {col} {col_type}")
+            else:
+                mysql_type = col_type
+                if col_type == "VARCHAR":
+                    if col in ("rule_stage",):
+                        mysql_type = "VARCHAR(64)"
+                    else:
+                        mysql_type = "VARCHAR(16)"
+                elif col_type == "DOUBLE":
+                    mysql_type = "DOUBLE"
+                elif col_type == "TEXT":
+                    mysql_type = "TEXT"
+                conn.execute(f"ALTER TABLE screening_results ADD COLUMN {col} {mysql_type}")
+    except Exception:
+        pass
+    try:
         if not _col_exists("push_settings", "auto_eval_interval_minutes"):
             if DB_BACKEND == "duckdb":
                 conn.execute("ALTER TABLE push_settings ADD COLUMN auto_eval_interval_minutes INTEGER DEFAULT 5")
             else:
                 conn.execute("ALTER TABLE push_settings ADD COLUMN auto_eval_interval_minutes INT DEFAULT 5")
+    except Exception:
+        pass
+    try:
+        if not _col_exists("symbol_industry_settings", "market_broad_index"):
+            if DB_BACKEND == "duckdb":
+                conn.execute("ALTER TABLE symbol_industry_settings ADD COLUMN market_broad_index VARCHAR")
+            else:
+                conn.execute("ALTER TABLE symbol_industry_settings ADD COLUMN market_broad_index VARCHAR(32)")
+    except Exception:
+        pass
+    try:
+        if not _col_exists("symbol_industry_settings", "market_style_index"):
+            if DB_BACKEND == "duckdb":
+                conn.execute("ALTER TABLE symbol_industry_settings ADD COLUMN market_style_index VARCHAR")
+            else:
+                conn.execute("ALTER TABLE symbol_industry_settings ADD COLUMN market_style_index VARCHAR(32)")
+    except Exception:
+        pass
+    try:
+        if not _col_exists("symbol_notes", "is_global"):
+            if DB_BACKEND == "duckdb":
+                conn.execute("ALTER TABLE symbol_notes ADD COLUMN is_global BOOLEAN DEFAULT FALSE")
+            else:
+                conn.execute("ALTER TABLE symbol_notes ADD COLUMN is_global TINYINT(1) DEFAULT 0")
     except Exception:
         pass
 
@@ -818,6 +1176,21 @@ def init_db():
         migrate_symbol_prompts_to_templates()
     except Exception as e:
         print(f"[DB] prompt template init skipped: {e}")
+
+    try:
+        ensure_aitrader_rule_profiles(conn)
+    except Exception as e:
+        print(f"[DB] aitrader rule profile init skipped: {e}")
+
+    try:
+        ensure_rule_indicators(conn)
+    except Exception as e:
+        print(f"[DB] rule indicators init skipped: {e}")
+
+    try:
+        ensure_rule_indicator_bucket_mapping(conn)
+    except Exception as e:
+        print(f"[DB] rule indicator bucket mapping init skipped: {e}")
 
     # Paper orders add strategy_id column if missing
     try:
@@ -1322,6 +1695,534 @@ def _to_ymd_compact(value: Any) -> str:
     return text.replace("-", "") if text else ""
 
 
+def normalize_aitrader_rule_market(market: str | None) -> str:
+    text = (market or "").strip().lower()
+    if text in AITRADER_RULE_MARKETS:
+        return text
+    if text in ("a", "cn", "ash", "stock"):
+        return "ashare"
+    return "ashare"
+
+
+def detect_aitrader_rule_market(symbol: str | None) -> str:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return "ashare"
+    if sym.endswith(".US"):
+        return "us"
+    if sym.endswith((".SH", ".SZ", ".BJ")):
+        code = sym.split(".")[0]
+        if code.startswith(("15", "16", "5")):
+            return "etf"
+        return "ashare"
+    return "crypto"
+
+
+def _rule_profile_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return bool(default)
+
+
+def _rule_profile_float(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return float(default)
+        num = float(value)
+        if num != num or num in (float("inf"), float("-inf")):
+            return float(default)
+        return num
+    except Exception:
+        return float(default)
+
+
+def _normalize_rule_profile_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    market = normalize_aitrader_rule_market(str(row.get("market") or "ashare"))
+    defaults = DEFAULT_AITRADER_RULE_PROFILES.get(market, DEFAULT_AITRADER_RULE_PROFILES["ashare"])
+    return {
+        "market": market,
+        "rr_buy_downtrend": _rule_profile_float(row.get("rr_buy_downtrend"), float(defaults["rr_buy_downtrend"])),
+        "rr_buy_uptrend": _rule_profile_float(row.get("rr_buy_uptrend"), float(defaults["rr_buy_uptrend"])),
+        "require_close_above_ma20_downtrend": _rule_profile_bool(
+            row.get("require_close_above_ma20_downtrend"),
+            bool(defaults["require_close_above_ma20_downtrend"]),
+        ),
+        "buy_position_downtrend": str(
+            row.get("buy_position_downtrend") or defaults["buy_position_downtrend"]
+        ),
+        "watch_position_downtrend": str(
+            row.get("watch_position_downtrend") or defaults["watch_position_downtrend"]
+        ),
+        "buy_position_uptrend": str(
+            row.get("buy_position_uptrend") or defaults["buy_position_uptrend"]
+        ),
+        "watch_position_uptrend": str(
+            row.get("watch_position_uptrend") or defaults["watch_position_uptrend"]
+        ),
+        "watch_position_range": str(
+            row.get("watch_position_range") or defaults["watch_position_range"]
+        ),
+    }
+
+
+def _build_default_rule_profile(market: str) -> Dict[str, Any]:
+    market_norm = normalize_aitrader_rule_market(market)
+    defaults = DEFAULT_AITRADER_RULE_PROFILES.get(market_norm, DEFAULT_AITRADER_RULE_PROFILES["ashare"])
+    return _normalize_rule_profile_row({"market": market_norm, **defaults})
+
+
+def _decode_rule_profile_row(row: Any) -> Dict[str, Any]:
+    return _normalize_rule_profile_row({
+        "market": row[0],
+        "rr_buy_downtrend": row[1],
+        "rr_buy_uptrend": row[2],
+        "require_close_above_ma20_downtrend": row[3],
+        "buy_position_downtrend": row[4],
+        "watch_position_downtrend": row[5],
+        "buy_position_uptrend": row[6],
+        "watch_position_uptrend": row[7],
+        "watch_position_range": row[8],
+    })
+
+
+def ensure_aitrader_rule_profiles(conn=None):
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
+    try:
+        for market in AITRADER_RULE_MARKETS:
+            defaults = _build_default_rule_profile(market)
+            row = conn.execute(
+                "SELECT 1 FROM aitrader_rule_profiles WHERE market = ? LIMIT 1",
+                (market,),
+            ).fetchone()
+            if row:
+                continue
+            conn.execute(
+                "INSERT INTO aitrader_rule_profiles "
+                "(market, rr_buy_downtrend, rr_buy_uptrend, require_close_above_ma20_downtrend, "
+                "buy_position_downtrend, watch_position_downtrend, buy_position_uptrend, watch_position_uptrend, "
+                "watch_position_range, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (
+                    market,
+                    defaults["rr_buy_downtrend"],
+                    defaults["rr_buy_uptrend"],
+                    int(bool(defaults["require_close_above_ma20_downtrend"])),
+                    defaults["buy_position_downtrend"],
+                    defaults["watch_position_downtrend"],
+                    defaults["buy_position_uptrend"],
+                    defaults["watch_position_uptrend"],
+                    defaults["watch_position_range"],
+                ),
+            )
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def ensure_rule_indicators(conn=None):
+    from rule_indicator_catalog import RULE_INDICATOR_CATALOG
+
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
+    try:
+        for item in RULE_INDICATOR_CATALOG:
+            indicator_id = str(item.get("indicator_id") or "").strip()
+            if not indicator_id:
+                continue
+            name = item.get("name") or indicator_id
+            category = item.get("category") or ""
+            description = item.get("description") or ""
+            formula = item.get("formula") or ""
+            data_source = item.get("data_source") or ""
+            params = dict(item.get("params") or {})
+            if "weight" not in params:
+                params["weight"] = DEFAULT_RULE_INDICATOR_WEIGHTS.get(category, 0.5)
+            params_text = json.dumps(params, ensure_ascii=False)
+            default_enabled = bool(item.get("default_enabled", True))
+            sort_order = int(item.get("sort_order") or 0)
+            if DB_BACKEND == "duckdb":
+                conn.execute(
+                    "INSERT OR REPLACE INTO rule_indicators "
+                    "(indicator_id, name, category, description, formula, data_source, params_json, default_enabled, sort_order, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    (
+                        indicator_id,
+                        name,
+                        category,
+                        description,
+                        formula,
+                        data_source,
+                        params_text,
+                        default_enabled,
+                        sort_order,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO rule_indicators "
+                    "(indicator_id, name, category, description, formula, data_source, params_json, default_enabled, sort_order, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "name = VALUES(name), "
+                    "category = VALUES(category), "
+                    "description = VALUES(description), "
+                    "formula = VALUES(formula), "
+                    "data_source = VALUES(data_source), "
+                    "params_json = VALUES(params_json), "
+                    "default_enabled = VALUES(default_enabled), "
+                    "sort_order = VALUES(sort_order), "
+                    "updated_at = CURRENT_TIMESTAMP",
+                    (
+                        indicator_id,
+                        name,
+                        category,
+                        description,
+                        formula,
+                        data_source,
+                        params_text,
+                        default_enabled,
+                        sort_order,
+                    ),
+                )
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def ensure_rule_indicator_bucket_mapping(conn=None):
+    from rule_indicator_mapping import get_default_mapping
+
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
+    try:
+        existing_rows = conn.execute(
+            "SELECT category FROM rule_indicator_bucket_mapping"
+        ).fetchall()
+        existing = {str(r[0]) for r in existing_rows if r and r[0] is not None}
+        defaults = get_default_mapping()
+        for category, bucket in defaults.items():
+            if category in existing:
+                continue
+            if DB_BACKEND == "duckdb":
+                conn.execute(
+                    "INSERT INTO rule_indicator_bucket_mapping (category, bucket, updated_at) "
+                    "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (category, bucket),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO rule_indicator_bucket_mapping (category, bucket, updated_at) "
+                    "VALUES (?, ?, CURRENT_TIMESTAMP) "
+                    "ON DUPLICATE KEY UPDATE bucket = bucket",
+                    (category, bucket),
+                )
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def get_rule_indicator_bucket_mapping() -> Dict[str, str]:
+    conn = get_connection()
+    try:
+        ensure_rule_indicator_bucket_mapping(conn)
+        rows = conn.execute(
+            "SELECT category, bucket FROM rule_indicator_bucket_mapping"
+        ).fetchall()
+        mapping: Dict[str, str] = {}
+        for row in rows:
+            if not row or row[0] is None:
+                continue
+            category = str(row[0])
+            bucket = str(row[1]) if row[1] is not None else ""
+            if bucket:
+                mapping[category] = bucket
+        return mapping
+    finally:
+        conn.close()
+
+
+def upsert_rule_indicator_bucket_mapping(category: str, bucket: str) -> bool:
+    category_norm = (category or "").strip()
+    bucket_norm = (bucket or "").strip().lower()
+    if not category_norm or bucket_norm not in {"trend", "structure", "volume", "rr", "total"}:
+        return False
+    conn = get_connection()
+    try:
+        if DB_BACKEND == "duckdb":
+            conn.execute(
+                "INSERT OR REPLACE INTO rule_indicator_bucket_mapping (category, bucket, updated_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (category_norm, bucket_norm),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO rule_indicator_bucket_mapping (category, bucket, updated_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP) "
+                "ON DUPLICATE KEY UPDATE bucket = VALUES(bucket), updated_at = CURRENT_TIMESTAMP",
+                (category_norm, bucket_norm),
+            )
+        return True
+    finally:
+        conn.close()
+
+
+def list_rule_indicators(market: str = "ashare") -> List[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        ensure_rule_indicators(conn)
+        rows = conn.execute(
+            "SELECT indicator_id, name, category, description, formula, data_source, params_json, default_enabled, sort_order "
+            "FROM rule_indicators ORDER BY sort_order ASC, indicator_id ASC"
+        ).fetchall()
+        setting_rows = conn.execute(
+            "SELECT indicator_id, enabled, params_json FROM rule_indicator_settings WHERE market = ?",
+            ((market or "ashare").strip().lower(),),
+        ).fetchall()
+        settings = {}
+        for r in setting_rows:
+            settings[str(r[0])] = {
+                "enabled": bool(r[1]) if r[1] is not None else None,
+                "params": _parse_json_field(r[2]),
+            }
+        items: List[Dict[str, Any]] = []
+        for r in rows:
+            indicator_id = str(r[0])
+            params = _parse_json_field(r[6])
+            if "weight" not in params:
+                params["weight"] = DEFAULT_RULE_INDICATOR_WEIGHTS.get(r[2] or "", 0.5)
+            if "score_contribution" not in params:
+                params["score_contribution"] = 0.0
+            setting = settings.get(indicator_id, {})
+            if setting.get("params"):
+                params = {**params, **setting.get("params")}
+            enabled = setting.get("enabled")
+            if enabled is None:
+                enabled = bool(r[7]) if r[7] is not None else True
+            items.append({
+                "indicator_id": indicator_id,
+                "name": r[1],
+                "category": r[2],
+                "description": r[3],
+                "formula": r[4],
+                "data_source": r[5],
+                "params": params,
+                "default_enabled": bool(r[7]) if r[7] is not None else True,
+                "enabled": bool(enabled),
+                "sort_order": int(r[8] or 0),
+            })
+        return items
+    finally:
+        conn.close()
+
+
+def upsert_rule_indicator_setting(
+    indicator_id: str,
+    market: str = "ashare",
+    enabled: Optional[bool] = None,
+    params: Optional[dict] = None,
+) -> bool:
+    conn = get_connection()
+    try:
+        indicator_id = (indicator_id or "").strip()
+        if not indicator_id:
+            return False
+        market_key = (market or "ashare").strip().lower()
+        row = conn.execute(
+            "SELECT indicator_id FROM rule_indicators WHERE indicator_id = ? LIMIT 1",
+            (indicator_id,),
+        ).fetchone()
+        if not row:
+            return False
+        existing = conn.execute(
+            "SELECT enabled, params_json FROM rule_indicator_settings WHERE indicator_id = ? AND market = ?",
+            (indicator_id, market_key),
+        ).fetchone()
+        current_enabled = enabled
+        current_params = params
+        if existing:
+            if current_enabled is None:
+                current_enabled = bool(existing[0]) if existing[0] is not None else None
+            if current_params is None:
+                current_params = _parse_json_field(existing[1])
+        if current_enabled is None:
+            current_enabled = True
+        params_text = json.dumps(current_params or {}, ensure_ascii=False)
+        if DB_BACKEND == "duckdb":
+            conn.execute(
+                "INSERT OR REPLACE INTO rule_indicator_settings "
+                "(indicator_id, market, enabled, params_json, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (indicator_id, market_key, bool(current_enabled), params_text),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO rule_indicator_settings "
+                "(indicator_id, market, enabled, params_json, updated_at) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON DUPLICATE KEY UPDATE "
+                "enabled = VALUES(enabled), "
+                "params_json = VALUES(params_json), "
+                "updated_at = CURRENT_TIMESTAMP",
+                (indicator_id, market_key, bool(current_enabled), params_text),
+            )
+        return True
+    finally:
+        conn.close()
+
+
+def _merge_constraint_defaults(raw: Any) -> Dict[str, Any]:
+    merged = dict(DEFAULT_CONSTRAINTS)
+    if isinstance(raw, dict):
+        merged.update(raw)
+        return merged
+    if isinstance(raw, str) and raw.strip():
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                merged.update(loaded)
+        except Exception:
+            pass
+    return merged
+
+
+def _safe_strategy_numeric(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return float(default)
+        num = float(value)
+        if num != num or num in (float("inf"), float("-inf")):
+            return float(default)
+        return num
+    except Exception:
+        return float(default)
+
+
+def _get_effective_paper_strategy_id(conn, strategy_id: int | None = None) -> int:
+    if strategy_id:
+        row = conn.execute(
+            "SELECT id FROM paper_strategies WHERE id = ? LIMIT 1",
+            (int(strategy_id),),
+        ).fetchone()
+        if row:
+            return int(row[0])
+    row = conn.execute(
+        "SELECT id FROM paper_strategies WHERE type = 'manual' ORDER BY id LIMIT 1"
+    ).fetchone()
+    if row:
+        return int(row[0])
+    row = conn.execute("SELECT id FROM paper_strategies ORDER BY id LIMIT 1").fetchone()
+    if row:
+        return int(row[0])
+    return 0
+
+
+def get_paper_portfolio_context(symbol: str = "", strategy_id: int | None = None):
+    conn = get_connection()
+    try:
+        sid = _get_effective_paper_strategy_id(conn, strategy_id)
+        if sid <= 0:
+            return {
+                "strategy_id": 0,
+                "strategy_name": "",
+                "initial_capital": 0.0,
+                "cash_balance": 0.0,
+                "positions_value": 0.0,
+                "total_equity": 0.0,
+                "max_drawdown_pct": float(DEFAULT_CONSTRAINTS.get("max_drawdown_pct") or 15.0),
+                "max_position_pct": float(DEFAULT_CONSTRAINTS.get("max_position_pct") or 20.0),
+                "stop_loss_pct": float(DEFAULT_CONSTRAINTS.get("stop_loss_pct") or 5.0),
+                "max_drawdown_budget": 0.0,
+                "position": {},
+                "positions": [],
+            }
+
+        strategy_row = conn.execute(
+            "SELECT name, initial_capital, constraints_json FROM paper_strategies WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        strategy_name = strategy_row[0] if strategy_row else ""
+        initial_capital = _safe_strategy_numeric(strategy_row[1] if strategy_row else None, 100000.0)
+        constraints = _merge_constraint_defaults(strategy_row[2] if strategy_row else None)
+        max_drawdown_pct = _safe_strategy_numeric(constraints.get("max_drawdown_pct"), 15.0)
+        max_position_pct = _safe_strategy_numeric(constraints.get("max_position_pct"), 20.0)
+        stop_loss_pct = _safe_strategy_numeric(constraints.get("stop_loss_pct"), 5.0)
+
+        order_rows = conn.execute(
+            "SELECT side, price, quantity, fee FROM paper_orders WHERE strategy_id = ?",
+            (sid,),
+        ).fetchall()
+        cash_balance = float(initial_capital)
+        for side, price, qty, fee in order_rows:
+            amount = _safe_strategy_numeric(price, 0.0) * _safe_strategy_numeric(qty, 0.0)
+            fee_val = _safe_strategy_numeric(fee, 0.0)
+            if str(side).upper() == "BUY":
+                cash_balance -= amount + fee_val
+            elif str(side).upper() == "SELL":
+                cash_balance += amount - fee_val
+
+        pos_rows = conn.execute(
+            "SELECT symbol, quantity, avg_cost FROM paper_positions WHERE strategy_id = ?",
+            (sid,),
+        ).fetchall()
+        positions: List[Dict[str, Any]] = []
+        positions_value = 0.0
+        target_symbol = (symbol or "").strip().upper()
+        target_position: Dict[str, Any] = {}
+
+        for row in pos_rows:
+            pos_symbol = str(row[0] or "").strip().upper()
+            qty = _safe_int_value(row[1])
+            avg_cost = _safe_strategy_numeric(row[2], 0.0)
+            close_row = conn.execute(
+                "SELECT close FROM daily_klines WHERE symbol = ? AND period = ? ORDER BY date DESC LIMIT 1",
+                (pos_symbol, "daily"),
+            ).fetchone()
+            last_close = _safe_strategy_numeric(close_row[0] if close_row else None, avg_cost)
+            market_value = float(last_close) * float(qty)
+            positions_value += market_value
+            pos_item = {
+                "symbol": pos_symbol,
+                "quantity": qty,
+                "avg_cost": avg_cost,
+                "last_close": last_close,
+                "market_value": market_value,
+            }
+            positions.append(pos_item)
+            if pos_symbol == target_symbol:
+                target_position = pos_item
+
+        total_equity = float(cash_balance) + float(positions_value)
+        if total_equity < 0:
+            total_equity = 0.0
+        max_drawdown_budget = total_equity * max(0.0, max_drawdown_pct) / 100.0
+
+        return {
+            "strategy_id": sid,
+            "strategy_name": strategy_name or "",
+            "initial_capital": float(initial_capital),
+            "cash_balance": float(cash_balance),
+            "positions_value": float(positions_value),
+            "total_equity": float(total_equity),
+            "max_drawdown_pct": float(max_drawdown_pct),
+            "max_position_pct": float(max_position_pct),
+            "stop_loss_pct": float(stop_loss_pct),
+            "max_drawdown_budget": float(max_drawdown_budget),
+            "position": target_position,
+            "positions": positions,
+        }
+    finally:
+        conn.close()
+
+
 def get_daily_klines_cache(symbol: str, period: str = "daily") -> Optional[Dict[str, Any]]:
     sym = (symbol or "").upper().strip()
     if not sym:
@@ -1688,6 +2589,124 @@ def clear_memory(symbol: str) -> bool:
     finally:
         conn.close()
 
+
+def list_symbol_notes(symbol: str, limit: int = 200):
+    conn = get_connection()
+    try:
+        sym = (symbol or "").upper().strip()
+        lim = max(1, min(int(limit or 200), 1000))
+        if not sym:
+            return []
+        rows = conn.execute(
+            "SELECT id, symbol, note_date, content, is_global, created_at, updated_at "
+            "FROM symbol_notes WHERE symbol = ? OR is_global = TRUE "
+            "ORDER BY note_date DESC, updated_at DESC, id DESC LIMIT ?",
+            (sym, lim),
+        ).fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "symbol": row[1],
+                "note_date": row[2],
+                "content": row[3] or "",
+                "is_global": bool(row[4]),
+                "created_at": row[5],
+                "updated_at": row[6],
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def create_symbol_note(symbol: str, note_date: str, content: str, is_global: bool = False):
+    conn = get_connection()
+    try:
+        sym = (symbol or "").upper().strip()
+        txt = (content or "").strip()
+        date_text = str(note_date or "").strip()
+        if not sym:
+            raise ValueError("Invalid symbol")
+        if not txt:
+            raise ValueError("Note content is empty")
+        if not date_text:
+            raise ValueError("Invalid note_date")
+        res = conn.execute(
+            "INSERT INTO symbol_notes (symbol, note_date, content, is_global, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            (sym, date_text, txt, bool(is_global)),
+        )
+        note_id = int(res.lastrowid) if hasattr(res, "lastrowid") and res.lastrowid else 0
+        if note_id > 0:
+            row = conn.execute(
+                "SELECT id, symbol, note_date, content, is_global, created_at, updated_at "
+                "FROM symbol_notes WHERE id = ? LIMIT 1",
+                (note_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id, symbol, note_date, content, is_global, created_at, updated_at "
+                "FROM symbol_notes WHERE symbol = ? AND note_date = ? AND content = ? AND is_global = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (sym, date_text, txt, bool(is_global)),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "symbol": row[1],
+            "note_date": row[2],
+            "content": row[3] or "",
+            "is_global": bool(row[4]),
+            "created_at": row[5],
+            "updated_at": row[6],
+        }
+    finally:
+        conn.close()
+
+
+def update_symbol_note(note_id: int, note_date: str, content: str, is_global: bool = False):
+    conn = get_connection()
+    try:
+        txt = (content or "").strip()
+        date_text = str(note_date or "").strip()
+        if not txt:
+            raise ValueError("Note content is empty")
+        if not date_text:
+            raise ValueError("Invalid note_date")
+        nid = int(note_id)
+        conn.execute(
+            "UPDATE symbol_notes SET note_date = ?, content = ?, is_global = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (date_text, txt, bool(is_global), nid),
+        )
+        row = conn.execute(
+            "SELECT id, symbol, note_date, content, is_global, created_at, updated_at "
+            "FROM symbol_notes WHERE id = ? LIMIT 1",
+            (nid,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "symbol": row[1],
+            "note_date": row[2],
+            "content": row[3] or "",
+            "is_global": bool(row[4]),
+            "created_at": row[5],
+            "updated_at": row[6],
+        }
+    finally:
+        conn.close()
+
+
+def delete_symbol_note(note_id: int) -> bool:
+    conn = get_connection()
+    try:
+        res = conn.execute("DELETE FROM symbol_notes WHERE id = ?", (int(note_id),))
+        return bool(getattr(res, "rowcount", 0))
+    finally:
+        conn.close()
+
 def _normalize_template_name(conn, base_name: str) -> str:
     name = (base_name or "").strip() or "Untitled"
     existing = conn.execute(
@@ -1773,16 +2792,17 @@ def list_prompt_templates() -> list[dict]:
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT id, name, prompt, is_builtin, created_at, updated_at FROM prompt_templates ORDER BY id"
+            "SELECT id, name, prompt, params, is_builtin, created_at, updated_at FROM prompt_templates ORDER BY id"
         ).fetchall()
         return [
             {
                 "id": r[0],
                 "name": r[1],
                 "prompt": r[2],
-                "is_builtin": bool(r[3]),
-                "created_at": r[4],
-                "updated_at": r[5],
+                "params": _parse_json_field(r[3]),
+                "is_builtin": bool(r[4]),
+                "created_at": r[5],
+                "updated_at": r[6],
             }
             for r in rows
         ]
@@ -1793,12 +2813,12 @@ def get_prompt_template_by_name(name: str) -> dict | None:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT id, name, prompt, is_builtin FROM prompt_templates WHERE name = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            "SELECT id, name, prompt, params, is_builtin FROM prompt_templates WHERE name = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
             ((name or "").strip(),)
         ).fetchone()
         if not row:
             return None
-        return {"id": row[0], "name": row[1], "prompt": row[2], "is_builtin": bool(row[3])}
+        return {"id": row[0], "name": row[1], "prompt": row[2], "params": _parse_json_field(row[3]), "is_builtin": bool(row[4])}
     finally:
         conn.close()
 
@@ -1806,35 +2826,36 @@ def get_prompt_template_by_id(template_id: int) -> dict | None:
     conn = get_connection()
     try:
         row = conn.execute(
-            "SELECT id, name, prompt, is_builtin FROM prompt_templates WHERE id = ?",
+            "SELECT id, name, prompt, params, is_builtin FROM prompt_templates WHERE id = ?",
             (int(template_id),)
         ).fetchone()
         if not row:
             return None
-        return {"id": row[0], "name": row[1], "prompt": row[2], "is_builtin": bool(row[3])}
+        return {"id": row[0], "name": row[1], "prompt": row[2], "params": _parse_json_field(row[3]), "is_builtin": bool(row[4])}
     finally:
         conn.close()
 
-def create_prompt_template(name: str, prompt: str, is_builtin: bool = False) -> dict:
+def create_prompt_template(name: str, prompt: str, is_builtin: bool = False, params: dict | None = None) -> dict:
     conn = get_connection()
     try:
         text = (prompt or "").strip()
         if not text:
             raise ValueError("prompt required")
         title = _normalize_template_name(conn, name)
+        params_text = json.dumps(params or {}, ensure_ascii=False)
         res = conn.execute(
-            "INSERT INTO prompt_templates (name, prompt, is_builtin, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-            (title, text, bool(is_builtin))
+            "INSERT INTO prompt_templates (name, prompt, params, is_builtin, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (title, text, params_text, bool(is_builtin))
         )
         return {"id": int(res.lastrowid) if hasattr(res, "lastrowid") and res.lastrowid else None}
     finally:
         conn.close()
 
-def update_prompt_template(template_id: int, name: str | None = None, prompt: str | None = None) -> bool:
+def update_prompt_template(template_id: int, name: str | None = None, prompt: str | None = None, params: dict | None = None) -> bool:
     conn = get_connection()
     try:
         updates = []
-        params: list = []
+        values: list = []
         if name is not None:
             raw_name = (name or "").strip() or "Untitled"
             row = conn.execute(
@@ -1844,17 +2865,20 @@ def update_prompt_template(template_id: int, name: str | None = None, prompt: st
             if row and int(row[0]) != int(template_id):
                 raw_name = _normalize_template_name(conn, raw_name)
             updates.append("name = ?")
-            params.append(raw_name)
+            values.append(raw_name)
         if prompt is not None:
             updates.append("prompt = ?")
-            params.append((prompt or "").strip())
+            values.append((prompt or "").strip())
+        if params is not None:
+            updates.append("params = ?")
+            values.append(json.dumps(params or {}, ensure_ascii=False))
         if not updates:
             return True
         updates.append("updated_at = CURRENT_TIMESTAMP")
-        params.append(int(template_id))
+        values.append(int(template_id))
         conn.execute(
             f"UPDATE prompt_templates SET {', '.join(updates)} WHERE id = ?",
-            params
+            values
         )
         return True
     finally:
@@ -1892,14 +2916,14 @@ def get_symbol_prompt_template(symbol: str) -> dict | None:
     try:
         sym = (symbol or "").upper()
         row = conn.execute(
-            "SELECT t.id, t.name, t.prompt, t.is_builtin "
+            "SELECT t.id, t.name, t.prompt, t.params, t.is_builtin "
             "FROM symbol_prompt_settings s JOIN prompt_templates t ON s.template_id = t.id "
             "WHERE s.symbol = ? LIMIT 1",
             (sym,)
         ).fetchone()
         if not row:
             return None
-        return {"id": row[0], "name": row[1], "prompt": row[2], "is_builtin": bool(row[3])}
+        return {"id": row[0], "name": row[1], "prompt": row[2], "params": _parse_json_field(row[3]), "is_builtin": bool(row[4])}
     finally:
         conn.close()
 
@@ -1923,7 +2947,14 @@ def create_screening_run(model_id: str, universe: str, params: dict, total: int)
         conn.close()
 
 
-def update_screening_run(run_id: int, status: str = None, processed: int = None, total: int = None, finished: bool = False):
+def update_screening_run(
+    run_id: int,
+    status: str = None,
+    processed: int = None,
+    total: int = None,
+    finished: bool = False,
+    finished_status: str = None,
+):
     conn = get_connection()
     try:
         if status is not None:
@@ -1933,17 +2964,68 @@ def update_screening_run(run_id: int, status: str = None, processed: int = None,
         if total is not None:
             conn.execute("UPDATE screening_runs SET total = ? WHERE id = ?", (int(total), run_id))
         if finished:
-            conn.execute("UPDATE screening_runs SET finished_at = CURRENT_TIMESTAMP, status = ? WHERE id = ?", ("completed", run_id))
+            final_status = finished_status or status or "completed"
+            conn.execute("UPDATE screening_runs SET finished_at = CURRENT_TIMESTAMP, status = ? WHERE id = ?", (final_status, run_id))
     finally:
         conn.close()
 
 
-def add_screening_result(run_id: int, symbol: str, action: str, score: float, reason: str, raw_json: dict, model_id: str = ""):
+def add_screening_result(
+    run_id: int,
+    symbol: str,
+    action: str,
+    score: float,
+    reason: str,
+    raw_json: dict,
+    model_id: str = "",
+    rule_metrics: dict | None = None,
+    ai_metrics: dict | None = None,
+):
     conn = get_connection()
     try:
+        rule_metrics = rule_metrics or {}
+        ai_metrics = ai_metrics or {}
+        scores = rule_metrics.get("scores") or {}
+        risk_gates = rule_metrics.get("risk_gates")
+        if risk_gates is None:
+            risk_gates = scores.get("risk_gates")
+        risk_text = ""
+        if isinstance(risk_gates, (list, tuple)):
+            risk_text = json.dumps(list(risk_gates), ensure_ascii=False)
+        elif isinstance(risk_gates, str):
+            risk_text = risk_gates
         conn.execute(
-            "REPLACE INTO screening_results (run_id, symbol, action, score, reason, model_id, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (int(run_id), symbol, action, float(score or 0), reason or "", model_id or "", dumps_config(raw_json or {}, {}))
+            "REPLACE INTO screening_results (run_id, symbol, action, score, reason, model_id, raw_json, "
+            "rule_action, rule_stage, rule_rr, rule_rr_up, rule_rr_down, rule_rr_threshold, rule_confidence, "
+            "rule_trend_score, rule_structure_score, rule_volume_score, rule_rr_score, rule_total_score, rule_risk_gates, "
+            "ai_action, ai_reason, ai_risk, ai_model) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                int(run_id),
+                symbol,
+                action,
+                float(score or 0),
+                reason or "",
+                model_id or "",
+                dumps_config(raw_json or {}, {}),
+                rule_metrics.get("action") or "",
+                rule_metrics.get("stage") or "",
+                float(rule_metrics.get("rr") or 0) if rule_metrics.get("rr") is not None else None,
+                float(rule_metrics.get("rr_up") or 0) if rule_metrics.get("rr_up") is not None else None,
+                float(rule_metrics.get("rr_down") or 0) if rule_metrics.get("rr_down") is not None else None,
+                float(rule_metrics.get("rr_threshold") or 0) if rule_metrics.get("rr_threshold") is not None else None,
+                float(rule_metrics.get("confidence") or 0) if rule_metrics.get("confidence") is not None else None,
+                float(scores.get("trend_score") or 0) if scores.get("trend_score") is not None else None,
+                float(scores.get("structure_score") or 0) if scores.get("structure_score") is not None else None,
+                float(scores.get("volume_score") or 0) if scores.get("volume_score") is not None else None,
+                float(scores.get("rr_score") or 0) if scores.get("rr_score") is not None else None,
+                float(scores.get("total_score") or 0) if scores.get("total_score") is not None else None,
+                risk_text,
+                ai_metrics.get("action") or "",
+                ai_metrics.get("reason") or "",
+                ai_metrics.get("risk") or "",
+                ai_metrics.get("model") or "",
+            )
         )
     finally:
         conn.close()
@@ -2015,13 +3097,21 @@ def list_screening_results(run_id: int, action: str = None, limit: int = 200, of
     try:
         if action:
             rows = conn.execute(
-                "SELECT symbol, action, score, reason, model_id, raw_json FROM screening_results WHERE run_id = ? AND action = ? "
+                "SELECT symbol, action, score, reason, model_id, raw_json, "
+                "rule_action, rule_stage, rule_rr, rule_rr_up, rule_rr_down, rule_rr_threshold, rule_confidence, "
+                "rule_trend_score, rule_structure_score, rule_volume_score, rule_rr_score, rule_total_score, rule_risk_gates, "
+                "ai_action, ai_reason, ai_risk, ai_model "
+                "FROM screening_results WHERE run_id = ? AND action = ? "
                 "ORDER BY score DESC LIMIT ? OFFSET ?",
                 (int(run_id), action, int(limit), int(offset))
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT symbol, action, score, reason, model_id, raw_json FROM screening_results WHERE run_id = ? "
+                "SELECT symbol, action, score, reason, model_id, raw_json, "
+                "rule_action, rule_stage, rule_rr, rule_rr_up, rule_rr_down, rule_rr_threshold, rule_confidence, "
+                "rule_trend_score, rule_structure_score, rule_volume_score, rule_rr_score, rule_total_score, rule_risk_gates, "
+                "ai_action, ai_reason, ai_risk, ai_model "
+                "FROM screening_results WHERE run_id = ? "
                 "ORDER BY score DESC LIMIT ? OFFSET ?",
                 (int(run_id), int(limit), int(offset))
             ).fetchall()
@@ -2039,6 +3129,23 @@ def list_screening_results(run_id: int, action: str = None, limit: int = 200, of
                 "reason": row[3],
                 "model_id": row[4],
                 "raw": raw,
+                "rule_action": row[6],
+                "rule_stage": row[7],
+                "rule_rr": row[8],
+                "rule_rr_up": row[9],
+                "rule_rr_down": row[10],
+                "rule_rr_threshold": row[11],
+                "rule_confidence": row[12],
+                "rule_trend_score": row[13],
+                "rule_structure_score": row[14],
+                "rule_volume_score": row[15],
+                "rule_rr_score": row[16],
+                "rule_total_score": row[17],
+                "rule_risk_gates": row[18],
+                "ai_action": row[19],
+                "ai_reason": row[20],
+                "ai_risk": row[21],
+                "ai_model": row[22],
             })
         return results
     finally:
@@ -2086,6 +3193,97 @@ def get_screening_summary(run_id: int):
         conn.close()
 
 
+def get_screening_stats(run_id: int) -> dict:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT action, rule_action, rule_stage, rule_risk_gates, ai_action, score, rule_total_score "
+            "FROM screening_results WHERE run_id = ?",
+            (int(run_id),)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    action_counts: dict[str, int] = {}
+    rule_action_counts: dict[str, int] = {}
+    rule_stage_counts: dict[str, int] = {}
+    ai_action_counts: dict[str, int] = {}
+    risk_gate_counts: dict[str, int] = {}
+    score_vals: list[float] = []
+    rule_score_vals: list[float] = []
+
+    for row in rows or []:
+        action = row[0] or ""
+        rule_action = row[1] or ""
+        rule_stage = row[2] or ""
+        rule_risk_gates = row[3] or ""
+        ai_action = row[4] or ""
+        score = row[5]
+        rule_score = row[6]
+
+        if action:
+            action_counts[action] = action_counts.get(action, 0) + 1
+        if rule_action:
+            rule_action_counts[rule_action] = rule_action_counts.get(rule_action, 0) + 1
+        if rule_stage:
+            rule_stage_counts[rule_stage] = rule_stage_counts.get(rule_stage, 0) + 1
+        if ai_action:
+            ai_action_counts[ai_action] = ai_action_counts.get(ai_action, 0) + 1
+
+        gates = []
+        if isinstance(rule_risk_gates, str) and rule_risk_gates:
+            try:
+                gates = json.loads(rule_risk_gates)
+            except Exception:
+                gates = [rule_risk_gates]
+        if isinstance(gates, (list, tuple)):
+            for gate in gates:
+                if not gate:
+                    continue
+                risk_gate_counts[gate] = risk_gate_counts.get(gate, 0) + 1
+
+        if score is not None:
+            try:
+                score_vals.append(float(score))
+            except Exception:
+                pass
+        if rule_score is not None:
+            try:
+                rule_score_vals.append(float(rule_score))
+            except Exception:
+                pass
+
+    def _hist(values: list[float]) -> dict[str, int]:
+        buckets = {"<40": 0, "40-60": 0, "60-75": 0, ">=75": 0}
+        for v in values:
+            if v < 40:
+                buckets["<40"] += 1
+            elif v < 60:
+                buckets["40-60"] += 1
+            elif v < 75:
+                buckets["60-75"] += 1
+            else:
+                buckets[">=75"] += 1
+        return buckets
+
+    total = len(rows or [])
+    avg_score = sum(score_vals) / len(score_vals) if score_vals else 0.0
+    avg_rule_score = sum(rule_score_vals) / len(rule_score_vals) if rule_score_vals else 0.0
+
+    return {
+        "total": total,
+        "action_counts": action_counts,
+        "rule_action_counts": rule_action_counts,
+        "rule_stage_counts": rule_stage_counts,
+        "ai_action_counts": ai_action_counts,
+        "risk_gate_counts": risk_gate_counts,
+        "score_hist": _hist(score_vals),
+        "rule_score_hist": _hist(rule_score_vals),
+        "avg_score": round(avg_score, 2),
+        "avg_rule_score": round(avg_rule_score, 2),
+    }
+
+
 def get_latest_screening_run():
     conn = get_connection()
     try:
@@ -2105,6 +3303,323 @@ def delete_screening_run(run_id: int) -> bool:
         conn.execute("DELETE FROM screening_results WHERE run_id = ?", (int(run_id),))
         conn.execute("DELETE FROM screening_runs WHERE id = ?", (int(run_id),))
         return True
+    finally:
+        conn.close()
+
+
+def list_aitrader_rule_profiles():
+    conn = get_connection()
+    try:
+        ensure_aitrader_rule_profiles(conn)
+        rows = conn.execute(
+            "SELECT market, rr_buy_downtrend, rr_buy_uptrend, require_close_above_ma20_downtrend, "
+            "buy_position_downtrend, watch_position_downtrend, buy_position_uptrend, watch_position_uptrend, "
+            "watch_position_range, updated_at "
+            "FROM aitrader_rule_profiles ORDER BY market ASC"
+        ).fetchall()
+        return [
+            {
+                **_decode_rule_profile_row(row),
+                "updated_at": row[9],
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def get_aitrader_rule_profile(market: str = "ashare"):
+    conn = get_connection()
+    try:
+        ensure_aitrader_rule_profiles(conn)
+        market_norm = normalize_aitrader_rule_market(market)
+        row = conn.execute(
+            "SELECT market, rr_buy_downtrend, rr_buy_uptrend, require_close_above_ma20_downtrend, "
+            "buy_position_downtrend, watch_position_downtrend, buy_position_uptrend, watch_position_uptrend, "
+            "watch_position_range, updated_at "
+            "FROM aitrader_rule_profiles WHERE market = ? LIMIT 1",
+            (market_norm,),
+        ).fetchone()
+        if not row:
+            return {
+                **_build_default_rule_profile(market_norm),
+                "updated_at": None,
+            }
+        return {
+            **_decode_rule_profile_row(row),
+            "updated_at": row[9],
+        }
+    finally:
+        conn.close()
+
+
+def upsert_aitrader_rule_profile(market: str, patch: dict | None = None):
+    market_norm = normalize_aitrader_rule_market(market)
+    conn = get_connection()
+    try:
+        ensure_aitrader_rule_profiles(conn)
+        row = conn.execute(
+            "SELECT market, rr_buy_downtrend, rr_buy_uptrend, require_close_above_ma20_downtrend, "
+            "buy_position_downtrend, watch_position_downtrend, buy_position_uptrend, watch_position_uptrend, "
+            "watch_position_range, updated_at "
+            "FROM aitrader_rule_profiles WHERE market = ? LIMIT 1",
+            (market_norm,),
+        ).fetchone()
+        current = {
+            **_decode_rule_profile_row(row),
+            "updated_at": row[9],
+        } if row else {
+            **_build_default_rule_profile(market_norm),
+            "updated_at": None,
+        }
+        merged = dict(current)
+        merged.update(patch or {})
+        merged["market"] = market_norm
+        normalized = _normalize_rule_profile_row(merged)
+        conn.execute(
+            "INSERT OR REPLACE INTO aitrader_rule_profiles "
+            "(market, rr_buy_downtrend, rr_buy_uptrend, require_close_above_ma20_downtrend, "
+            "buy_position_downtrend, watch_position_downtrend, buy_position_uptrend, watch_position_uptrend, "
+            "watch_position_range, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (
+                market_norm,
+                normalized["rr_buy_downtrend"],
+                normalized["rr_buy_uptrend"],
+                int(bool(normalized["require_close_above_ma20_downtrend"])),
+                normalized["buy_position_downtrend"],
+                normalized["watch_position_downtrend"],
+                normalized["buy_position_uptrend"],
+                normalized["watch_position_uptrend"],
+                normalized["watch_position_range"],
+            ),
+        )
+        row = conn.execute(
+            "SELECT market, rr_buy_downtrend, rr_buy_uptrend, require_close_above_ma20_downtrend, "
+            "buy_position_downtrend, watch_position_downtrend, buy_position_uptrend, watch_position_uptrend, "
+            "watch_position_range, updated_at "
+            "FROM aitrader_rule_profiles WHERE market = ? LIMIT 1",
+            (market_norm,),
+        ).fetchone()
+        if not row:
+            return {
+                **normalized,
+                "updated_at": None,
+            }
+        return {
+            **_decode_rule_profile_row(row),
+            "updated_at": row[9],
+        }
+    finally:
+        conn.close()
+
+
+def _to_epoch_seconds(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            return dt.timestamp()
+        except Exception:
+            continue
+    return 0.0
+
+
+def get_signal_calibration(symbol: str, bucket: str, horizon_days: int = 5, max_age_hours: float = 24.0):
+    sym = (symbol or "").strip().upper()
+    key = (bucket or "").strip().lower()
+    if not sym or not key:
+        return None
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT symbol, market, bucket, horizon_days, sample_size, hit_rate, avg_return, mfe, mae, confidence, updated_at "
+            "FROM aitrader_signal_calibration WHERE symbol = ? AND bucket = ? AND horizon_days = ? LIMIT 1",
+            (sym, key, int(horizon_days or 5)),
+        ).fetchone()
+        if not row:
+            return None
+        updated_ts = _to_epoch_seconds(row[10])
+        if max_age_hours > 0 and updated_ts > 0:
+            age = time.time() - updated_ts
+            if age > max_age_hours * 3600.0:
+                return None
+        return {
+            "symbol": row[0],
+            "market": row[1],
+            "bucket": row[2],
+            "horizon_days": int(row[3] or 0),
+            "sample_size": int(row[4] or 0),
+            "hit_rate": float(row[5] or 0.0),
+            "avg_return": float(row[6] or 0.0),
+            "mfe": float(row[7] or 0.0),
+            "mae": float(row[8] or 0.0),
+            "confidence": float(row[9] or 0.0),
+            "updated_at": row[10],
+        }
+    finally:
+        conn.close()
+
+
+def upsert_signal_calibration(
+    symbol: str,
+    market: str,
+    bucket: str,
+    horizon_days: int,
+    sample_size: int,
+    hit_rate: float,
+    avg_return: float,
+    mfe: float,
+    mae: float,
+    confidence: float,
+):
+    sym = (symbol or "").strip().upper()
+    mkt = (market or "").strip().lower()
+    key = (bucket or "").strip().lower()
+    if not sym or not key:
+        return False
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO aitrader_signal_calibration "
+            "(symbol, market, bucket, horizon_days, sample_size, hit_rate, avg_return, mfe, mae, confidence, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (
+                sym,
+                mkt,
+                key,
+                int(horizon_days or 5),
+                int(sample_size or 0),
+                float(hit_rate or 0.0),
+                float(avg_return or 0.0),
+                float(mfe or 0.0),
+                float(mae or 0.0),
+                float(confidence or 0.0),
+            ),
+        )
+        return True
+    finally:
+        conn.close()
+
+
+def add_aitrader_analysis_history(
+    symbol: str,
+    engine: str,
+    model_id: str,
+    bars: int,
+    start_date: str,
+    end_date: str,
+    source: str,
+    analysis: str,
+    analysis_meta: dict | None = None,
+    snapshot: dict | None = None
+) -> int:
+    conn = get_connection()
+    try:
+        sym = (symbol or "").upper().strip()
+        eng = (engine or "").strip().lower()
+        model = (model_id or "").strip()
+        res = conn.execute(
+            "INSERT INTO aitrader_analysis_history "
+            "(symbol, engine, model_id, bars, start_date, end_date, source, analysis, analysis_meta_json, snapshot_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sym,
+                eng,
+                model,
+                int(bars or 0),
+                _normalize_ymd(start_date),
+                _normalize_ymd(end_date),
+                (source or "").strip(),
+                analysis or "",
+                dumps_config(analysis_meta or {}, {}),
+                dumps_config(snapshot or {}, {}),
+            )
+        )
+        return int(res.lastrowid) if hasattr(res, "lastrowid") and res.lastrowid else 0
+    finally:
+        conn.close()
+
+
+def list_aitrader_analysis_history(symbol: str = "", limit: int = 50):
+    conn = get_connection()
+    try:
+        lim = max(1, min(int(limit or 50), 500))
+        sym = (symbol or "").upper().strip()
+        if sym:
+            rows = conn.execute(
+                "SELECT id, symbol, engine, model_id, bars, start_date, end_date, source, analysis, created_at "
+                "FROM aitrader_analysis_history WHERE symbol = ? ORDER BY id DESC LIMIT ?",
+                (sym, lim)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, symbol, engine, model_id, bars, start_date, end_date, source, analysis, created_at "
+                "FROM aitrader_analysis_history ORDER BY id DESC LIMIT ?",
+                (lim,)
+            ).fetchall()
+        result = []
+        for row in rows:
+            analysis_text = row[8] or ""
+            preview = analysis_text[:240]
+            if len(analysis_text) > 240:
+                preview += "..."
+            result.append({
+                "id": int(row[0]),
+                "symbol": row[1],
+                "engine": row[2],
+                "model_id": row[3],
+                "bars": int(row[4] or 0),
+                "start_date": row[5],
+                "end_date": row[6],
+                "source": row[7] or "",
+                "analysis_preview": preview,
+                "created_at": row[9],
+            })
+        return result
+    finally:
+        conn.close()
+
+
+def get_aitrader_analysis_history(record_id: int):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT id, symbol, engine, model_id, bars, start_date, end_date, source, analysis, analysis_meta_json, snapshot_json, created_at "
+            "FROM aitrader_analysis_history WHERE id = ?",
+            (int(record_id),)
+        ).fetchone()
+        if not row:
+            return None
+        analysis_meta = {}
+        snapshot = {}
+        try:
+            analysis_meta = json.loads(row[9]) if row[9] else {}
+        except Exception:
+            analysis_meta = {}
+        try:
+            snapshot = json.loads(row[10]) if row[10] else {}
+        except Exception:
+            snapshot = {}
+        return {
+            "id": int(row[0]),
+            "symbol": row[1],
+            "engine": row[2],
+            "model_id": row[3],
+            "bars": int(row[4] or 0),
+            "start_date": row[5],
+            "end_date": row[6],
+            "source": row[7] or "",
+            "analysis": row[8] or "",
+            "analysis_meta": analysis_meta,
+            "snapshot": snapshot,
+            "created_at": row[11],
+        }
     finally:
         conn.close()
 

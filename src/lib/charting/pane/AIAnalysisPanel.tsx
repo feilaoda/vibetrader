@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from 'react-aria-components';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -45,6 +45,8 @@ interface IndustryProfile {
     updated_at?: string | null;
     enabled?: boolean;
     enabled_at?: string | null;
+    market_broad_index?: string | null;
+    market_style_index?: string | null;
     profile?: string;
     profile_name?: string | null;
     profile_override?: string | null;
@@ -93,6 +95,40 @@ type ContextSettings = {
     klineRowsAssistant: number;
 };
 
+const toYmd = (value?: string) => (value || "").replace(/-/g, "");
+
+const inferKlineDate = (kline: any): string => {
+    const date = kline?.date || kline?.time || kline?.closeTime || kline?.timestamp;
+    if (!date) return "";
+    if (typeof date === "string") {
+        if (/^\d{8}$/.test(date)) return date;
+        if (/^\d{4}-\d{2}-\d{2}/.test(date)) return date.slice(0, 10).replace(/-/g, "");
+        return "";
+    }
+    const ts = Number(date);
+    if (!Number.isFinite(ts)) return "";
+    const ms = ts < 1e12 ? ts * 1000 : ts;
+    const d = new Date(ms);
+    if (Number.isNaN(d.getTime())) return "";
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${y}${m}${dd}`;
+};
+
+const filterKlinesByEndDate = (klines: any[], endDateYmd: string) => {
+    if (!endDateYmd) return klines;
+    return (klines || []).filter(k => {
+        const ymd = inferKlineDate(k);
+        return !ymd || ymd <= endDateYmd;
+    });
+};
+
+const ymdToInput = (ymd: string) => {
+    if (!ymd || ymd.length !== 8) return "";
+    return `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
+};
+
 const SETTINGS_KEY = "vibetrader.ai.context.settings";
 const DEFAULT_SETTINGS: ContextSettings = {
     enableMemory: true,
@@ -130,12 +166,158 @@ const DEFAULT_PUSH_SETTINGS: PushSettings = {
     token: ""
 };
 
+const MARKET_BROAD_INDEX_OPTIONS = [
+    { value: "000985.SH", label: "中证全指 (000985.SH)" },
+    { value: "000300.SH", label: "沪深300 (000300.SH)" },
+    { value: "000688.SH", label: "科创50 (000688.SH)" },
+    { value: "399006.SZ", label: "创业板指 (399006.SZ)" },
+];
+
+const MARKET_STYLE_INDEX_OPTIONS = [
+    { value: "", label: "自动(跟模板)" },
+    { value: "000300.SH", label: "蓝筹: 沪深300 (000300.SH)" },
+    { value: "000852.SH", label: "中小盘: 中证1000 (000852.SH)" },
+    { value: "399006.SZ", label: "成长: 创业板指 (399006.SZ)" },
+    { value: "000688.SH", label: "成长: 科创50 (000688.SH)" },
+];
+
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
+
+type MessageBubbleProps = {
+    msg: ChatMessage;
+    isStreaming: boolean;
+    modelLabel: string;
+    isExtracting: boolean;
+    onCreateAction: (content: string) => void;
+    onToggleFavorite: (msg: ChatMessage) => void;
+    onCopy: (text: string) => void;
+};
+
+const MessageBubble = memo((props: MessageBubbleProps) => {
+    const {
+        msg,
+        isStreaming,
+        modelLabel,
+        isExtracting,
+        onCreateAction,
+        onToggleFavorite,
+        onCopy
+    } = props;
+    const displayContent = useMemo(() => {
+        if (msg.role === 'assistant' && msg.model) {
+            return `${msg.content}\n\n(${modelLabel || msg.model})`;
+        }
+        return msg.content;
+    }, [msg.content, msg.model, msg.role, modelLabel]);
+
+    return (
+        <div style={{
+            marginBottom: '16px',
+            display: 'flex',
+            justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start'
+        }}>
+            <div style={{
+                maxWidth: '90%',
+                backgroundColor: msg.role === 'user' ? '#007acc' : '#fff',
+                color: msg.role === 'user' ? '#fff' : '#333',
+                borderRadius: '8px',
+                padding: '12px',
+                boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
+                fontSize: '13px',
+                lineHeight: '1.5',
+                position: 'relative'
+            }} className="message-bubble">
+                {msg.role === 'assistant' && (
+                    <div style={{
+                        borderBottom: '1px solid #eee',
+                        marginBottom: '8px',
+                        paddingBottom: '4px',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        fontSize: '11px',
+                        color: '#888'
+                    }}>
+                        <span style={{ fontWeight: 'bold' }}>VibeTrader AI</span>
+                    </div>
+                )}
+
+                <div className="markdown-body" style={{ textAlign: 'left', wordBreak: 'break-word' }}>
+                    {msg.role === 'assistant' ? (
+                        isStreaming ? (
+                            <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>{displayContent}</pre>
+                        ) : (
+                            <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS}>{displayContent}</ReactMarkdown>
+                        )
+                    ) : (
+                        <pre
+                            style={{
+                                margin: 0,
+                                whiteSpace: 'pre-wrap',
+                                fontFamily: 'inherit',
+                                color: 'inherit',
+                                background: 'transparent',
+                                padding: 0
+                            }}
+                        >
+                            {displayContent}
+                        </pre>
+                    )}
+                </div>
+
+                {msg.role === 'assistant' && (
+                    <div style={{
+                        display: 'flex',
+                        justifyContent: 'flex-end',
+                        gap: '8px',
+                        marginTop: '8px',
+                        paddingTop: '6px',
+                        borderTop: '1px dashed #eee'
+                    }}>
+                        <div title="Create Action Plan">
+                            <Button onPress={() => onCreateAction(msg.content)} isDisabled={isExtracting} style={{ cursor: isExtracting ? 'wait' : 'pointer', border: 'none', background: 'transparent', color: '#666', padding: 4 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px' }}>
+                                    <Send /> <span>{isExtracting ? 'Extracting...' : 'Action'}</span>
+                                </div>
+                            </Button>
+                        </div>
+                        <div title="Favorite">
+                            <Button onPress={() => onToggleFavorite(msg)} style={{ cursor: 'pointer', border: 'none', background: 'transparent', color: msg.is_favorite ? '#f1c40f' : '#ccc', padding: 4 }}>
+                                {msg.is_favorite ? <StarFilled /> : <Star />}
+                            </Button>
+                        </div>
+                        <div title="Copy">
+                            <Button onPress={() => onCopy(displayContent)} style={{ cursor: 'pointer', border: 'none', background: 'transparent', color: '#ccc', padding: 4 }}>
+                                <Copy />
+                            </Button>
+                        </div>
+                    </div>
+                )}
+
+                {msg.role === 'user' && (
+                    <div style={{ fontSize: '10px', marginTop: '4px', opacity: 0.7, textAlign: 'right' }}>
+                        {new Date(msg.timestamp * 1000).toLocaleTimeString()}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}, (prev, next) => {
+    return (
+        prev.msg === next.msg &&
+        prev.isStreaming === next.isStreaming &&
+        prev.modelLabel === next.modelLabel &&
+        prev.isExtracting === next.isExtracting
+    );
+});
+
 export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const [config, setConfig] = useState<LLMConfig | null>(null);
     const [selectedModel, setSelectedModel] = useState<string>("");
 
     const [messages, setMessages] = useState<ChatMessage[]>([]);
-    const [analysisMode, setAnalysisMode] = useState<'chat' | 'assistant' | 'temporary'>('chat');
+    const [analysisMode, setAnalysisMode] = useState<'chat' | 'assistant' | 'temporary' | 'regression'>('chat');
+    const [regressionDate, setRegressionDate] = useState<string>("");
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [settingsTab, setSettingsTab] = useState<'params' | 'prompt' | 'industry' | 'push'>('params');
     const [contextSettings, setContextSettings] = useState<ContextSettings>(DEFAULT_SETTINGS);
@@ -144,11 +326,13 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const resolveModelLabel = (modelId?: string) => {
         if (!modelId) return "";
         const lower = modelId.toLowerCase();
+        if (lower.includes("gpt") || lower.includes("codex") || lower.startsWith("o1") || lower.startsWith("o3") || lower.startsWith("o4")) return "OpenAI";
         if (lower.includes("gemini")) return "Gemini";
         if (lower.includes("deepseek")) return "DeepSeek";
         if (lower.includes("claude")) return "Claude";
         const found = config?.models?.find(m => m.id === modelId);
         const name = found?.name || "";
+        if (name.includes("OpenAI") || name.includes("Codex")) return "OpenAI";
         if (name.includes("Gemini")) return "Gemini";
         if (name.includes("DeepSeek")) return "DeepSeek";
         if (name.includes("Claude")) return "Claude";
@@ -190,6 +374,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const [industryDraft, setIndustryDraft] = useState("");
     const [profileDraft, setProfileDraft] = useState("");
     const [industryEnabled, setIndustryEnabled] = useState(false);
+    const [marketBroadIndexDraft, setMarketBroadIndexDraft] = useState("000985.SH");
+    const [marketStyleIndexDraft, setMarketStyleIndexDraft] = useState("");
     const [templates, setTemplates] = useState<IndustryTemplate[]>([]);
     const [templatesLoading, setTemplatesLoading] = useState(false);
     const [templatesError, setTemplatesError] = useState("");
@@ -215,7 +401,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const buildRealtimeSummary = (rt: any, note?: string) => {
         const ts = rt?.timestamp ? new Date(rt.timestamp).toLocaleString() : new Date().toLocaleString();
         const volumeText = formatVolume(rt?.volume, rt?.source);
-        const suffix = note ? `（${note}）` : "";
+        const resolvedNote = note || rt?.note;
+        const suffix = resolvedNote ? `（${resolvedNote}）` : "";
         return `当前行情(${ts}): 最新价 ${rt?.price ?? 'N/A'}，今开 ${rt?.open ?? 'N/A'}，最高 ${rt?.high ?? 'N/A'}，最低 ${rt?.low ?? 'N/A'}，成交量 ${volumeText}。${suffix}`;
     };
 
@@ -282,13 +469,10 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
     const buildIndustryContext = (profile: IndustryProfile | null) => {
         if (!profile?.enabled) return "";
+        if (!profile.industry) return "";
         const parts: string[] = [];
         if (profile.industry) parts.push(`行业: ${profile.industry}`);
-        const templateName = profile.profile_name || profile.profile;
-        if (templateName) parts.push(`模板: ${templateName}`);
-        if (profile.profile_override) parts.push(`模板覆盖: ${profile.profile_override}`);
         if (profile.source) parts.push(`行业来源: ${profile.source}`);
-        if (profile.reason) parts.push(`推荐理由: ${profile.reason}`);
         if (parts.length === 0) return "";
         return parts.join("；");
     };
@@ -344,12 +528,24 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     // Load history unless in temporary mode
     useEffect(() => {
         if (!props.isOpen) return;
-        if (analysisMode === 'temporary') {
+        if (analysisMode === 'temporary' || analysisMode === 'regression') {
             setMessages([]);
             return;
         }
+        setMessages([]);
         loadHistory();
     }, [analysisMode, props.isOpen, props.symbol]);
+
+    useEffect(() => {
+        if (analysisMode !== 'regression') return;
+        if (regressionDate) return;
+        const last = props.klines && props.klines.length
+            ? inferKlineDate(props.klines[props.klines.length - 1])
+            : "";
+        if (last) {
+            setRegressionDate(ymdToInput(last));
+        }
+    }, [analysisMode, regressionDate, props.klines]);
 
     useEffect(() => {
         try {
@@ -463,6 +659,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             setIndustryDraft(industryProfile?.industry || "");
             setProfileDraft(industryProfile?.profile_override || "");
             setIndustryEnabled(!!industryProfile?.enabled);
+            setMarketBroadIndexDraft(industryProfile?.market_broad_index || "000985.SH");
+            setMarketStyleIndexDraft(industryProfile?.market_style_index || "");
             loadPushSettings();
             loadPushSymbol(props.symbol);
         }
@@ -473,6 +671,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         setIndustryDraft(industryProfile?.industry || "");
         setProfileDraft(industryProfile?.profile_override || "");
         setIndustryEnabled(!!industryProfile?.enabled);
+        setMarketBroadIndexDraft(industryProfile?.market_broad_index || "000985.SH");
+        setMarketStyleIndexDraft(industryProfile?.market_style_index || "");
         loadPushSymbol(props.symbol);
     }, [industryProfile, settingsOpen]);
 
@@ -497,7 +697,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     };
 
     const loadHistory = () => {
-        if (analysisMode === 'temporary') {
+        if (analysisMode === 'temporary' || analysisMode === 'regression') {
             setMessages([]);
             return;
         }
@@ -686,12 +886,35 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             await fetch(`${API_BASE_URL}/api/industry/settings/${encodeURIComponent(props.symbol)}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ enabled })
+                body: JSON.stringify({
+                    enabled,
+                    market_broad_index: marketBroadIndexDraft || null,
+                    market_style_index: marketStyleIndexDraft || null
+                })
             });
             loadIndustryProfile();
         } catch (err) {
             console.error(err);
             setIndustryError("行业开关保存失败");
+        }
+    };
+
+    const handleSaveMarketIndexes = async () => {
+        if (!props.symbol) return;
+        try {
+            await fetch(`${API_BASE_URL}/api/industry/settings/${encodeURIComponent(props.symbol)}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    enabled: industryEnabled,
+                    market_broad_index: marketBroadIndexDraft || null,
+                    market_style_index: marketStyleIndexDraft || null
+                })
+            });
+            loadIndustryProfile();
+        } catch (err) {
+            console.error(err);
+            setIndustryError("大盘参数保存失败");
         }
     };
 
@@ -733,14 +956,15 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         userInput: string;
         displayUserContent?: string;
         runMode: "manual" | "auto";
-        analysisMode: "chat" | "assistant" | "temporary";
+        analysisMode: "chat" | "assistant" | "temporary" | "regression";
         contextSettings: ContextSettings;
         transientContext?: string;
         disableHistory?: boolean;
         disableIndicatorContext?: boolean;
         pushSummary?: string;
+        regressionDate?: string;
     }) => {
-        const { symbol, klines, userInput, displayUserContent, runMode, analysisMode, contextSettings, transientContext, disableHistory, disableIndicatorContext, pushSummary } = params;
+        const { symbol, klines, userInput, displayUserContent, runMode, analysisMode, contextSettings, transientContext, disableHistory, disableIndicatorContext, pushSummary, regressionDate } = params;
         if (!config?.configured) return;
         if (!symbol || klines.length === 0) {
             const msg = !symbol ? "No symbol selected" : "No kline data available";
@@ -803,6 +1027,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                     user_input: userInput,
                     transient_context: transientContext,
                     mode: analysisMode,
+                    regression_date: regressionDate || null,
                     context_config: {
                         enable_memory: contextSettings.enableMemory,
                         memory_include_assistant: contextSettings.memoryIncludeAssistant,
@@ -855,7 +1080,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                     if (msg.id !== id) return msg;
                     return { ...msg, content };
                 }));
-            }, 120);
+            }, 250);
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -870,6 +1095,13 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                         return { ...msg, content: aiContent };
                     }));
                 }
+            }
+            if (tempAiMsgId) {
+                const finalContent = streamingBufferRef.current || aiContent;
+                setMessages(prev => prev.map(msg => {
+                    if (msg.id !== tempAiMsgId) return msg;
+                    return { ...msg, content: finalContent };
+                }));
             }
 
         } catch (e) {
@@ -948,19 +1180,35 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
         const userInput = input.trim();
         setInput("");
+        const regressionYmd = analysisMode === 'regression' ? toYmd(regressionDate) : "";
+        if (analysisMode === 'regression' && !regressionYmd) {
+            setMessages(prev => [...prev, {
+                id: Date.now(),
+                role: 'assistant',
+                content: '请先选择回归日期。',
+                timestamp: Date.now() / 1000,
+                is_favorite: false
+            }]);
+            return;
+        }
 
         let klinesToUse = props.klines;
         let realtimeSummary = '';
-        const wantDaily = contextSettings.chatUseDaily && (analysisMode === 'assistant' || analysisMode === 'chat' || analysisMode === 'temporary');
+        const wantDaily = analysisMode === 'regression'
+            || (contextSettings.chatUseDaily && (analysisMode === 'assistant' || analysisMode === 'chat' || analysisMode === 'temporary'));
         if (wantDaily) {
             try {
                 const limit = analysisMode === 'assistant'
                     ? contextSettings.klineRowsAssistant
                     : contextSettings.klineRowsChat;
-                const dailyRes = await fetch(`${API_BASE_URL}/api/klines/${encodeURIComponent(props.symbol)}?period=1d&limit=${limit}`);
+                const endParam = regressionYmd ? `&end_date=${regressionYmd}` : "";
+                const dailyRes = await fetch(`${API_BASE_URL}/api/klines/${encodeURIComponent(props.symbol)}?period=1d&limit=${limit}${endParam}`);
                 if (dailyRes.ok) {
                     const dailyJson = await dailyRes.json();
-                    const dailyKlines = Array.isArray(dailyJson?.data) ? dailyJson.data : [];
+                    let dailyKlines = Array.isArray(dailyJson?.data) ? dailyJson.data : [];
+                    if (regressionYmd) {
+                        dailyKlines = filterKlinesByEndDate(dailyKlines, regressionYmd);
+                    }
                     if (dailyKlines.length > 0) {
                         klinesToUse = dailyKlines;
                     }
@@ -969,13 +1217,20 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 // fallback to current klines
             }
         }
+        if (regressionYmd) {
+            klinesToUse = filterKlinesByEndDate(klinesToUse as any[], regressionYmd);
+        }
         if (analysisMode === 'chat' || analysisMode === 'temporary') {
             try {
                 const realtimeRes = await fetch(`${API_BASE_URL}/api/realtime/${encodeURIComponent(props.symbol)}`);
                 if (realtimeRes.ok) {
                     const rt = await realtimeRes.json();
-                    if (rt && rt?.price !== undefined && !rt?.stale) {
-                        realtimeSummary = buildRealtimeSummary(rt);
+                    if (rt && rt?.price !== undefined) {
+                        if (rt?.stale && !rt?.note) {
+                            realtimeSummary = '当前行情获取失败或非当日数据。';
+                        } else {
+                            realtimeSummary = buildRealtimeSummary(rt);
+                        }
                     } else {
                         realtimeSummary = '当前行情获取失败或非当日数据。';
                     }
@@ -987,8 +1242,9 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             }
         }
 
-        const industryContext = buildIndustryTransient(industryProfile);
-        const indicatorContext = industryProfile?.enabled
+        const useIndustryContext = analysisMode !== 'regression';
+        const industryContext = useIndustryContext ? buildIndustryTransient(industryProfile) : "";
+        const indicatorContext = useIndustryContext && industryProfile?.enabled
             ? await fetchIndustryIndicatorContext()
             : "";
         const transientParts = [industryContext, indicatorContext].filter(Boolean);
@@ -996,14 +1252,14 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         const baseUserInput = realtimeSummary ? `${userInput}\n\n${realtimeSummary}` : userInput;
 
         const displayParts = [baseUserInput];
-        if (contextSettings.showIndustryInChat) {
+        if (useIndustryContext && contextSettings.showIndustryInChat) {
             if (indicatorContext) displayParts.push(indicatorContext);
         }
         const displayUserContent = displayParts.join("\n\n");
 
-        const useTempMode = analysisMode === 'temporary';
-        const forceNoHistory = contextSettings.contextOnlyCurrent;
-        const effectiveSaveHistory = useTempMode ? contextSettings.saveHistory : true;
+        const useTempMode = analysisMode === 'temporary' || analysisMode === 'regression';
+        const forceNoHistory = contextSettings.contextOnlyCurrent || analysisMode === 'regression' || !contextSettings.enableMemory;
+        const effectiveSaveHistory = analysisMode === 'temporary' ? contextSettings.saveHistory : !useTempMode;
         const effectiveContextSettings = useTempMode
             ? {
                 ...contextSettings,
@@ -1026,8 +1282,9 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 analysisMode,
                 contextSettings: effectiveContextSettings,
                 transientContext,
-                disableIndicatorContext: !!indicatorContext,
-                disableHistory: useTempMode || forceNoHistory
+                disableIndicatorContext: analysisMode === 'regression' || !!indicatorContext,
+                disableHistory: useTempMode || forceNoHistory,
+                regressionDate: regressionYmd || undefined
             });
         } finally {
             // no-op
@@ -1357,15 +1614,15 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         }
     };
 
-    const toggleFavorite = async (msg: ChatMessage) => {
+    const toggleFavorite = useCallback(async (msg: ChatMessage) => {
         // Optimistic
         setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, is_favorite: !m.is_favorite } : m));
         await fetch(`${API_BASE_URL}/api/history/${msg.id}/favorite`, { method: 'POST' });
-    };
+    }, []);
 
-    const copyToClipboard = (text: string) => {
+    const copyToClipboard = useCallback((text: string) => {
         navigator.clipboard.writeText(text);
-    };
+    }, []);
 
     if (!props.isOpen) return null;
 
@@ -1443,96 +1700,18 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                     </div>
                 )}
 
-                {messages.map((msg) => {
-                    const modelLabel = msg.role === 'assistant' && msg.model
-                        ? resolveModelLabel(msg.model)
-                        : "";
-                    const displayContent = (msg.role === 'assistant' && msg.model)
-                        ? `${msg.content}\n\n(${modelLabel || msg.model})`
-                        : msg.content;
-                    return (
-                    <div key={msg.id} style={{
-                        marginBottom: '16px',
-                        display: 'flex',
-                        justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start'
-                    }}>
-                        <div style={{
-                            maxWidth: '90%',
-                            backgroundColor: msg.role === 'user' ? '#007acc' : '#fff',
-                            color: msg.role === 'user' ? '#fff' : '#333',
-                            borderRadius: '8px',
-                            padding: '12px',
-                            boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
-                            fontSize: '13px',
-                            lineHeight: '1.5',
-                            position: 'relative'
-                        }} className="message-bubble">
-
-                            {/* Message Header (Role) */}
-                            {msg.role === 'assistant' && (
-                                <div style={{
-                                    borderBottom: '1px solid #eee',
-                                    marginBottom: '8px',
-                                    paddingBottom: '4px',
-                                    display: 'flex',
-                                    justifyContent: 'space-between',
-                                    alignItems: 'center',
-                                    fontSize: '11px',
-                                    color: '#888'
-                                }}>
-                                    <span style={{ fontWeight: 'bold' }}>VibeTrader AI</span>
-                                </div>
-                            )}
-
-                            {/* Content */}
-                            <div className="markdown-body" style={{ textAlign: 'left', wordBreak: 'break-word' }}>
-                                {msg.role === 'assistant' && msg.id === streamingMessageId ? (
-                                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>{displayContent}</pre>
-                                ) : (
-                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayContent}</ReactMarkdown>
-                                )}
-                            </div>
-
-                            {/* Message Actions (Footer) */}
-                            {msg.role === 'assistant' && (
-                                <div style={{
-                                    display: 'flex',
-                                    justifyContent: 'flex-end',
-                                    gap: '8px',
-                                    marginTop: '8px',
-                                    paddingTop: '6px',
-                                    borderTop: '1px dashed #eee'
-                                }}>
-                                    <div title="Create Action Plan">
-                                        <Button onPress={() => handleCreateAction(msg.content)} isDisabled={isExtracting} style={{ cursor: isExtracting ? 'wait' : 'pointer', border: 'none', background: 'transparent', color: '#666', padding: 4 }}>
-                                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px' }}>
-                                                <Send /> <span>{isExtracting ? 'Extracting...' : 'Action'}</span>
-                                            </div>
-                                        </Button>
-                                    </div>
-                                    <div title="Favorite">
-                                        <Button onPress={() => toggleFavorite(msg)} style={{ cursor: 'pointer', border: 'none', background: 'transparent', color: msg.is_favorite ? '#f1c40f' : '#ccc', padding: 4 }}>
-                                            {msg.is_favorite ? <StarFilled /> : <Star />}
-                                        </Button>
-                                    </div>
-                                    <div title="Copy">
-                                        <Button onPress={() => copyToClipboard(displayContent)} style={{ cursor: 'pointer', border: 'none', background: 'transparent', color: '#ccc', padding: 4 }}>
-                                            <Copy />
-                                        </Button>
-                                    </div>
-                                </div>
-                            )}
-
-                            {/* User Timestamp */}
-                            {msg.role === 'user' && (
-                                <div style={{ fontSize: '10px', marginTop: '4px', opacity: 0.7, textAlign: 'right' }}>
-                                    {new Date(msg.timestamp * 1000).toLocaleTimeString()}
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                );
-                })}
+                {messages.map((msg) => (
+                    <MessageBubble
+                        key={msg.id}
+                        msg={msg}
+                        modelLabel={msg.role === 'assistant' && msg.model ? resolveModelLabel(msg.model) : ""}
+                        isStreaming={msg.role === 'assistant' && msg.id === streamingMessageId}
+                        isExtracting={isExtracting}
+                        onCreateAction={handleCreateAction}
+                        onToggleFavorite={toggleFavorite}
+                        onCopy={copyToClipboard}
+                    />
+                ))}
 
                 {isLoading && (
                     <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: '16px' }}>
@@ -1590,7 +1769,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
 
                             <select
                                 value={analysisMode}
-                                onChange={(e) => setAnalysisMode(e.target.value as 'chat' | 'assistant' | 'temporary')}
+                                onChange={(e) => setAnalysisMode(e.target.value as 'chat' | 'assistant' | 'temporary' | 'regression')}
                                 style={{
                                     padding: '4px 8px',
                                     borderRadius: '2px',
@@ -1603,7 +1782,26 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                 <option value="chat">对话</option>
                                 <option value="assistant">助手</option>
                                 <option value="temporary">临时</option>
+                                <option value="regression">回归</option>
                             </select>
+
+                            {analysisMode === 'regression' && (
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: '#555' }}>
+                                    日期
+                                    <input
+                                        type="date"
+                                        value={regressionDate}
+                                        onChange={(e) => setRegressionDate(e.target.value)}
+                                        style={{
+                                            padding: '2px 6px',
+                                            borderRadius: '2px',
+                                            border: '1px solid #ddd',
+                                            fontSize: '11px',
+                                            backgroundColor: '#fff'
+                                        }}
+                                    />
+                                </label>
+                            )}
 
                             {!config?.configured && (
                                 <span style={{ color: 'red', fontSize: '10px' }}>API Key Missing</span>
@@ -1773,7 +1971,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                             type="checkbox"
                                             checked={contextSettings.enableMemory}
                                             onChange={(e) => persistSettings({ ...contextSettings, enableMemory: e.target.checked })}
-                                        /> 启用记忆摘要
+                                        /> 启用记忆摘要（关闭将不携带历史）
                                     </label>
                                     <label style={{ fontSize: '12px' }}>
                                         <input
@@ -1982,6 +2180,39 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                         disabled={!industryEnabled}
                                     /> 对话区显示行业信息（仅展示，不写入记忆）
                                 </label>
+                                <label style={{ fontSize: '12px' }}>
+                                    全市场指数（1+1模式）
+                                    <select
+                                        value={marketBroadIndexDraft}
+                                        onChange={(e) => setMarketBroadIndexDraft(e.target.value)}
+                                        style={inputStyle}
+                                        disabled={!industryEnabled}
+                                    >
+                                        {MARKET_BROAD_INDEX_OPTIONS.map(item => (
+                                            <option key={item.value} value={item.value}>{item.label}</option>
+                                        ))}
+                                    </select>
+                                </label>
+                                <label style={{ fontSize: '12px' }}>
+                                    风格指数（蓝筹/中小盘/成长）
+                                    <select
+                                        value={marketStyleIndexDraft}
+                                        onChange={(e) => setMarketStyleIndexDraft(e.target.value)}
+                                        style={inputStyle}
+                                        disabled={!industryEnabled}
+                                    >
+                                        {MARKET_STYLE_INDEX_OPTIONS.map(item => (
+                                            <option key={item.value || "auto"} value={item.value}>{item.label}</option>
+                                        ))}
+                                    </select>
+                                </label>
+                                <Button
+                                    onPress={handleSaveMarketIndexes}
+                                    style={{ background: '#f3f3f3', border: '1px solid #ddd', padding: '6px 10px', borderRadius: '4px', alignSelf: 'flex-start' }}
+                                    isDisabled={!industryEnabled}
+                                >
+                                    保存大盘参数
+                                </Button>
                                 <label style={{ fontSize: '12px' }}>
                                     行业
                                     <input

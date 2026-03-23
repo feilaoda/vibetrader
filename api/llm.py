@@ -1,9 +1,12 @@
 import os
 import re
+import json
+from datetime import time as dtime
 from typing import List, Dict, Optional
 from openai import OpenAI
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MEMORY_PAIRS_LIMIT, PROVIDERS, AVAILABLE_MODELS
 from prompts import DEFAULT_SYSTEM_PROMPT_NAME, SYSTEM_PROMPT_TEMPLATES
+from trading_time import now_cn, is_trading_day
 
 class LLMService:
     def __init__(self):
@@ -79,15 +82,210 @@ class LLMService:
             return SYSTEM_PROMPT_TEMPLATES[0][1]
         return ""
 
-    def build_system_prompt(self, symbol: str, custom_prompt: Optional[str] = None) -> str:
+    def _format_now_time(self, override: Optional[str] = None) -> str:
+        now = now_cn()
+        if override:
+            text = override.strip()
+            try:
+                import datetime
+                tz = now.tzinfo
+                if re.match(r"^\d{8}$", text):
+                    base = datetime.datetime.strptime(text, "%Y%m%d")
+                    now = base.replace(hour=15, minute=0, second=0, tzinfo=tz)
+                elif re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+                    base = datetime.datetime.strptime(text, "%Y-%m-%d")
+                    now = base.replace(hour=15, minute=0, second=0, tzinfo=tz)
+                elif re.match(r"^\d{4}-\d{2}-\d{2}\\s+\\d{2}:\\d{2}:\\d{2}$", text):
+                    base = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+                    now = base.replace(tzinfo=tz)
+            except Exception:
+                now = now_cn()
+        phase = "盘后"
+        if is_trading_day(now):
+            t = now.time()
+            if t < dtime(9, 30):
+                phase = "盘前"
+            elif dtime(9, 30) <= t < dtime(11, 30) or dtime(13, 0) <= t < dtime(15, 0):
+                phase = "盘中"
+            elif dtime(11, 30) <= t < dtime(13, 0):
+                phase = "午盘"
+            else:
+                phase = "盘后"
+        return f"{now.strftime('%Y-%m-%d %H:%M:%S')} [{phase}]"
+
+    def _param_to_str(self, val: object) -> str:
+        if isinstance(val, (dict, list)):
+            return json.dumps(val, ensure_ascii=False)
+        return str(val)
+
+    def _safe_float(self, val: object) -> float:
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+
+    def _format_volume(self, val: float) -> str:
+        if val <= 0:
+            return "0"
+        if val >= 1e8:
+            return f"{val / 1e8:.2f}亿"
+        if val >= 1e4:
+            return f"{val / 1e4:.2f}万"
+        return f"{val:.0f}"
+
+    def _render_prompt_template(self, text: str, params: Optional[Dict[str, object]] = None) -> str:
+        if not text:
+            return ""
+        if not params:
+            return text
+        def repl(match: re.Match) -> str:
+            key = (match.group(1) or "").strip()
+            if not key:
+                return match.group(0)
+            if key in params:
+                return self._param_to_str(params.get(key))
+            return match.group(0)
+        return re.sub(r"{{\s*([^}]+?)\s*}}", repl, text)
+
+    def _render_brace_placeholders(self, text: str, params: Optional[Dict[str, object]] = None) -> str:
+        if not text or not params:
+            return text
+        reserved = {"symbol", "nowTime"}
+        def repl(match: re.Match) -> str:
+            key = (match.group(1) or "").strip()
+            if not key or key in reserved:
+                return match.group(0)
+            if key in params:
+                return self._param_to_str(params.get(key))
+            return match.group(0)
+        return re.sub(r"(?<!{){\s*([A-Za-z0-9_]+)\s*}(?!})", repl, text)
+
+    def _extract_cys13(self, klines: Optional[List[Dict]]) -> Optional[object]:
+        if not klines:
+            return None
+        last = klines[-1] or {}
+        keys = ("CYS13", "cys13", "CYS_13", "cys_13")
+        for key in keys:
+            if key in last and last.get(key) not in (None, ""):
+                return last.get(key)
+        indicators = last.get("indicators")
+        if isinstance(indicators, dict):
+            for key in keys:
+                if key in indicators and indicators.get(key) not in (None, ""):
+                    return indicators.get(key)
+        computed = self._compute_cys13(klines)
+        if computed is not None:
+            return computed
+        return None
+
+    def _compute_day5_summary(self, klines: Optional[List[Dict]]) -> Optional[str]:
+        if not klines or len(klines) < 5:
+            return None
+        recent = klines[-5:]
+        prev_close = None
+        if len(klines) >= 6:
+            prev_close = self._safe_float(klines[-6].get("close"))
+        vol_avg = 0.0
+        volumes = [self._safe_float(item.get("volume")) for item in recent]
+        if volumes:
+            vol_avg = sum(volumes) / len(volumes)
+        lines: List[str] = ["近5日量价表现:"]
+        for item in recent:
+            date = item.get("date") or ""
+            close = self._safe_float(item.get("close"))
+            vol = self._safe_float(item.get("volume"))
+            if prev_close and prev_close > 0:
+                change = (close - prev_close) / prev_close * 100.0
+                change_str = f"{change:+.2f}%"
+            else:
+                change_str = "N/A"
+            ratio_str = ""
+            if vol_avg > 0 and vol > 0:
+                ratio_str = f" 量比{(vol / vol_avg):.2f}"
+            lines.append(f"{date} 收盘{close:.2f} 涨跌{change_str} 成交量{self._format_volume(vol)}{ratio_str}")
+            prev_close = close
+        return "\n".join(lines)
+
+    def _compute_cys13(self, klines: Optional[List[Dict]]) -> Optional[float]:
+        if not klines or len(klines) < 13:
+            return None
+        recent = klines[-13:]
+        costs: List[float] = []
+        for item in recent:
+            if not isinstance(item, dict):
+                return None
+            amount = self._safe_float(item.get("amount") or item.get("turnover") or item.get("成交额"))
+            volume = self._safe_float(item.get("volume"))
+            cost = 0.0
+            if amount > 0 and volume > 0:
+                cost = amount / volume
+            else:
+                close = self._safe_float(item.get("close"))
+                if close <= 0:
+                    return None
+                high = self._safe_float(item.get("high"))
+                low = self._safe_float(item.get("low"))
+                open_v = self._safe_float(item.get("open"))
+                if high > 0 and low > 0:
+                    cost = (high + low + close) / 3.0
+                elif open_v > 0:
+                    cost = (open_v + close) / 2.0
+                else:
+                    cost = close
+            if cost <= 0:
+                return None
+            costs.append(cost)
+        if len(costs) < 13:
+            return None
+        ma13 = sum(costs) / 13.0
+        close_last = self._safe_float(recent[-1].get("close"))
+        if ma13 <= 0 or close_last <= 0:
+            return None
+        return (close_last - ma13) / ma13 * 100.0
+
+    def _augment_prompt_params(
+        self,
+        params: Optional[Dict[str, object]],
+        klines: Optional[List[Dict]],
+        cys13_value: Optional[object] = None
+    ) -> Dict[str, object]:
+        merged: Dict[str, object] = dict(params or {})
+        cys13 = cys13_value if cys13_value is not None else self._extract_cys13(klines)
+        if cys13 is not None and "CYS13" not in merged and "cys13" not in merged:
+            formatted = None
+            try:
+                formatted = f"{float(cys13):.2f}"
+            except Exception:
+                formatted = cys13
+            merged["CYS13"] = formatted
+        if "DAY5" not in merged and "day5" not in merged:
+            day5 = self._compute_day5_summary(klines)
+            if day5:
+                merged["DAY5"] = day5
+        return merged
+
+    def build_system_prompt(
+        self,
+        symbol: str,
+        custom_prompt: Optional[str] = None,
+        now_time_override: Optional[str] = None,
+        prompt_params: Optional[Dict[str, object]] = None
+    ) -> str:
+        now_time = self._format_now_time(now_time_override)
         if custom_prompt:
             text = custom_prompt.strip()
-            if "{symbol}" in text:
-                return text.replace("{symbol}", symbol)
-            if symbol and symbol in text:
+            text = self._render_prompt_template(text, prompt_params)
+            text = self._render_brace_placeholders(text, prompt_params)
+            has_symbol_placeholder = "{symbol}" in text
+            has_symbol_literal = bool(symbol and symbol in text)
+            text = text.replace("{symbol}", symbol).replace("{nowTime}", now_time)
+            if has_symbol_placeholder or has_symbol_literal:
                 return text
             return f"{text}\n\n当前分析的目标股票是: {symbol}。"
-        return self.get_default_system_prompt_template().replace("{symbol}", symbol)
+        base = self.get_default_system_prompt_template()
+        base = self._render_prompt_template(base, prompt_params)
+        base = self._render_brace_placeholders(base, prompt_params)
+        return base.replace("{symbol}", symbol).replace("{nowTime}", now_time)
 
     def _tokenize(self, text: str) -> List[str]:
         if not text:
@@ -294,7 +492,11 @@ class LLMService:
         user_input: str = None,
         mode: str = "assistant",
         context_config: Optional[Dict] = None,
-        transient_context: Optional[str] = None
+        transient_context: Optional[str] = None,
+        regression_date: Optional[str] = None,
+        prompt_id: Optional[int] = None,
+        prompt_text: Optional[str] = None,
+        prompt_params: Optional[Dict[str, object]] = None
     ) -> object:
         """调用 LLM 分析股票 (支持对话模式)"""
         target_model = model or self.default_model
@@ -350,8 +552,64 @@ class LLMService:
         KLINE_ROWS_CHAT = _to_int("kline_rows_chat", 100, 0, 365)
         KLINE_ROWS_ASSISTANT = _to_int("kline_rows_assistant", 365, 0, 365)
 
+        if not ENABLE_MEMORY:
+            DISABLE_HISTORY = True
+            ENABLE_RETRIEVAL = False
+            HISTORY_LIMIT = 0
+            RECENT_LIMIT = 0
+            SUMMARY_MIN = 0
+            SUMMARY_STEP = 0
+
+        if mode == "regression":
+            DISABLE_HISTORY = True
+            SAVE_HISTORY = False
+            ENABLE_MEMORY = False
+            ENABLE_RETRIEVAL = False
+            HISTORY_LIMIT = 0
+            RECENT_LIMIT = 0
+
         active_prompt = db.get_active_system_prompt(symbol) if symbol else None
-        system_prompt = self.build_system_prompt(symbol, active_prompt.get("prompt") if active_prompt else None)
+        override_prompt = None
+        merged_params: Dict[str, object] = {}
+        if prompt_id:
+            tmpl = db.get_prompt_template_by_id(prompt_id)
+            if tmpl:
+                override_prompt = tmpl.get("prompt")
+                merged_params.update(tmpl.get("params") or {})
+        if prompt_text:
+            override_prompt = prompt_text
+
+        if override_prompt:
+            if prompt_params:
+                merged_params.update(prompt_params)
+        else:
+            if active_prompt and active_prompt.get("params"):
+                merged_params.update(active_prompt.get("params") or {})
+            if prompt_params:
+                merged_params.update(prompt_params)
+
+        prompt_text_hint = override_prompt or (active_prompt.get("prompt") if active_prompt else "")
+        needs_cys13 = "{CYS13}" in (prompt_text_hint or "") or "{cys13}" in (prompt_text_hint or "")
+        cys13_value = self._extract_cys13(klines)
+        if debug_ctx and needs_cys13 and cys13_value is None and "CYS13" not in merged_params and "cys13" not in merged_params:
+            print("[LLM][Context] CYS13 placeholder present but no data found in klines/params")
+
+        merged_params = self._augment_prompt_params(merged_params, klines, cys13_value)
+
+        if override_prompt:
+            system_prompt = self.build_system_prompt(
+                symbol,
+                override_prompt,
+                regression_date if mode == "regression" else None,
+                merged_params
+            )
+        else:
+            system_prompt = self.build_system_prompt(
+                symbol,
+                active_prompt.get("prompt") if active_prompt else None,
+                regression_date if mode == "regression" else None,
+                merged_params
+            )
         short_query = False
         if user_input:
             try:
@@ -439,7 +697,7 @@ class LLMService:
         memory_messages: List[Dict] = []
         if ENABLE_MEMORY:
             if MEMORY_INCLUDE_ASSISTANT:
-                memory_messages = self._build_memory_pairs(raw_history, max_pairs=MEMORY_PAIRS_LIMIT, max_user_chars=MAX_MESSAGE_CHARS, max_ai_chars=MAX_MESSAGE_CHARS)
+                memory_messages = self._build_memory_pairs(history, max_pairs=MEMORY_PAIRS_LIMIT, max_user_chars=MAX_MESSAGE_CHARS, max_ai_chars=MAX_MESSAGE_CHARS)
             elif summary:
                 memory_messages = self._summary_to_messages(summary, MAX_MESSAGE_CHARS)
                 if not memory_messages:

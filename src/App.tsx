@@ -10,6 +10,9 @@ import { PaperTradingPage } from './lib/paper/PaperTradingPage';
 import { IndustryTemplatesPage } from './lib/industry/IndustryTemplatesPage';
 import { ScreeningPage } from './lib/screening/ScreeningPage';
 import { WatchlistPage } from './lib/watchlist/WatchlistPage';
+import { AITraderPage } from './lib/aitrader/AITraderPage';
+import { PromptLabPage } from './lib/prompts/PromptLabPage';
+import { RuleIndicatorsPage } from './lib/aitrader/RuleIndicatorsPage';
 
 // Configure the type of the `routerOptions` prop on all React Spectrum components.
 declare module '@react-spectrum/s2' {
@@ -64,6 +67,9 @@ function App() {
                 <Route path="/industry-templates" element={<IndustryTemplatesPage />} />
                 <Route path="/screening" element={<ScreeningPage />} />
                 <Route path="/watchlist" element={<WatchlistPage />} />
+                <Route path="/aitrader" element={<AITraderPage />} />
+                <Route path="/prompt-lab" element={<PromptLabPage />} />
+                <Route path="/rule-indicators" element={<RuleIndicatorsPage />} />
             </Routes>
         </Provider>
     )

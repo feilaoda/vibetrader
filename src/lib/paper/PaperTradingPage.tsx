@@ -191,6 +191,58 @@ interface WatchlistItem {
     name?: string;
 }
 
+const toSafeNumber = (value: unknown, fallback = 0): number => {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : fallback;
+};
+
+const asRecord = (value: unknown): Record<string, unknown> => (
+    value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+);
+
+const normalizeStrategy = (raw: unknown): Strategy => {
+    const rec = asRecord(raw);
+    return {
+        ...(rec as Partial<Strategy>),
+        id: toSafeNumber(rec.id, 0),
+        run_interval_minutes: toSafeNumber(rec.run_interval_minutes, 1440),
+        auto_run_enabled: Boolean(rec.auto_run_enabled),
+        initial_capital: toSafeNumber(rec.initial_capital, 100000),
+        last_optimization_score: rec.last_optimization_score == null
+        ? null
+            : toSafeNumber(rec.last_optimization_score, 0),
+    };
+};
+
+const normalizePosition = (raw: unknown, index: number): Position => {
+    const rec = asRecord(raw);
+    return {
+        id: rec.symbol ? String(rec.symbol) : `pos-${index}`,
+        symbol: String(rec.symbol || ""),
+        name: rec.name ? String(rec.name) : undefined,
+        quantity: toSafeNumber(rec.quantity, 0),
+        avg_cost: toSafeNumber(rec.avg_cost, 0),
+        current_price: toSafeNumber(rec.current_price, 0),
+        market_value: toSafeNumber(rec.market_value, 0),
+        profit: toSafeNumber(rec.profit, 0),
+        profit_percent: toSafeNumber(rec.profit_percent, 0),
+    };
+};
+
+const normalizeOrder = (raw: unknown, index: number): Order => {
+    const rec = asRecord(raw);
+    return {
+        id: rec.id ?? `order-${index}`,
+        symbol: String(rec.symbol || ""),
+        name: rec.name ? String(rec.name) : undefined,
+        side: String(rec.side || "BUY").toUpperCase() === "SELL" ? "SELL" : "BUY",
+        price: toSafeNumber(rec.price, 0),
+        quantity: toSafeNumber(rec.quantity, 0),
+        fee: toSafeNumber(rec.fee, 0),
+        created_at: String(rec.created_at || ""),
+    };
+};
+
 export const PaperTradingPage = () => {
     const [strategies, setStrategies] = useState<Strategy[]>([]);
     const [selectedStrategyId, setSelectedStrategyId] = useState<number | null>(null);
@@ -264,9 +316,12 @@ export const PaperTradingPage = () => {
         try {
             const res = await fetch(`${API_BASE}/api/paper/strategies`);
             const data = await res.json();
-            const items = Array.isArray(data.data) ? data.data : [];
+            const items = Array.isArray(data.data)
+                ? data.data.map((item: unknown) => normalizeStrategy(item)).filter((item: Strategy) => item.id > 0)
+                : [];
             setStrategies(items);
-            if (!selectedStrategyId && items.length > 0) {
+            const hasCurrent = !!selectedStrategyId && items.some((s: Strategy) => s.id === selectedStrategyId);
+            if (!hasCurrent && items.length > 0) {
                 const manual = items.find((s: Strategy) => s.type === 'manual');
                 const defaultId = manual ? manual.id : items[0].id;
                 setSelectedStrategyId(defaultId);
@@ -285,18 +340,12 @@ export const PaperTradingPage = () => {
             const posRes = await fetch(`${API_BASE}/api/paper/positions?strategy_id=${selectedStrategyId}`);
             const posData = await posRes.json();
             const rawPositions = Array.isArray(posData.data) ? posData.data : [];
-            setPositions(rawPositions.map((p: Position, index: number) => ({
-                ...p,
-                id: p.symbol || `pos-${index}`
-            })) as Position[]);
+            setPositions(rawPositions.map((p: unknown, index: number) => normalizePosition(p, index)));
 
             const ordRes = await fetch(`${API_BASE}/api/paper/orders?strategy_id=${selectedStrategyId}`);
             const ordData = await ordRes.json();
             const rawOrders = Array.isArray(ordData.data) ? ordData.data : [];
-            setOrders(rawOrders.map((o: Order, index: number) => ({
-                ...o,
-                id: o.id ?? `order-${index}`
-            })) as Order[]);
+            setOrders(rawOrders.map((o: unknown, index: number) => normalizeOrder(o, index)));
 
             setLastUpdated(new Date().toLocaleTimeString());
         } catch (e) {
@@ -639,7 +688,7 @@ export const PaperTradingPage = () => {
 
     // Dashboard Calculations
     const totalMarketValue = positions.reduce((sum, p) => sum + (Number(p.market_value) || 0), 0);
-    const initialCapital = selectedStrategy?.initial_capital ?? 100000;
+    const initialCapital = toSafeNumber(selectedStrategy?.initial_capital, 100000);
     const cashBalance = orders.reduce((cash, o) => {
         const price = Number(o.price) || 0;
         const qty = Number(o.quantity) || 0;
@@ -750,9 +799,12 @@ export const PaperTradingPage = () => {
                             selectedKeys={selectedStrategyId ? new Set([String(selectedStrategyId)]) : new Set()}
                             onSelectionChange={(keys) => {
                                 if (keys === 'all') return;
-                                const selected = (keys as Set<string>).values().next().value;
-                                if (selected) {
-                                    setSelectedStrategyId(Number(selected));
+                                const selected = Array.from(keys as Set<string>)[0];
+                                const nextId = toSafeNumber(selected, 0);
+                                if (nextId > 0) {
+                                    setRunDetailsOpen(false);
+                                    setSelectedRun(null);
+                                    setSelectedStrategyId(nextId);
                                 }
                             }}
                             density="compact"
@@ -831,8 +883,8 @@ export const PaperTradingPage = () => {
                                     {!settingsOpen && (
                                         <div style={{ marginTop: '12px', fontSize: '13px', color: '#666' }}>
                                             {selectedStrategy.is_ai
-                                                ? `Model: ${(llmConfig?.models || []).find(m => m.id === (modelDraft || selectedStrategy.model_id))?.name || (modelDraft || selectedStrategy.model_id || 'N/A')} · Interval: ${intervalOptions.find(o => o.id === String(intervalDraft || selectedStrategy.run_interval_minutes))?.label || '1天'} · Auto: ${autoRunEnabledDraft ? 'ON' : 'OFF'} · Universe: ${universeTypeDraft === 'watchlist' ? (watchlistSelected.length > 0 ? `自选池(${watchlistSelected.length})` : '自选池') : `自定义(${customSymbolCount})`} · Initial: ¥${(selectedStrategy.initial_capital ?? 100000).toFixed(0)}${isStrategyRunning ? ' · Status: running' : ''}${selectedStrategy.last_run_at ? ` · Last run: ${new Date(selectedStrategy.last_run_at).toLocaleString()}` : ''}${selectedStrategy.last_optimized_at ? ` · Optimized: ${new Date(selectedStrategy.last_optimized_at).toLocaleString()}${selectedStrategy.last_optimization_score != null ? ` · Score: ${Number(selectedStrategy.last_optimization_score).toFixed(3)}` : ''}` : ''}`
-                                                : `Manual strategy: trades are placed by you, no AI automation. · Initial: ¥${(selectedStrategy.initial_capital ?? 100000).toFixed(0)}${selectedStrategy.last_run_at ? ` · Last run: ${new Date(selectedStrategy.last_run_at).toLocaleString()}` : ''}`}
+                                                ? `Model: ${(llmConfig?.models || []).find(m => m.id === (modelDraft || selectedStrategy.model_id))?.name || (modelDraft || selectedStrategy.model_id || 'N/A')} · Interval: ${intervalOptions.find(o => o.id === String(intervalDraft || selectedStrategy.run_interval_minutes))?.label || '1天'} · Auto: ${autoRunEnabledDraft ? 'ON' : 'OFF'} · Universe: ${universeTypeDraft === 'watchlist' ? (watchlistSelected.length > 0 ? `自选池(${watchlistSelected.length})` : '自选池') : `自定义(${customSymbolCount})`} · Initial: ¥${toSafeNumber(selectedStrategy.initial_capital, 100000).toFixed(0)}${isStrategyRunning ? ' · Status: running' : ''}${selectedStrategy.last_run_at ? ` · Last run: ${new Date(selectedStrategy.last_run_at).toLocaleString()}` : ''}${selectedStrategy.last_optimized_at ? ` · Optimized: ${new Date(selectedStrategy.last_optimized_at).toLocaleString()}${selectedStrategy.last_optimization_score != null ? ` · Score: ${Number(selectedStrategy.last_optimization_score).toFixed(3)}` : ''}` : ''}`
+                                                : `Manual strategy: trades are placed by you, no AI automation. · Initial: ¥${toSafeNumber(selectedStrategy.initial_capital, 100000).toFixed(0)}${selectedStrategy.last_run_at ? ` · Last run: ${new Date(selectedStrategy.last_run_at).toLocaleString()}` : ''}`}
                                         </div>
                                     )}
                                     {selectedStrategy.is_ai && latestRun && (

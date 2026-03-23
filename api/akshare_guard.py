@@ -54,6 +54,11 @@ def _get_rate_limit_seconds(scope: str) -> float:
     return RATE_LIMIT_DEFAULT_SECONDS
 
 
+def akshare_disabled() -> bool:
+    value = str(os.getenv("AKSHARE_DISABLED", "0")).strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
 def throttle(scope: str = "default", min_interval: Optional[float] = None) -> float:
     """Throttle AkShare calls to avoid triggering IP bans."""
     interval = min_interval if min_interval is not None else _get_rate_limit_seconds(scope)

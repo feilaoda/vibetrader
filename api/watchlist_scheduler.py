@@ -79,6 +79,7 @@ def _collect_symbols() -> List[str]:
 def _sync_symbols(symbols: List[str]) -> None:
     if not symbols:
         return
+    print(f"[WatchlistScheduler] syncing {len(symbols)} symbols...")
     now = _now_cn()
     trade_iso = _latest_trading_date(now).strftime("%Y-%m-%d")
     for sym in symbols:
@@ -89,7 +90,7 @@ def _sync_symbols(symbols: List[str]) -> None:
             else:
                 if not _needs_cn_refresh(sym, trade_iso):
                     continue
-            get_klines_with_cache(sym, period="daily", limit=2, force_refresh=True, include_intraday=True)
+            get_klines_with_cache(sym, period="daily", limit=2, force_refresh=False, include_intraday=False)
             time.sleep(0.2)
         except Exception as exc:
             print(f"[WatchlistScheduler] sync failed {sym}: {exc}")

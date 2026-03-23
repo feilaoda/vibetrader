@@ -121,7 +121,12 @@ def run_daily_scan_workflow(strategy_name="turtle", source="all", limit=None, pr
                         score=score,
                         reason=reason[:255], # Truncate for DB column if needed (usually text)
                         raw_json=raw_data,
-                        model_id=prompt_type
+                        model_id=prompt_type,
+                        ai_metrics={
+                            "action": decision,
+                            "reason": reason,
+                            "model": prompt_type,
+                        }
                     )
                 except Exception as e:
                     print(f"Error saving {symbol}: {e}")

@@ -7,6 +7,7 @@ from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from datetime import datetime, timedelta
+import os
 import re
 import urllib.request
 import asyncio
@@ -15,7 +16,6 @@ try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
-import akshare as ak
 import time
 
 def retry_request(func, max_retries=3, delay=1):
@@ -37,6 +37,11 @@ CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else None
 def _now_cn() -> datetime:
     return datetime.now(CN_TZ) if CN_TZ else datetime.now()
 
+
+def _flag_enabled(name: str, default: str = "1") -> bool:
+    value = os.getenv(name, default)
+    return str(value).strip().lower() not in ("0", "false", "no", "off")
+
 from actions import router as actions_router
 from paper import router as paper_router
 from fundamentals import router as fundamentals_router
@@ -44,6 +49,7 @@ from industry import router as industry_router
 from crypto import router as crypto_router
 from push import router as push_router
 from screening import router as screening_router
+from aitrader_router import router as aitrader_router
 
 app.include_router(actions_router, prefix="/api")
 app.include_router(paper_router, prefix="/api")
@@ -52,6 +58,7 @@ app.include_router(industry_router, prefix="/api")
 app.include_router(crypto_router, prefix="/api")
 app.include_router(push_router, prefix="/api")
 app.include_router(screening_router, prefix="/api")
+app.include_router(aitrader_router, prefix="/api")
 
 # CORS 配置
 app.add_middleware(
@@ -166,11 +173,12 @@ async def sync_klines(
 ):
     """手动强制同步数据"""
     try:
-        from cache import force_sync
+        from cache import force_sync, DAILY_PERIODS
         from akshare_guard import get_status
         
         ak_period = PERIOD_MAP.get(period, "daily")
-        klines, source = force_sync(symbol, ak_period)
+        include_intraday = True if ak_period == "daily" else False
+        klines, source = force_sync(symbol, ak_period, include_intraday=include_intraday)
         
         return {
             "success": True,
@@ -213,6 +221,32 @@ class WatchlistItemModel(BaseModel):
     market: str
     name: Optional[str] = None
     addedAt: Optional[int] = None
+
+
+class SymbolNoteCreateModel(BaseModel):
+    symbol: str
+    content: str
+    note_date: Optional[str] = None
+    is_global: Optional[bool] = False
+
+
+class SymbolNoteUpdateModel(BaseModel):
+    content: str
+    note_date: Optional[str] = None
+    is_global: Optional[bool] = False
+
+
+def _normalize_note_date(raw: Optional[str]) -> str:
+    if not raw:
+        return _now_cn().strftime("%Y-%m-%d")
+    text = str(raw).strip()
+    if not text:
+        return _now_cn().strftime("%Y-%m-%d")
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    raise HTTPException(status_code=400, detail="Invalid note_date, use YYYY-MM-DD")
 
 @app.get("/api/watchlist")
 async def get_watchlist():
@@ -264,7 +298,7 @@ async def sync_watchlist_daily(market: str = Query("ashare", description="市场
         if not symbol:
             continue
         try:
-            klines, source = force_sync(symbol, "daily")
+            klines, source = force_sync(symbol, "daily", include_intraday=True)
             results.append({
                 "symbol": symbol,
                 "count": len(klines),
@@ -289,6 +323,53 @@ async def sync_watchlist_daily(market: str = Query("ashare", description="市场
     }
 
 
+@app.get("/api/notes")
+async def get_symbol_notes(
+    symbol: str = Query(..., description="股票代码"),
+    limit: int = Query(200, description="返回数量"),
+):
+    from db import list_symbol_notes
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="Invalid symbol")
+    rows = list_symbol_notes(sym, limit=limit)
+    return {"data": rows}
+
+
+@app.post("/api/notes")
+async def create_symbol_note(payload: SymbolNoteCreateModel):
+    from db import create_symbol_note as db_create_symbol_note
+    sym = (payload.symbol or "").upper().strip()
+    content = (payload.content or "").strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="Invalid symbol")
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty note content")
+    note = db_create_symbol_note(sym, _normalize_note_date(payload.note_date), content, bool(payload.is_global))
+    return {"success": True, "data": note}
+
+
+@app.put("/api/notes/{note_id}")
+async def update_symbol_note(note_id: int, payload: SymbolNoteUpdateModel):
+    from db import update_symbol_note as db_update_symbol_note
+    content = (payload.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty note content")
+    note = db_update_symbol_note(note_id, _normalize_note_date(payload.note_date), content, bool(payload.is_global))
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return {"success": True, "data": note}
+
+
+@app.delete("/api/notes/{note_id}")
+async def delete_symbol_note(note_id: int):
+    from db import delete_symbol_note as db_delete_symbol_note
+    ok = db_delete_symbol_note(note_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return {"success": True}
+
+
 # AI 分析 API
 class AnalyzeRequest(BaseModel):
     symbol: str
@@ -297,12 +378,17 @@ class AnalyzeRequest(BaseModel):
     user_input: Optional[str] = None
     transient_context: Optional[str] = None
     mode: Optional[str] = None
+    regression_date: Optional[str] = None
+    prompt_id: Optional[int] = None
+    prompt_text: Optional[str] = None
+    prompt_params: Optional[dict] = None
     context_config: Optional[dict] = None
 
 
 class SystemPromptCreate(BaseModel):
     name: Optional[str] = None
     prompt: str
+    params: Optional[dict] = None
     set_active: Optional[bool] = False
     symbol: Optional[str] = None
 
@@ -310,8 +396,18 @@ class SystemPromptCreate(BaseModel):
 class SystemPromptUpdate(BaseModel):
     name: Optional[str] = None
     prompt: Optional[str] = None
+    params: Optional[dict] = None
     set_active: Optional[bool] = None
     symbol: Optional[str] = None
+
+
+class SystemPromptRender(BaseModel):
+    prompt_id: Optional[int] = None
+    prompt_text: Optional[str] = None
+    params: Optional[dict] = None
+    symbol: Optional[str] = None
+    regression_date: Optional[str] = None
+    klines: Optional[list] = None
 
 @app.post("/api/analyze")
 async def analyze_stock(request: AnalyzeRequest, http_request: Request):
@@ -329,7 +425,11 @@ async def analyze_stock(request: AnalyzeRequest, http_request: Request):
         request.user_input,
         request.mode or "assistant",
         request.context_config or {},
-        request.transient_context
+        request.transient_context,
+        request.regression_date,
+        request.prompt_id,
+        request.prompt_text,
+        request.prompt_params
     )
     
     if isinstance(response, str):
@@ -379,12 +479,12 @@ async def analyze_stock(request: AnalyzeRequest, http_request: Request):
     return StreamingResponse(iter_response(), media_type="text/plain")
 
 @app.get("/api/system_prompts")
-async def list_system_prompts(symbol: str = Query(..., description="股票代码")):
+async def list_system_prompts(symbol: str = Query("", description="股票代码")):
     """获取系统提示词模板列表 + 当前标的关联模板"""
     from db import list_prompt_templates, get_symbol_prompt_template, get_prompt_template_by_name
     from prompts import DEFAULT_SYSTEM_PROMPT_NAME
     items = list_prompt_templates()
-    active = get_symbol_prompt_template(symbol)
+    active = get_symbol_prompt_template(symbol) if symbol else None
     default_tmpl = get_prompt_template_by_name(DEFAULT_SYSTEM_PROMPT_NAME)
     return {
         "data": items,
@@ -401,7 +501,8 @@ async def create_system_prompt(payload: SystemPromptCreate):
         result = create_prompt_template(
             payload.name or "Untitled",
             payload.prompt,
-            False
+            False,
+            payload.params
         )
         template_id = result.get("id")
         if payload.set_active and payload.symbol and template_id:
@@ -418,7 +519,8 @@ async def update_system_prompt(prompt_id: int, payload: SystemPromptUpdate):
         update_prompt_template(
             prompt_id,
             name=payload.name,
-            prompt=payload.prompt
+            prompt=payload.prompt,
+            params=payload.params
         )
         if payload.set_active and payload.symbol:
             set_symbol_prompt_template(payload.symbol, prompt_id)
@@ -434,6 +536,52 @@ async def activate_system_prompt(prompt_id: int, symbol: str = Query(..., descri
     if not ok:
         raise HTTPException(status_code=404, detail="Prompt not found")
     return {"success": True}
+
+
+@app.post("/api/system_prompts/render")
+async def render_system_prompt(payload: SystemPromptRender):
+    """Render prompt template with params before use."""
+    from db import get_prompt_template_by_id
+    from cache import load_cache
+    from llm import llm_service
+
+    prompt_text = (payload.prompt_text or "").strip()
+    params = payload.params or {}
+    if payload.prompt_id:
+        tmpl = get_prompt_template_by_id(int(payload.prompt_id))
+        if tmpl:
+            prompt_text = prompt_text or (tmpl.get("prompt") or "")
+            base_params = tmpl.get("params") or {}
+            params = {**base_params, **(params or {})}
+    if not prompt_text:
+        raise HTTPException(status_code=400, detail="prompt_text required")
+    needs_cys13 = False
+    try:
+        needs_cys13 = bool(re.search(r"{\s*(CYS13|cys13)\s*}", prompt_text))
+    except Exception:
+        needs_cys13 = False
+
+    klines = payload.klines or []
+    if not klines and needs_cys13 and payload.symbol:
+        try:
+            cache = load_cache(payload.symbol, "daily")
+            if cache and cache.get("klines"):
+                klines = cache.get("klines")[-30:]
+        except Exception:
+            klines = []
+
+    if klines:
+        try:
+            params = llm_service._augment_prompt_params(params, klines)  # noqa: SLF001
+        except Exception:
+            pass
+    rendered = llm_service.build_system_prompt(
+        payload.symbol or "",
+        prompt_text,
+        payload.regression_date,
+        params
+    )
+    return {"prompt": rendered}
 
 @app.delete("/api/system_prompts/{prompt_id}")
 async def delete_system_prompt(prompt_id: int):
@@ -531,8 +679,14 @@ async def startup_event():
 
     start_strategy_scheduler()
     start_optimizer_scheduler()
-    start_industry_scheduler()
-    start_watchlist_scheduler()
+    if _flag_enabled("INDUSTRY_SCHEDULER_ENABLED", "1"):
+        start_industry_scheduler()
+    else:
+        print("[Startup] Industry scheduler disabled (INDUSTRY_SCHEDULER_ENABLED=0)")
+    if _flag_enabled("WATCHLIST_SCHEDULER_ENABLED", "1"):
+        start_watchlist_scheduler()
+    else:
+        print("[Startup] Watchlist scheduler disabled (WATCHLIST_SCHEDULER_ENABLED=0)")
 
 
 @app.get("/api/symbols")
@@ -873,99 +1027,33 @@ async def get_realtime(symbol: str):
             return payload
 
         code = format_symbol(symbol)
-        
-        is_etf = code.startswith(("15", "16", "5"))
 
-        from akshare_guard import should_skip_remote, record_failure, record_success, get_status, throttle
+        from data_sources import DataType
+        from data_sources.router import fetch as router_fetch
+        from akshare_guard import get_status
         from cache import get_klines_with_cache, build_daily_kline_from_minutes
+        from trading_time import is_trading_day, now_cn
+        from datetime import time as dtime
 
-        scope = "realtime_etf" if is_etf else "realtime_stock"
-        scope_tencent = "realtime_tencent_etf" if is_etf else "realtime_tencent_stock"
-        today_iso = _now_cn().strftime("%Y-%m-%d")
-        today_str = _now_cn().strftime("%Y%m%d")
+        scope = "realtime"
+        now_dt = now_cn()
+        today_iso = now_dt.strftime("%Y-%m-%d")
+        today_str = now_dt.strftime("%Y%m%d")
 
-        def _safe_float(value) -> float:
-            try:
-                if value is None:
-                    return 0
-                if isinstance(value, str):
-                    text = value.strip().replace(",", "")
-                    if text in ("", "--", "None", "nan"):
-                        return 0
-                    return float(text)
-                num = float(value)
-                if num != num or num in (float("inf"), float("-inf")):
-                    return 0
-                return num
-            except Exception:
-                return 0
+        def _market_phase(now) -> str:
+            if not is_trading_day(now):
+                return "休市"
+            t = now.time()
+            if t < dtime(9, 30):
+                return "盘前"
+            if dtime(9, 30) <= t < dtime(11, 30) or dtime(13, 0) <= t < dtime(15, 0):
+                return "盘中"
+            if dtime(11, 30) <= t < dtime(13, 0):
+                return "午盘"
+            return "盘后"
 
-        def fetch_tencent_realtime() -> Optional[dict]:
-            if should_skip_remote(scope=scope_tencent):
-                return None
-            market_prefix = get_market_prefix(symbol)
-            url = f"https://qt.gtimg.cn/q={market_prefix}{code}"
-
-            def _do():
-                req = urllib.request.Request(url, headers={
-                    "User-Agent": "Mozilla/5.0"
-                })
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    return resp.read()
-
-            raw = retry_request(_do)
-            if not raw:
-                return None
-            try:
-                text = raw.decode("gbk", errors="ignore")
-            except Exception:
-                text = raw.decode("utf-8", errors="ignore")
-            match = re.search(r'="([^"]+)"', text)
-            if not match:
-                return None
-            parts = match.group(1).split("~")
-            if len(parts) < 35:
-                return None
-
-            name = parts[1] if len(parts) > 1 else None
-            price = _safe_float(parts[3] if len(parts) > 3 else 0)
-            prev_close = _safe_float(parts[4] if len(parts) > 4 else 0)
-            open_p = _safe_float(parts[5] if len(parts) > 5 else 0)
-            volume_lot = _safe_float(parts[6] if len(parts) > 6 else 0)
-            change = _safe_float(parts[31] if len(parts) > 31 else (price - prev_close))
-            change_pct = _safe_float(parts[32] if len(parts) > 32 else ((change / prev_close * 100) if prev_close else 0))
-            high = _safe_float(parts[33] if len(parts) > 33 else 0)
-            low = _safe_float(parts[34] if len(parts) > 34 else 0)
-            amount = _safe_float(parts[37] if len(parts) > 37 else 0) * 10000
-            time_str = parts[30] if len(parts) > 30 else ""
-
-            ts = int(_now_cn().timestamp() * 1000)
-            if time_str and ":" in time_str:
-                try:
-                    dt = datetime.strptime(f"{today_iso} {time_str}", "%Y-%m-%d %H:%M:%S")
-                    if CN_TZ:
-                        dt = dt.replace(tzinfo=CN_TZ)
-                    ts = int(dt.timestamp() * 1000)
-                except Exception:
-                    pass
-
-            record_success(scope_tencent)
-            return {
-                "symbol": symbol,
-                "name": name,
-                "price": price,
-                "change": change,
-                "changePercent": change_pct,
-                "open": open_p,
-                "high": high,
-                "low": low,
-                "volume": volume_lot * 100,
-                "amount": amount,
-                "timestamp": ts,
-                "source": "tencent",
-                "stale": False,
-                "api_status": get_status(scope_tencent),
-            }
+        phase = _market_phase(now_dt)
+        out_of_session = phase in ("盘前", "盘后", "休市")
 
         def build_summary_from_daily() -> Optional[dict]:
             try:
@@ -1041,98 +1129,37 @@ async def get_realtime(symbol: str):
                 "stale": stale,
             }
 
-        # Default to Tencent realtime first
-        tencent_data = None
-        try:
-            tencent_data = fetch_tencent_realtime()
-        except Exception as t_err:
-            record_failure(f"realtime_tencent_failed: {t_err}", scope_tencent)
-            tencent_data = None
-        if tencent_data:
-            _maybe_upsert_symbol(tencent_data)
-            return tencent_data
+        data, channel = router_fetch(
+            DataType.REALTIME,
+            channels=["tencent", "akshare"],
+            symbol=symbol,
+            code=code,
+        )
+        if data:
+            data["api_status"] = get_status(scope)
+            data["phase"] = phase
+            if phase == "午盘":
+                data["note"] = "午盘休市，以上为最新成交"
+            if out_of_session:
+                summary = build_summary_from_daily()
+                if summary:
+                    summary["api_status"] = get_status(scope)
+                    summary["note"] = f"{phase}，使用最近交易日行情"
+                    summary["stale"] = True
+                    summary["phase"] = phase
+                    return summary
+                data["note"] = f"{phase}，行情可能为昨收"
+                data["stale"] = True
+            _maybe_upsert_symbol(data)
+            return data
 
-        if should_skip_remote(scope=scope):
-            summary = build_summary_from_intraday() or build_summary_from_daily()
-            if summary:
-                summary["api_status"] = get_status(scope)
-                summary["note"] = "realtime backoff"
-                return summary
-            raise HTTPException(status_code=503, detail="Realtime backoff active")
-
-        def _ak_call(func):
-            throttle(scope="akshare_realtime")
-            return func()
-        
-        if is_etf:
-            df = retry_request(lambda: _ak_call(ak.fund_etf_spot_em))
-            row = df[df["代码"] == code]
-        else:
-            df = retry_request(lambda: _ak_call(ak.stock_zh_a_spot_em))
-            row = df[df["代码"] == code]
-
-        if row.empty:
-            raise HTTPException(status_code=404, detail="股票/ETF 未找到")
-
-        r = row.iloc[0]
-        
-        # Handle column name differences
-        if is_etf:
-            record_success(scope)
-            price = _safe_float(r["最新价"] if "最新价" in r else 0)
-            vol_raw = _safe_float(r["成交量"] if "成交量" in r else 0)
-            amt_raw = _safe_float(r["成交额"] if "成交额" in r else 0)
-            multiplier = 100
-            if vol_raw > 0 and amt_raw > 0 and price > 0:
-                ratio = (amt_raw / vol_raw) / price
-                if ratio <= 2:
-                    multiplier = 1
-            payload = {
-                "symbol": symbol,
-                "name": r["名称"],
-                "price": price,
-                "change": _safe_float(r["涨跌额"] if "涨跌额" in r else 0),
-                "changePercent": _safe_float(r["涨跌幅"] if "涨跌幅" in r else 0),
-                "open": _safe_float(r["开盘价"] if "开盘价" in r else 0),
-                "high": _safe_float(r["最高价"] if "最高价" in r else 0),
-                "low": _safe_float(r["最低价"] if "最低价" in r else 0),
-                "volume": vol_raw * multiplier,
-                "amount": amt_raw,
-                "timestamp": int(_now_cn().timestamp() * 1000),
-                "source": "realtime",
-                "stale": False,
-                "api_status": get_status(scope),
-            }
-            _maybe_upsert_symbol(payload)
-            return payload
-        else:
-            record_success(scope)
-            price = _safe_float(r["最新价"] if "最新价" in r else 0)
-            vol_raw = _safe_float(r["成交量"] if "成交量" in r else 0)
-            amt_raw = _safe_float(r["成交额"] if "成交额" in r else 0)
-            multiplier = 100
-            if vol_raw > 0 and amt_raw > 0 and price > 0:
-                ratio = (amt_raw / vol_raw) / price
-                if ratio <= 2:
-                    multiplier = 1
-            payload = {
-                "symbol": symbol,
-                "name": r["名称"],
-                "price": price,
-                "change": _safe_float(r["涨跌额"] if "涨跌额" in r else 0),
-                "changePercent": _safe_float(r["涨跌幅"] if "涨跌幅" in r else 0),
-                "open": _safe_float(r["今开"] if "今开" in r else 0),
-                "high": _safe_float(r["最高"] if "最高" in r else 0),
-                "low": _safe_float(r["最低"] if "最低" in r else 0),
-                "volume": vol_raw * multiplier,
-                "amount": amt_raw,
-                "timestamp": int(_now_cn().timestamp() * 1000),
-                "source": "realtime",
-                "stale": False,
-                "api_status": get_status(scope),
-            }
-            _maybe_upsert_symbol(payload)
-            return payload
+        summary = build_summary_from_intraday() or build_summary_from_daily()
+        if summary:
+            summary["api_status"] = get_status(scope)
+            summary["note"] = "realtime_unavailable"
+            summary["phase"] = phase
+            return summary
+        raise HTTPException(status_code=503, detail="Realtime unavailable")
 
     except HTTPException:
         raise
@@ -1158,6 +1185,12 @@ async def get_realtime(symbol: str):
 async def health_check():
     """健康检查"""
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+
+@app.get("/api/datasource/status")
+async def datasource_status(probe: bool = True):
+    from data_sources import get_status as _get_status
+    return _get_status(probe=probe)
 
 
 if __name__ == "__main__":

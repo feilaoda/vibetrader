@@ -15,10 +15,11 @@ from strategy_defaults import (
     DEFAULT_PARAMS,
     DEFAULT_OPTIMIZATION
 )
-from akshare_guard import should_skip_remote, record_failure, record_success, throttle
+from akshare_guard import should_skip_remote, record_failure, record_success
 from strategy_universe import fetch_symbols_for_strategy
 from strategy_optimizer import optimize_strategy
-import akshare as ak
+from data_sources import DataType
+from data_sources.router import fetch as router_fetch
 
 
 router = APIRouter()
@@ -278,43 +279,28 @@ def get_spot_maps(codes: Set[str]) -> tuple[Dict[str, float], Dict[str, str]]:
         return cached_prices, cached_names
 
     has_data = False
-    try:
-        throttle(scope="akshare_spot")
-        df = ak.stock_zh_a_spot_em()
-        if df is not None and not df.empty:
-            subset = df[df["代码"].isin(codes)]
-            for _, row in subset.iterrows():
-                code = str(row.get("代码", "")).strip()
-                if not code:
-                    continue
-                price_by_code[code] = safe_float(row.get("最新价"))
-                name = row.get("名称")
-                if name:
-                    name_by_code[code] = str(name)
-            if not subset.empty:
-                has_data = True
-    except Exception as e:
-        print(f"[paper] Error fetching stock spot: {e}")
-        record_failure(f"spot_stock_failed: {e}")
-
-    try:
-        throttle(scope="akshare_spot")
-        df = ak.fund_etf_spot_em()
-        if df is not None and not df.empty:
-            subset = df[df["代码"].isin(codes)]
-            for _, row in subset.iterrows():
-                code = str(row.get("代码", "")).strip()
-                if not code:
-                    continue
-                price_by_code[code] = safe_float(row.get("最新价"))
-                name = row.get("名称")
-                if name:
-                    name_by_code[code] = str(name)
-            if not subset.empty:
-                has_data = True
-    except Exception as e:
-        print(f"[paper] Error fetching ETF spot: {e}")
-        record_failure(f"spot_etf_failed: {e}")
+    for code in codes:
+        try:
+            sym = normalize_symbol(code)
+            data, _ = router_fetch(
+                DataType.REALTIME,
+                channels=["tencent", "akshare"],
+                symbol=sym,
+                code=code,
+            )
+        except Exception as e:
+            record_failure(f"spot_realtime_failed: {e}")
+            continue
+        if not data:
+            continue
+        price = safe_float(data.get("price"))
+        if price <= 0:
+            continue
+        price_by_code[code] = price
+        name = data.get("name")
+        if name:
+            name_by_code[code] = str(name)
+        has_data = True
 
     if has_data:
         cache_prices = cache.get("prices", {})
@@ -351,17 +337,16 @@ def get_current_price(symbol: str) -> float:
         if should_skip_remote():
             return 0
         code = format_symbol(symbol)
-        is_etf = code.startswith(("15", "16", "5"))
-        if is_etf:
-            throttle(scope="akshare_spot")
-            df = ak.fund_etf_spot_em()
-            row = df[df["代码"] == code]
-            return safe_float(row.iloc[0]["最新价"]) if not row.empty else 0
-        else:
-            throttle(scope="akshare_spot")
-            df = ak.stock_zh_a_spot_em()
-            row = df[df["代码"] == code]
-            return safe_float(row.iloc[0]["最新价"]) if not row.empty else 0
+        sym = normalize_symbol(symbol)
+        data, _ = router_fetch(
+            DataType.REALTIME,
+            channels=["tencent", "akshare"],
+            symbol=sym,
+            code=code,
+        )
+        if not data:
+            return 0
+        return safe_float(data.get("price"))
     except:
         return 0
 

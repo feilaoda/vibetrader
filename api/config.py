@@ -21,6 +21,19 @@ try:
     LLM_MEMORY_PAIRS_LIMIT = int(os.getenv("LLM_MEMORY_PAIRS_LIMIT", "5"))
 except Exception:
     LLM_MEMORY_PAIRS_LIMIT = 5
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", LLM_API_KEY)
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+OPENAI_CODEX_MODEL = os.getenv("OPENAI_CODEX_MODEL", "codex-mini-latest")
+# Web search config (optional for stock recommendations)
+WEB_SEARCH_PROVIDER = os.getenv("WEB_SEARCH_PROVIDER", "serper")
+WEB_SEARCH_API_KEY = os.getenv("WEB_SEARCH_API_KEY", "")
+WEB_SEARCH_ENDPOINT = os.getenv("WEB_SEARCH_ENDPOINT", "")
+try:
+    WEB_SEARCH_TIMEOUT = int(os.getenv("WEB_SEARCH_TIMEOUT", "8"))
+except Exception:
+    WEB_SEARCH_TIMEOUT = 8
 # GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL")
 # Provider Specific Configs
@@ -40,6 +53,10 @@ PROVIDERS = {
     "claude": {
         "api_key": os.getenv("CLAUDE_API_KEY", LLM_API_KEY),
         "base_url": os.getenv("CLAUDE_BASE_URL", "https://api.anthropic.com/v1"), # Note: anthropic needs different client usually, but if proxied via openai compatible...
+    },
+    "openai": {
+        "api_key": OPENAI_API_KEY,
+        "base_url": OPENAI_BASE_URL,
     }
 }
 
@@ -55,6 +72,11 @@ AVAILABLE_MODELS = [
 
     {"id": "claude-3-5-sonnet-20240620", "name": "Claude 3.5 Sonnet", "provider": "claude"},
 ]
+
+if OPENAI_CHAT_MODEL:
+    AVAILABLE_MODELS.append({"id": OPENAI_CHAT_MODEL, "name": f"OpenAI {OPENAI_CHAT_MODEL}", "provider": "openai"})
+if OPENAI_CODEX_MODEL and OPENAI_CODEX_MODEL != OPENAI_CHAT_MODEL:
+    AVAILABLE_MODELS.append({"id": OPENAI_CODEX_MODEL, "name": f"OpenAI {OPENAI_CODEX_MODEL}", "provider": "openai"})
 
 
 def get_llm_config():

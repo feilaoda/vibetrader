@@ -13,6 +13,7 @@ import Title from "../pane/Title";
 import { Help } from "../pane/Help";
 import { IndicatorView } from "./IndicatorView";
 import { AIAnalysisPanel } from "../pane/AIAnalysisPanel";
+import { SymbolNotesWidget } from "../pane/SymbolNotesWidget";
 import { Context, PineTS } from "pinets";
 import { DefaultTSer } from "../../timeseris/DefaultTSer";
 import { TFrame } from "../../timeseris/TFrame";
@@ -314,18 +315,6 @@ class KlineViewContainer extends Component<Props, State> {
             });
             const data = await res.json();
 
-            // Also sync fundamentals for current symbol
-            try {
-                const fundamentalsRes = await fetch(`${baseUrl}/api/fundamentals/sync`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ symbols: [this.symbol], force: true })
-                });
-                await fundamentalsRes.json();
-            } catch (e) {
-                // Ignore fundamentals sync errors for now
-            }
-
             if (data.success) {
                 if (data.api_status) {
                     this.setState({ apiStatus: data.api_status });
@@ -361,10 +350,12 @@ class KlineViewContainer extends Component<Props, State> {
 
     handleSyncWatchlistDaily = async () => {
         try {
-            this.setState({ toast: { message: "Syncing watchlist daily data...", type: 'info' } });
+            const market = getMarket();
+            const marketLabel = market === 'us' ? 'US' : (market === 'crypto' ? 'Crypto' : 'A-share');
+            this.setState({ toast: { message: `Syncing ${marketLabel} watchlist daily data...`, type: 'info' } });
 
             const baseUrl = import.meta.env.VITE_ASHARE_API_URL || "";
-            const res = await fetch(`${baseUrl}/api/watchlist/sync_daily?market=ashare`, {
+            const res = await fetch(`${baseUrl}/api/watchlist/sync_daily?market=${encodeURIComponent(market)}`, {
                 method: 'POST'
             });
             const data = await res.json();
@@ -377,7 +368,7 @@ class KlineViewContainer extends Component<Props, State> {
                 const ok = data.success_count ?? 0;
                 const fail = data.error_count ?? 0;
                 const message = total === 0
-                    ? "No A-share watchlist items to sync."
+                    ? `No ${marketLabel} watchlist items to sync.`
                     : `Watchlist synced: ${ok}/${total}${fail ? ` (failed ${fail})` : ''}`;
                 this.setState({
                     toast: {
@@ -427,6 +418,9 @@ class KlineViewContainer extends Component<Props, State> {
     }
 
     getSelectedIncicators = () => {
+        if (!this.predefinedPines) {
+            return [];
+        }
         let selectedIndicatorFns = new Map<string, string>();
 
         const selectedIndicatorTagsNow = this.state.selectedIndicatorTags
@@ -435,7 +429,15 @@ class KlineViewContainer extends Component<Props, State> {
 
         } else {
             for (const pineName of selectedIndicatorTagsNow) {
-                selectedIndicatorFns.set(pineName as string, this.predefinedPines.get(pineName as string))
+                const key = String(pineName);
+                let resolvedName = key;
+                if (!this.predefinedPines.has(resolvedName) && key.startsWith("ind-tag-")) {
+                    const idx = Number(key.slice("ind-tag-".length));
+                    if (Number.isFinite(idx) && allIndTags[idx]) {
+                        resolvedName = allIndTags[idx];
+                    }
+                }
+                selectedIndicatorFns.set(resolvedName, this.predefinedPines.get(resolvedName))
             }
         }
 
@@ -1629,6 +1631,45 @@ class KlineViewContainer extends Component<Props, State> {
                         <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
                             <ActionButton onPress={() => {
                                 const baseUrl = import.meta.env.BASE_URL;
+                                const target = baseUrl.endsWith('/') ? `${baseUrl}aitrader` : `${baseUrl}/aitrader`;
+                                window.open(target, '_blank');
+                            }} >
+                                <ChartTrend />
+                            </ActionButton>
+                            <Tooltip>
+                                AITrader Compare
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={() => {
+                                const baseUrl = import.meta.env.BASE_URL;
+                                const target = baseUrl.endsWith('/') ? `${baseUrl}prompt-lab` : `${baseUrl}/prompt-lab`;
+                                window.open(target, '_blank');
+                            }} >
+                                <GridTypeLines />
+                            </ActionButton>
+                            <Tooltip>
+                                Prompt Lab
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={() => {
+                                const baseUrl = import.meta.env.BASE_URL;
+                                const target = baseUrl.endsWith('/') ? `${baseUrl}rule-indicators` : `${baseUrl}/rule-indicators`;
+                                window.open(target, '_blank');
+                            }} >
+                                <LineHeight />
+                            </ActionButton>
+                            <Tooltip>
+                                Rule Indicators
+                            </Tooltip>
+                        </TooltipTrigger>
+
+                        <TooltipTrigger delay={TOOLTIP_DELAY} placement="end">
+                            <ActionButton onPress={() => {
+                                const baseUrl = import.meta.env.BASE_URL;
                                 // Handle case where baseUrl is '/' or '/vibetrader/'
                                 const target = baseUrl.endsWith('/') ? `${baseUrl}paper` : `${baseUrl}/paper`;
                                 window.open(target, '_blank');
@@ -1719,8 +1760,8 @@ class KlineViewContainer extends Component<Props, State> {
                                 selectedKeys={this.state.selectedIndicatorTags}
                                 onSelectionChange={this.setSelectedIndicatorTags}
                             >
-                                {allIndTags.map((tag, n) =>
-                                    <Tag key={"ind-tag-" + n} id={tag}>{tag.toUpperCase()}</Tag>
+                                {allIndTags.map((tag) =>
+                                    <Tag key={tag} id={tag}>{tag.toUpperCase()}</Tag>
                                 )}
                             </TagGroup>
 
@@ -1854,6 +1895,11 @@ class KlineViewContainer extends Component<Props, State> {
                     )}
 
                 </div>
+
+                <SymbolNotesWidget
+                    symbol={this.symbol}
+                    rightOffset={this.state.isAIPanelOpen ? (this.state.aiPanelWidth || 500) + 12 : 12}
+                />
 
                 {this.state.isAIPanelOpen && (
                     <>

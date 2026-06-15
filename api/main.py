@@ -33,6 +33,8 @@ def retry_request(func, max_retries=3, delay=1):
 app = FastAPI(title="VibeTrader A股 API", version="1.0.0")
 
 CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else None
+CN_INDEX_SH_CODES = {"000001", "000016", "000300", "000688", "000852", "000905", "000985"}
+CN_INDEX_SZ_CODES = {"399001", "399005", "399006"}
 
 def _now_cn() -> datetime:
     return datetime.now(CN_TZ) if CN_TZ else datetime.now()
@@ -50,6 +52,7 @@ from crypto import router as crypto_router
 from push import router as push_router
 from screening import router as screening_router
 from aitrader_router import router as aitrader_router
+from kdj_screener import router as kdj_screener_router
 
 app.include_router(actions_router, prefix="/api")
 app.include_router(paper_router, prefix="/api")
@@ -59,6 +62,7 @@ app.include_router(crypto_router, prefix="/api")
 app.include_router(push_router, prefix="/api")
 app.include_router(screening_router, prefix="/api")
 app.include_router(aitrader_router, prefix="/api")
+app.include_router(kdj_screener_router, prefix="/api")
 
 # CORS 配置
 app.add_middleware(
@@ -97,7 +101,16 @@ def format_symbol(symbol: str) -> str:
 
 def get_market_prefix(symbol: str) -> str:
     """判断股票市场前缀 (上海/深圳)"""
+    sym = (symbol or "").upper()
     code = format_symbol(symbol)
+    if sym.endswith(".SH"):
+        return "sh"
+    if sym.endswith(".SZ"):
+        return "sz"
+    if code in CN_INDEX_SH_CODES:
+        return "sh"
+    if code in CN_INDEX_SZ_CODES:
+        return "sz"
     if code.startswith(("6", "9")):
         return "sh"
     elif code.startswith(("0", "2", "3", "1")):
@@ -805,6 +818,18 @@ def symbols_stats_api():
         return {"count": 0, "sh": 0, "sz": 0, "bj": 0}
 
 
+@app.post("/api/symbols/backfill_from_daily_klines")
+def symbols_backfill_from_daily_klines(limit: Optional[int] = Query(None, description="最多反向同步多少个，默认全部")):
+    """Backfill symbols table from locally cached daily kline symbols."""
+    try:
+        from db import backfill_symbols_from_daily_klines
+
+        return {"success": True, "data": backfill_symbols_from_daily_klines(limit=limit)}
+    except Exception as e:
+        print(f"Error backfilling symbols from daily klines: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/screening/runs")
 def list_screening_runs_api(limit: int = Query(20, description="返回数量限制")):
     from db import list_screening_runs
@@ -867,6 +892,7 @@ async def get_realtime(symbol: str):
         from us_indices import is_us_index_symbol, resolve_us_index_ticker, get_us_index_label
         from yahoo import fetch_quote
         from db import upsert_symbol_db
+        from cache import get_klines_with_cache, build_daily_kline_from_minutes, load_cache
 
         def _maybe_upsert_symbol(payload: dict):
             try:
@@ -876,9 +902,78 @@ async def get_realtime(symbol: str):
             except Exception:
                 pass
 
+        recent_daily_cache = {}
+
+        def _get_recent_daily_klines(sym: str, limit: int = 3) -> list[dict]:
+            cache_key = (sym, limit)
+            if cache_key in recent_daily_cache:
+                return recent_daily_cache[cache_key]
+            try:
+                cache_data = load_cache(sym, "daily") or {}
+                klines = cache_data.get("klines") or []
+                recent_daily_cache[cache_key] = list(klines[-limit:]) if klines else []
+            except Exception:
+                recent_daily_cache[cache_key] = []
+            return recent_daily_cache[cache_key]
+
+        def _payload_trade_date(payload: dict) -> str:
+            date_text = str(payload.get("date") or payload.get("tradeDate") or "").strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
+                return date_text
+            ts = payload.get("timestamp")
+            try:
+                if ts:
+                    dt = datetime.fromtimestamp(int(float(ts)) / 1000, CN_TZ) if CN_TZ else datetime.fromtimestamp(int(float(ts)) / 1000)
+                    return dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            return _now_cn().strftime("%Y-%m-%d")
+
+        def _attach_volume_progress(payload: Optional[dict], compare_mode: str = "intraday") -> Optional[dict]:
+            if not payload:
+                return payload
+            try:
+                current_volume = float(payload.get("volume") or 0)
+            except Exception:
+                current_volume = 0.0
+            if current_volume <= 0:
+                return payload
+
+            klines = _get_recent_daily_klines(payload.get("symbol") or symbol, limit=3)
+            if not klines:
+                return payload
+
+            trade_date = _payload_trade_date(payload)
+            previous_volume = 0.0
+            for row in reversed(klines):
+                row_date = str(row.get("date") or "").strip()
+                if not row_date:
+                    continue
+                if row_date < trade_date:
+                    try:
+                        previous_volume = float(row.get("volume") or 0)
+                    except Exception:
+                        previous_volume = 0.0
+                    break
+
+            if previous_volume <= 0 and compare_mode == "intraday":
+                try:
+                    fallback_row = klines[-1]
+                    fallback_date = str(fallback_row.get("date") or "").strip()
+                    if fallback_date and fallback_date != trade_date:
+                        previous_volume = float(fallback_row.get("volume") or 0)
+                except Exception:
+                    previous_volume = 0.0
+
+            if previous_volume <= 0:
+                return payload
+
+            payload["previousVolume"] = previous_volume
+            payload["volumeVsPreviousPct"] = current_volume / previous_volume * 100
+            return payload
+
         def _build_us_summary_from_daily(sym: str, fallback_name: str = "") -> Optional[dict]:
             try:
-                from cache import get_klines_with_cache
                 klines, src = get_klines_with_cache(
                     symbol=sym,
                     period="daily",
@@ -931,6 +1026,7 @@ async def get_realtime(symbol: str):
             if not quote:
                 summary = _build_us_summary_from_daily(symbol, get_us_index_label(ticker) or ticker)
                 if summary:
+                    summary = _attach_volume_progress(summary, compare_mode="daily")
                     _maybe_upsert_symbol(summary)
                     return summary
                 payload = {
@@ -949,6 +1045,7 @@ async def get_realtime(symbol: str):
                     "stale": True,
                     "error": "yahoo_quote_failed"
                 }
+                payload = _attach_volume_progress(payload, compare_mode="daily")
                 _maybe_upsert_symbol(payload)
                 return payload
             ts = quote.get("time")
@@ -971,6 +1068,7 @@ async def get_realtime(symbol: str):
                 "source": "yahoo",
                 "stale": False
             }
+            payload = _attach_volume_progress(payload, compare_mode="intraday")
             _maybe_upsert_symbol(payload)
             return payload
 
@@ -981,6 +1079,7 @@ async def get_realtime(symbol: str):
             if not quote:
                 summary = _build_us_summary_from_daily(symbol, ticker)
                 if summary:
+                    summary = _attach_volume_progress(summary, compare_mode="daily")
                     _maybe_upsert_symbol(summary)
                     return summary
                 payload = {
@@ -999,6 +1098,7 @@ async def get_realtime(symbol: str):
                     "stale": True,
                     "error": "yahoo_quote_failed"
                 }
+                payload = _attach_volume_progress(payload, compare_mode="daily")
                 _maybe_upsert_symbol(payload)
                 return payload
 
@@ -1023,6 +1123,7 @@ async def get_realtime(symbol: str):
                 "source": "yahoo",
                 "stale": False
             }
+            payload = _attach_volume_progress(payload, compare_mode="intraday")
             _maybe_upsert_symbol(payload)
             return payload
 
@@ -1031,7 +1132,6 @@ async def get_realtime(symbol: str):
         from data_sources import DataType
         from data_sources.router import fetch as router_fetch
         from akshare_guard import get_status
-        from cache import get_klines_with_cache, build_daily_kline_from_minutes
         from trading_time import is_trading_day, now_cn
         from datetime import time as dtime
 
@@ -1147,9 +1247,13 @@ async def get_realtime(symbol: str):
                     summary["note"] = f"{phase}，使用最近交易日行情"
                     summary["stale"] = True
                     summary["phase"] = phase
+                    summary = _attach_volume_progress(summary, compare_mode="daily")
                     return summary
                 data["note"] = f"{phase}，行情可能为昨收"
                 data["stale"] = True
+                data = _attach_volume_progress(data, compare_mode="daily")
+            else:
+                data = _attach_volume_progress(data, compare_mode="intraday")
             _maybe_upsert_symbol(data)
             return data
 
@@ -1158,6 +1262,8 @@ async def get_realtime(symbol: str):
             summary["api_status"] = get_status(scope)
             summary["note"] = "realtime_unavailable"
             summary["phase"] = phase
+            compare_mode = "daily" if summary.get("source") == "daily_summary" else "intraday"
+            summary = _attach_volume_progress(summary, compare_mode=compare_mode)
             return summary
         raise HTTPException(status_code=503, detail="Realtime unavailable")
 
@@ -1174,6 +1280,8 @@ async def get_realtime(symbol: str):
         if summary:
             summary["api_status"] = get_status(scope)
             summary["error"] = f"{type(e).__name__}: {e}"
+            compare_mode = "daily" if summary.get("source") == "daily_summary" else "intraday"
+            summary = _attach_volume_progress(summary, compare_mode=compare_mode)
             return summary
         import traceback
         print("[realtime] Error fetching realtime data")

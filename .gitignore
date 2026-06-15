@@ -31,3 +31,4 @@ __datacache__
 *.duckdb
 *.duckdb.wal
 .codex_last_message.txt
+target

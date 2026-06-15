@@ -643,6 +643,7 @@ class LLMService:
             if memory is not None and last_summary_id:
                 history = [msg for msg in history if msg.id > last_summary_id]
 
+        pending_history_summary: Optional[Dict[str, object]] = None
         if ENABLE_MEMORY and history and len(history) >= effective_summary_min:
             last_id = history[-1].id
             if not summary or (last_summary_id and last_id - last_summary_id >= effective_summary_step) or (not last_summary_id and last_id >= effective_summary_step):
@@ -660,13 +661,13 @@ class LLMService:
                     })
                 if len(new_msgs) > 20:
                     new_msgs = new_msgs[-20:]
-                updated = self._summarize_memory(client, target_model, symbol, summary or "", new_msgs, include_assistant=MEMORY_INCLUDE_ASSISTANT)
-                if updated:
-                    summary = updated
-                    if SAVE_HISTORY:
-                        db.save_memory(symbol, summary, last_id)
-                    if debug_ctx:
-                        print(f"[LLM][Memory] summary_updated=history len={len(summary)} last_id={last_id}")
+                # Defer memory consolidation until after the main answer streams so chat latency
+                # is not blocked by an extra LLM round-trip before first token.
+                pending_history_summary = {
+                    "existing_summary": summary or "",
+                    "new_messages": new_msgs,
+                    "last_id": last_id,
+                }
 
         context_history = history
         if history and not HISTORY_INCLUDE_ASSISTANT:
@@ -820,6 +821,28 @@ class LLMService:
                 # 5. Save Assistant Response to DB
                 if full_response and SAVE_HISTORY:
                     db.add_message(symbol, "assistant", full_response, target_model)
+                    if pending_history_summary:
+                        try:
+                            updated = self._summarize_memory(
+                                client,
+                                target_model,
+                                symbol,
+                                str(pending_history_summary.get("existing_summary") or ""),
+                                list(pending_history_summary.get("new_messages") or []),
+                                include_assistant=MEMORY_INCLUDE_ASSISTANT
+                            )
+                            if not updated:
+                                updated = self._fallback_memory_summary(
+                                    str(pending_history_summary.get("existing_summary") or ""),
+                                    list(pending_history_summary.get("new_messages") or [])
+                                )
+                            if updated:
+                                summary = updated
+                                db.save_memory(symbol, updated, int(pending_history_summary.get("last_id") or 0))
+                                if debug_ctx:
+                                    print(f"[LLM][Memory] summary_updated=history len={len(updated)} last_id={int(pending_history_summary.get('last_id') or 0)}")
+                        except Exception:
+                            pass
                     if ENABLE_MEMORY and MEMORY_INCLUDE_ASSISTANT:
                         try:
                             memory = db.get_memory(symbol) if symbol else None

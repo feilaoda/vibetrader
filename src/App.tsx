@@ -5,6 +5,7 @@ import '@react-spectrum/s2/page.css';
 import { useState } from 'react';
 
 import HomePage from './lib/layouts/HomePage'
+import StealthPage from './lib/layouts/StealthPage'
 import { ActionPage } from './lib/actions/ActionPage';
 import { PaperTradingPage } from './lib/paper/PaperTradingPage';
 import { IndustryTemplatesPage } from './lib/industry/IndustryTemplatesPage';
@@ -60,6 +61,7 @@ function App() {
                 <Route path="/vibetrader" element={
                     <HomePage toggleColorTheme={toggleColorTheme} colorTheme={colorTheme as 'light' | 'dark'} />
                 } />
+                <Route path="/desk" element={<StealthPage />} />
                 <Route path="/actions" element={
                     <ActionPage onBack={() => navigate('/')} />
                 } />

@@ -333,6 +333,24 @@ def init_db():
                 PRIMARY KEY(symbol, period)
             );
 
+            CREATE TABLE IF NOT EXISTS technical_indicators (
+                symbol VARCHAR,
+                date VARCHAR,
+                close DOUBLE,
+                ma30 DOUBLE,
+                ma60 DOUBLE,
+                kdj_period INTEGER,
+                daily_k DOUBLE,
+                daily_d DOUBLE,
+                daily_j DOUBLE,
+                weekly_k DOUBLE,
+                weekly_d DOUBLE,
+                weekly_j DOUBLE,
+                source VARCHAR,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, date)
+            );
+
             CREATE TABLE IF NOT EXISTS symbol_industry (
                 symbol VARCHAR PRIMARY KEY,
                 industry VARCHAR,
@@ -663,6 +681,26 @@ def init_db():
                 source VARCHAR(32),
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(symbol, period)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS technical_indicators (
+                symbol VARCHAR(32),
+                date VARCHAR(10),
+                close DOUBLE,
+                ma30 DOUBLE,
+                ma60 DOUBLE,
+                kdj_period INT,
+                daily_k DOUBLE,
+                daily_d DOUBLE,
+                daily_j DOUBLE,
+                weekly_k DOUBLE,
+                weekly_d DOUBLE,
+                weekly_j DOUBLE,
+                source VARCHAR(32),
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(symbol, date),
+                INDEX idx_technical_indicators_date (date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
             """
@@ -1640,6 +1678,49 @@ def upsert_symbol_db(symbol: str, code: Optional[str] = None, name: Optional[str
         conn.close()
 
 
+def backfill_symbols_from_daily_klines(limit: Optional[int] = None) -> dict:
+    """Backfill symbols table from locally stored daily kline symbols."""
+    conn = get_connection()
+    try:
+        sql = (
+            "SELECT k.symbol, COALESCE(MAX(s.name), '') AS name "
+            "FROM daily_klines k LEFT JOIN symbols s ON k.symbol = s.symbol "
+            "WHERE k.period = ? GROUP BY k.symbol ORDER BY k.symbol ASC"
+        )
+        rows = conn.execute(sql, ("daily",)).fetchall()
+    finally:
+        conn.close()
+
+    total = len(rows or [])
+    inserted = 0
+    skipped = 0
+    for row in rows or []:
+        if limit and inserted >= int(limit):
+            break
+        sym = (row[0] or "").upper().strip()
+        if not sym:
+            skipped += 1
+            continue
+        if "." in sym:
+            code = sym.split(".")[0]
+        else:
+            code = sym
+        if sym.endswith(".US"):
+            market = "US"
+        elif sym.endswith(".SH"):
+            market = "SH"
+        elif sym.endswith(".SZ"):
+            market = "SZ"
+        else:
+            market = "BJ"
+        sym_type = "etf" if market in ("SH", "SZ") and code.startswith(("5", "15", "16")) else "stock"
+        if upsert_symbol_db(sym, code=code, name=row[1] or "", market=market, sym_type=sym_type):
+            inserted += 1
+        else:
+            skipped += 1
+    return {"source_total": total, "upserted": inserted, "skipped": skipped}
+
+
 def _normalize_kline_period(period: str) -> str:
     text = (period or "daily").strip().lower()
     if text in ("1d", "d"):
@@ -2372,6 +2453,111 @@ def save_daily_klines_cache(symbol: str, period: str, data: Dict[str, Any]) -> b
             pass
         print(f"[DB] Error saving daily klines cache {sym}/{per}: {e}")
         return False
+    finally:
+        conn.close()
+
+
+def save_technical_indicators(symbol: str, rows: List[Dict[str, Any]]) -> bool:
+    sym = (symbol or "").upper().strip()
+    if not sym or not rows:
+        return False
+    payload = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        date_iso = _normalize_ymd(row.get("date"))
+        if not date_iso:
+            continue
+        payload.append((
+            sym,
+            date_iso,
+            _safe_float_value(row.get("close")),
+            row.get("ma30"),
+            row.get("ma60"),
+            _safe_int_value(row.get("kdj_period")) or 9,
+            row.get("daily_k"),
+            row.get("daily_d"),
+            row.get("daily_j"),
+            row.get("weekly_k"),
+            row.get("weekly_d"),
+            row.get("weekly_j"),
+            row.get("source") or "computed",
+        ))
+    if not payload:
+        return False
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM technical_indicators WHERE symbol = ?", (sym,))
+        conn.executemany(
+            "INSERT INTO technical_indicators "
+            "(symbol, date, close, ma30, ma60, kdj_period, daily_k, daily_d, daily_j, weekly_k, weekly_d, weekly_j, source, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            payload
+        )
+        conn.execute("COMMIT")
+        return True
+    except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        print(f"[DB] Error saving technical indicators {sym}: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def refresh_technical_indicators(symbol: str, klines: Optional[List[Dict[str, Any]]] = None) -> bool:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return False
+    if klines is None:
+        cache = get_daily_klines_cache(sym, "daily")
+        klines = cache.get("klines") if isinstance(cache, dict) else []
+    if not klines:
+        return False
+    try:
+        from technical_indicators import build_indicator_rows
+
+        rows = build_indicator_rows(sym, klines, kdj_period=9)
+        return save_technical_indicators(sym, rows)
+    except Exception as e:
+        print(f"[DB] Error computing technical indicators {sym}: {e}")
+        return False
+
+
+def get_latest_technical_indicator(symbol: str) -> Optional[Dict[str, Any]]:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return None
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT symbol, date, close, ma30, ma60, kdj_period, daily_k, daily_d, daily_j, weekly_k, weekly_d, weekly_j, source "
+            "FROM technical_indicators WHERE symbol = ? ORDER BY date DESC LIMIT 1",
+            (sym,)
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "symbol": row[0],
+            "date": row[1],
+            "close": _safe_float_value(row[2]),
+            "ma30": _safe_float_value(row[3]) if row[3] is not None else None,
+            "ma60": _safe_float_value(row[4]) if row[4] is not None else None,
+            "kdj_period": _safe_int_value(row[5]),
+            "daily_k": _safe_float_value(row[6]) if row[6] is not None else None,
+            "daily_d": _safe_float_value(row[7]) if row[7] is not None else None,
+            "daily_j": _safe_float_value(row[8]) if row[8] is not None else None,
+            "weekly_k": _safe_float_value(row[9]) if row[9] is not None else None,
+            "weekly_d": _safe_float_value(row[10]) if row[10] is not None else None,
+            "weekly_j": _safe_float_value(row[11]) if row[11] is not None else None,
+            "source": row[12],
+        }
+    except Exception as e:
+        print(f"[DB] Error loading technical indicators {sym}: {e}")
+        return None
     finally:
         conn.close()
 

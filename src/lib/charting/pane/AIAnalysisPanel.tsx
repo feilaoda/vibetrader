@@ -166,6 +166,8 @@ const DEFAULT_PUSH_SETTINGS: PushSettings = {
     token: ""
 };
 
+const AUTO_EVAL_ENABLED_KEY = "vibetrader.ai.auto.enabled";
+
 const MARKET_BROAD_INDEX_OPTIONS = [
     { value: "000985.SH", label: "中证全指 (000985.SH)" },
     { value: "000300.SH", label: "沪深300 (000300.SH)" },
@@ -339,6 +341,8 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         return modelId;
     };
     const [pushSymbolEnabled, setPushSymbolEnabled] = useState(false);
+    const [pushSettingsLoaded, setPushSettingsLoaded] = useState(false);
+    const [pushSymbolLoaded, setPushSymbolLoaded] = useState(false);
     const [pushSettingsError, setPushSettingsError] = useState("");
     const [pushSettingsSaving, setPushSettingsSaving] = useState(false);
     const [input, setInput] = useState("");
@@ -349,6 +353,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const [autoLoading, setAutoLoading] = useState(false);
     const [autoError, setAutoError] = useState("");
     const [autoLastRun, setAutoLastRun] = useState<number | null>(null);
+    const [autoPushStatus, setAutoPushStatus] = useState("");
     const [memoryClearing, setMemoryClearing] = useState(false);
     const [memoryNotice, setMemoryNotice] = useState("");
     const autoRunningRef = useRef(false);
@@ -484,12 +489,25 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         return context;
     };
 
+    const getTimeoutSignal = (timeoutMs: number): AbortSignal | undefined => {
+        const abortCtor = AbortSignal as typeof AbortSignal & { timeout?: (ms: number) => AbortSignal };
+        if (typeof abortCtor.timeout === "function") {
+            return abortCtor.timeout(timeoutMs);
+        }
+        return undefined;
+    };
+
+    const fetchJsonWithTimeout = async (url: string, timeoutMs = 3000) => {
+        const signal = getTimeoutSignal(timeoutMs);
+        const res = await fetch(url, signal ? { signal } : undefined);
+        if (!res.ok) return null;
+        return res.json();
+    };
+
     const fetchIndustryIndicatorContext = async () => {
         if (!industryProfile?.enabled) return "";
         try {
-            const res = await fetch(`${API_BASE_URL}/api/industry/context?symbol=${encodeURIComponent(props.symbol)}`);
-            if (!res.ok) return "";
-            const data = await res.json();
+            const data = await fetchJsonWithTimeout(`${API_BASE_URL}/api/industry/context?symbol=${encodeURIComponent(props.symbol)}`, 2200);
             const ctx = data?.data?.context;
             if (!ctx || typeof ctx !== "string") return "";
             return ctx.trim();
@@ -568,7 +586,29 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         }
     };
 
+    useEffect(() => {
+        try {
+            const raw = localStorage.getItem(AUTO_EVAL_ENABLED_KEY);
+            if (raw !== null) {
+                setAutoEnabled(raw === "1");
+            }
+        } catch (e) {
+            // ignore
+        }
+    }, []);
+
+    const persistAutoEnabled = (enabled: boolean) => {
+        setAutoEnabled(enabled);
+        setAutoError("");
+        try {
+            localStorage.setItem(AUTO_EVAL_ENABLED_KEY, enabled ? "1" : "0");
+        } catch (e) {
+            // ignore
+        }
+    };
+
     const loadPushSettings = async () => {
+        setPushSettingsLoaded(false);
         try {
             const res = await fetch(`${API_BASE_URL}/api/push/settings`);
             if (!res.ok) return;
@@ -583,11 +623,18 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             });
         } catch (e) {
             // ignore
+        } finally {
+            setPushSettingsLoaded(true);
         }
     };
 
     const loadPushSymbol = async (symbol: string) => {
-        if (!symbol) return;
+        if (!symbol) {
+            setPushSymbolLoaded(true);
+            setPushSymbolEnabled(false);
+            return;
+        }
+        setPushSymbolLoaded(false);
         try {
             const res = await fetch(`${API_BASE_URL}/api/push/symbol?symbol=${encodeURIComponent(symbol)}`);
             if (!res.ok) return;
@@ -595,10 +642,14 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             setPushSymbolEnabled(!!data?.data?.enabled);
         } catch (e) {
             // ignore
+        } finally {
+            setPushSymbolLoaded(true);
         }
     };
 
-    const savePushSettings = async () => {
+    const savePushSettings = async (override?: Partial<PushSettings>) => {
+        const nextSettings = { ...pushSettings, ...(override || {}) };
+        setPushSettings(nextSettings);
         setPushSettingsSaving(true);
         setPushSettingsError("");
         try {
@@ -606,11 +657,11 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    enabled: pushSettings.enabled,
-                    interval_minutes: pushSettings.intervalMinutes,
-                    auto_eval_interval_minutes: pushSettings.autoEvalIntervalMinutes,
-                    chat_id: pushSettings.chatId,
-                    token: pushSettings.token
+                    enabled: nextSettings.enabled,
+                    interval_minutes: nextSettings.intervalMinutes,
+                    auto_eval_interval_minutes: nextSettings.autoEvalIntervalMinutes,
+                    chat_id: nextSettings.chatId,
+                    token: nextSettings.token
                 })
             });
             if (!res.ok) {
@@ -625,12 +676,14 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         }
     };
 
-    const savePushSymbol = async () => {
+    const savePushSymbol = async (overrideEnabled?: boolean) => {
         if (!props.symbol) return;
+        const nextEnabled = typeof overrideEnabled === "boolean" ? overrideEnabled : pushSymbolEnabled;
+        setPushSymbolEnabled(nextEnabled);
         setPushSettingsSaving(true);
         setPushSettingsError("");
         try {
-            const res = await fetch(`${API_BASE_URL}/api/push/symbol?symbol=${encodeURIComponent(props.symbol)}&enabled=${pushSymbolEnabled ? "true" : "false"}`, {
+            const res = await fetch(`${API_BASE_URL}/api/push/symbol?symbol=${encodeURIComponent(props.symbol)}&enabled=${nextEnabled ? "true" : "false"}`, {
                 method: "PUT"
             });
             if (!res.ok) {
@@ -985,6 +1038,7 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             setAutoLoading(true);
             setAutoError("");
             setAutoLastRun(Date.now());
+            setAutoPushStatus("");
         }
 
         const userContent = displayUserContent ?? userInput;
@@ -1147,22 +1201,38 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
             } else {
                 setAutoLoading(false);
             }
-            if (runMode === "auto" && !wasAborted && pushSettings.enabled && pushSymbolEnabled && aiContent.trim()) {
-                const summary = pushSummary ? `${pushSummary}` : "";
-                const formatted = formatPushText(aiContent.trim());
-                const trimmed = formatted.slice(0, 1200);
-                const text = [
-                    symbol,
-                    summary,
-                    `AI(${selectedModel || "model"}): ${trimmed}`
-                ].filter(Boolean).join("\n");
-                fetch(`${API_BASE_URL}/api/push/notify`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ symbol, text })
-                }).catch(() => {
-                    // ignore
-                });
+            if (runMode === "auto" && !wasAborted) {
+                if (!pushSettings.enabled) {
+                    setAutoPushStatus("未推送：全局推送关闭");
+                } else if (!pushSymbolEnabled) {
+                    setAutoPushStatus("未推送：当前股票推送关闭");
+                } else if (!aiContent.trim()) {
+                    setAutoPushStatus("未推送：AI结果为空");
+                } else {
+                    const summary = pushSummary ? `${pushSummary}` : "";
+                    const formatted = formatPushText(aiContent.trim());
+                    const trimmed = formatted.slice(0, 1200);
+                    const text = [
+                        symbol,
+                        summary,
+                        `AI(${selectedModel || "model"}): ${trimmed}`
+                    ].filter(Boolean).join("\n");
+                    try {
+                        const resp = await fetch(`${API_BASE_URL}/api/push/notify`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ symbol, text })
+                        });
+                        if (!resp.ok) {
+                            const detail = await resp.json().catch(() => ({}));
+                            setAutoPushStatus(`推送失败：${detail?.detail || resp.statusText || resp.status}`);
+                        } else {
+                            setAutoPushStatus("已自动推送");
+                        }
+                    } catch (e: any) {
+                        setAutoPushStatus(`推送失败：${e?.message || "network_error"}`);
+                    }
+                }
             }
             if (!wasAborted && analysisMode !== 'temporary' && contextSettings.saveHistory && !disableHistory) {
                 try {
@@ -1196,57 +1266,64 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
         let realtimeSummary = '';
         const wantDaily = analysisMode === 'regression'
             || (contextSettings.chatUseDaily && (analysisMode === 'assistant' || analysisMode === 'chat' || analysisMode === 'temporary'));
-        if (wantDaily) {
-            try {
-                const limit = analysisMode === 'assistant'
-                    ? contextSettings.klineRowsAssistant
-                    : contextSettings.klineRowsChat;
-                const endParam = regressionYmd ? `&end_date=${regressionYmd}` : "";
-                const dailyRes = await fetch(`${API_BASE_URL}/api/klines/${encodeURIComponent(props.symbol)}?period=1d&limit=${limit}${endParam}`);
-                if (dailyRes.ok) {
-                    const dailyJson = await dailyRes.json();
-                    let dailyKlines = Array.isArray(dailyJson?.data) ? dailyJson.data : [];
-                    if (regressionYmd) {
-                        dailyKlines = filterKlinesByEndDate(dailyKlines, regressionYmd);
-                    }
-                    if (dailyKlines.length > 0) {
-                        klinesToUse = dailyKlines;
-                    }
-                }
-            } catch (e) {
-                // fallback to current klines
-            }
-        }
-        if (regressionYmd) {
-            klinesToUse = filterKlinesByEndDate(klinesToUse as any[], regressionYmd);
-        }
-        if (analysisMode === 'chat' || analysisMode === 'temporary') {
-            try {
-                const realtimeRes = await fetch(`${API_BASE_URL}/api/realtime/${encodeURIComponent(props.symbol)}`);
-                if (realtimeRes.ok) {
-                    const rt = await realtimeRes.json();
-                    if (rt && rt?.price !== undefined) {
-                        if (rt?.stale && !rt?.note) {
-                            realtimeSummary = '当前行情获取失败或非当日数据。';
-                        } else {
-                            realtimeSummary = buildRealtimeSummary(rt);
-                        }
-                    } else {
-                        realtimeSummary = '当前行情获取失败或非当日数据。';
-                    }
-                } else {
-                    realtimeSummary = '当前行情获取失败。';
-                }
-            } catch (e) {
-                realtimeSummary = '当前行情获取失败。';
-            }
-        }
-
         const useIndustryContext = analysisMode !== 'regression';
+        const dailyPromise = (async () => {
+            let dailyKlines = klinesToUse;
+            if (wantDaily) {
+                try {
+                    const limit = analysisMode === 'assistant'
+                        ? contextSettings.klineRowsAssistant
+                        : contextSettings.klineRowsChat;
+                    const endParam = regressionYmd ? `&end_date=${regressionYmd}` : "";
+                    const dailyJson = await fetchJsonWithTimeout(
+                        `${API_BASE_URL}/api/klines/${encodeURIComponent(props.symbol)}?period=1d&limit=${limit}${endParam}`,
+                        2500
+                    );
+                    const rows = Array.isArray(dailyJson?.data) ? dailyJson.data : [];
+                    if (rows.length > 0) {
+                        dailyKlines = rows;
+                    }
+                } catch (e) {
+                    // fallback to current klines
+                }
+            }
+            if (regressionYmd) {
+                dailyKlines = filterKlinesByEndDate(dailyKlines as any[], regressionYmd);
+            }
+            return dailyKlines;
+        })();
+
+        const realtimePromise = (async () => {
+            if (analysisMode !== 'chat' && analysisMode !== 'temporary') {
+                return '';
+            }
+            try {
+                const rt = await fetchJsonWithTimeout(`${API_BASE_URL}/api/realtime/${encodeURIComponent(props.symbol)}`, 2200);
+                if (rt && rt?.price !== undefined) {
+                    if (rt?.stale && !rt?.note) {
+                        return '当前行情获取失败或非当日数据。';
+                    }
+                    return buildRealtimeSummary(rt);
+                }
+                return '当前行情获取失败或非当日数据。';
+            } catch (e) {
+                return '当前行情获取失败。';
+            }
+        })();
+
+        const indicatorContextPromise = useIndustryContext && industryProfile?.enabled
+            ? fetchIndustryIndicatorContext()
+            : Promise.resolve("");
+
+        const [resolvedKlines, resolvedRealtimeSummary, indicatorContext] = await Promise.all([
+            dailyPromise,
+            realtimePromise,
+            indicatorContextPromise
+        ]);
+        klinesToUse = resolvedKlines;
+        realtimeSummary = resolvedRealtimeSummary;
+
         const industryContext = useIndustryContext ? buildIndustryTransient(industryProfile) : "";
-        const indicatorContext = useIndustryContext && industryProfile?.enabled
-            ? await fetchIndustryIndicatorContext()
-            : "";
         const transientParts = [industryContext, indicatorContext].filter(Boolean);
         const transientContext = transientParts.join("\n");
         const baseUserInput = realtimeSummary ? `${userInput}\n\n${realtimeSummary}` : userInput;
@@ -1549,16 +1626,17 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     useEffect(() => {
         if (!props.isOpen) return;
         if (!autoEnabled) return;
+        if (!pushSettingsLoaded || !pushSymbolLoaded) return;
         runAutoEvaluation({ allowAfterHours: true });
         const intervalMinutes = Math.max(1, Number(pushSettings.autoEvalIntervalMinutes || 5));
         const intervalMs = intervalMinutes * 60 * 1000;
         const interval = setInterval(() => {
             if (!autoRunningRef.current) {
-                runAutoEvaluation();
+                runAutoEvaluation({ allowAfterHours: true });
             }
         }, intervalMs);
         return () => clearInterval(interval);
-    }, [autoEnabled, props.isOpen, props.symbol, selectedModel, pushSettings.autoEvalIntervalMinutes]);
+    }, [autoEnabled, props.isOpen, props.symbol, selectedModel, pushSettings.autoEvalIntervalMinutes, pushSettingsLoaded, pushSymbolLoaded]);
 
     const [isExtracting, setIsExtracting] = useState(false);
 
@@ -1623,6 +1701,31 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
     const copyToClipboard = useCallback((text: string) => {
         navigator.clipboard.writeText(text);
     }, []);
+
+    const autoIntervalMinutes = Math.max(1, Number(pushSettings.autoEvalIntervalMinutes || 5));
+    const autoStatusText = (() => {
+        if (autoLoading) return "自动评估中...";
+        if (!pushSettingsLoaded || !pushSymbolLoaded) return "自动设置加载中...";
+        const parts: string[] = [];
+        if (autoLastRun) {
+            parts.push(`上次 ${new Date(autoLastRun).toLocaleTimeString()}`);
+        } else if (autoEnabled) {
+            parts.push("等待首次自动评估");
+        }
+        if (autoError) {
+            parts.push(autoError);
+        }
+        if (autoPushStatus) {
+            parts.push(autoPushStatus);
+        } else if (pushSettings.enabled && pushSymbolEnabled) {
+            parts.push("自动推送已启用");
+        } else if (!pushSettings.enabled) {
+            parts.push("全局推送关闭");
+        } else {
+            parts.push("当前股票推送关闭");
+        }
+        return parts.join(" · ");
+    })();
 
     if (!props.isOpen) return null;
 
@@ -1838,10 +1941,10 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                 <input
                                     type="checkbox"
                                     checked={autoEnabled}
-                                    onChange={(e) => setAutoEnabled(e.target.checked)}
+                                    onChange={(e) => persistAutoEnabled(e.target.checked)}
                                     disabled={!config?.configured}
                                 />
-                                自动评估(5m)
+                                自动评估({autoIntervalMinutes}m)
                             </label>
                             <Button
                                 onPress={() => setSettingsOpen(true)}
@@ -1893,6 +1996,9 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                 <span>Send</span> <Send />
                             </Button>
                         </div>
+                    </div>
+                    <div style={{ fontSize: '10px', color: autoError ? '#c00' : '#666' }}>
+                        {autoStatusText}
                     </div>
                 </div>
             </div>
@@ -2276,7 +2382,9 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                     <input
                                         type="checkbox"
                                         checked={pushSettings.enabled}
-                                        onChange={(e) => setPushSettings({ ...pushSettings, enabled: e.target.checked })}
+                                        onChange={(e) => {
+                                            void savePushSettings({ enabled: e.target.checked });
+                                        }}
                                     /> 启用推送
                                 </label>
                                 <label style={{ fontSize: '12px' }}>
@@ -2319,7 +2427,9 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                 </label>
                                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                                     <Button
-                                        onPress={savePushSettings}
+                                        onPress={() => {
+                                            void savePushSettings();
+                                        }}
                                         style={{ background: '#f3f3f3', border: '1px solid #ddd', padding: '6px 10px', borderRadius: '4px' }}
                                         isDisabled={pushSettingsSaving}
                                     >
@@ -2333,11 +2443,15 @@ export function AIAnalysisPanel(props: AIAnalysisPanelProps) {
                                     <input
                                         type="checkbox"
                                         checked={pushSymbolEnabled}
-                                        onChange={(e) => setPushSymbolEnabled(e.target.checked)}
+                                        onChange={(e) => {
+                                            void savePushSymbol(e.target.checked);
+                                        }}
                                     /> 启用当前股票推送
                                 </label>
                                 <Button
-                                    onPress={savePushSymbol}
+                                    onPress={() => {
+                                        void savePushSymbol();
+                                    }}
                                     style={{ background: '#f3f3f3', border: '1px solid #ddd', padding: '6px 10px', borderRadius: '4px', alignSelf: 'flex-start' }}
                                     isDisabled={pushSettingsSaving || !props.symbol}
                                 >

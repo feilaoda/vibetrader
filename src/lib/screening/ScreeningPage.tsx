@@ -21,7 +21,7 @@ type ScreeningResult = {
     score: number;
     reason: string;
     model_id?: string;
-    raw?: Record<string, any>;
+    raw?: Record<string, unknown>;
     rule_action?: string;
     rule_stage?: string;
     rule_rr?: number;
@@ -59,6 +59,48 @@ type ScreeningStats = {
     avg_rule_score?: number;
 };
 
+type KdjValue = {
+    k?: number;
+    d?: number;
+    j?: number;
+    rsv?: number;
+};
+
+type KdjScreenResult = {
+    symbol: string;
+    name?: string;
+    matched?: boolean;
+    date?: string;
+    close?: number;
+    ma_window?: number | null;
+    ma?: number | null;
+    daily_kdj?: KdjValue;
+    weekly_kdj?: KdjValue;
+    source?: string;
+    reason?: string;
+};
+
+type KdjScreenResponse = {
+    total?: number;
+    matched?: number;
+    data?: KdjScreenResult[];
+    error_count?: number;
+};
+
+type KdjPresetId = "pullback" | "oversold" | "custom";
+
+type IndicatorEntryRaw = {
+    status?: string;
+    value?: unknown;
+    reason?: string;
+    weight?: number;
+    score_contribution?: number;
+};
+
+const asRecord = (value: unknown): Record<string, unknown> | null => {
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+};
+
 export function ScreeningPage() {
     const [runs, setRuns] = useState<ScreeningRun[]>([]);
     const [selectedRun, setSelectedRun] = useState<number | null>(null);
@@ -89,6 +131,23 @@ export function ScreeningPage() {
     const [indicatorFilterStatus, setIndicatorFilterStatus] = useState("all");
     const [indicatorOnlyAbnormal, setIndicatorOnlyAbnormal] = useState(false);
     const [onlyIndicatorAbnormalRows, setOnlyIndicatorAbnormalRows] = useState(false);
+    const [kdjUniverse, setKdjUniverse] = useState("watchlist");
+    const [kdjMarket, setKdjMarket] = useState("ashare");
+    const [kdjPreset, setKdjPreset] = useState<KdjPresetId>("pullback");
+    const [kdjDailyMin, setKdjDailyMin] = useState("");
+    const [kdjDailyMax, setKdjDailyMax] = useState("20");
+    const [kdjWeeklyMin, setKdjWeeklyMin] = useState("50");
+    const [kdjWeeklyMax, setKdjWeeklyMax] = useState("");
+    const [kdjMaWindow, setKdjMaWindow] = useState("60");
+    const [kdjScope, setKdjScope] = useState("both");
+    const [kdjLimit, setKdjLimit] = useState("");
+    const [kdjRefreshMissing, setKdjRefreshMissing] = useState(false);
+    const [kdjIncludeAll, setKdjIncludeAll] = useState(false);
+    const [kdjLoading, setKdjLoading] = useState(false);
+    const [kdjRuleLoading, setKdjRuleLoading] = useState(false);
+    const [kdjMsg, setKdjMsg] = useState("");
+    const [kdjResults, setKdjResults] = useState<KdjScreenResult[]>([]);
+    const [kdjSummary, setKdjSummary] = useState<KdjScreenResponse | null>(null);
     const appBaseUrl = (import.meta as unknown as { env: Record<string, string> }).env?.BASE_URL || "/";
 
     const detectMarket = (symbol: string) => {
@@ -277,14 +336,22 @@ export function ScreeningPage() {
         return "--";
     };
 
-    const summarizeIndicators = (raw?: Record<string, any>) => {
-        const values = raw?.rule?.indicator_values || raw?.rule_meta?.indicator_values;
-        if (!values || typeof values !== "object") return null;
+    const formatNum = (value?: number | null, digits = 2) => {
+        if (typeof value !== "number" || !Number.isFinite(value)) return "--";
+        return value.toFixed(digits);
+    };
+
+    const summarizeIndicators = (raw?: Record<string, unknown>) => {
+        const rule = asRecord(raw?.rule);
+        const ruleMeta = asRecord(raw?.rule_meta);
+        const values = asRecord(rule?.indicator_values) || asRecord(ruleMeta?.indicator_values);
+        if (!values) return null;
         let ok = 0;
         let noData = 0;
         let disabled = 0;
         let error = 0;
-        Object.values(values as Record<string, any>).forEach((entry: any) => {
+        Object.values(values).forEach((item) => {
+            const entry = asRecord(item);
             const status = entry?.status;
             if (status === "ok") ok += 1;
             else if (status === "no_data") noData += 1;
@@ -362,6 +429,39 @@ export function ScreeningPage() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [aiEnabled]);
 
+    const applyKdjPreset = (preset: KdjPresetId) => {
+        setKdjPreset(preset);
+        if (preset === "pullback") {
+            setKdjDailyMin("");
+            setKdjDailyMax("20");
+            setKdjWeeklyMin("50");
+            setKdjWeeklyMax("");
+            setKdjMaWindow("60");
+            setKdjScope("both");
+            setKdjIncludeAll(false);
+            return;
+        }
+        if (preset === "oversold") {
+            setKdjDailyMin("");
+            setKdjDailyMax("10");
+            setKdjWeeklyMin("");
+            setKdjWeeklyMax("20");
+            setKdjMaWindow("0");
+            setKdjScope("both");
+            setKdjIncludeAll(false);
+        }
+    };
+
+    const markKdjCustom = () => {
+        if (kdjPreset !== "custom") setKdjPreset("custom");
+    };
+
+    const kdjPresetHint = useMemo(() => {
+        if (kdjPreset === "pullback") return "回踩候选：日J<=20 + 周J>=50 + 收盘站上MA60";
+        if (kdjPreset === "oversold") return "超跌观察：日J<=10 + 周J<=20，不直接当买点";
+        return "自定义：支持分别设置日J/周J上下限；四项都留空时退回兼容模式";
+    }, [kdjPreset]);
+
     const startRun = async () => {
         setRunMsg("");
         setRunLoading(true);
@@ -398,6 +498,78 @@ export function ScreeningPage() {
             setRunMsg("启动失败");
         } finally {
             setRunLoading(false);
+        }
+    };
+
+    const runKdjScreen = async () => {
+        setKdjMsg("");
+        setKdjLoading(true);
+        try {
+            const params = new URLSearchParams();
+            params.set("ma_window", String(Number(kdjMaWindow) || 0));
+            params.set("kdj_scope", kdjScope);
+            params.set("universe", kdjUniverse);
+            params.set("market", kdjMarket);
+            params.set("bars", "260");
+            if (kdjDailyMin.trim()) params.set("daily_j_min", kdjDailyMin.trim());
+            if (kdjDailyMax.trim()) params.set("daily_j_max", kdjDailyMax.trim());
+            if (kdjWeeklyMin.trim()) params.set("weekly_j_min", kdjWeeklyMin.trim());
+            if (kdjWeeklyMax.trim()) params.set("weekly_j_max", kdjWeeklyMax.trim());
+            if (Number(kdjLimit) > 0) params.set("limit", String(Number(kdjLimit)));
+            params.set("refresh_missing", kdjRefreshMissing ? "true" : "false");
+            params.set("include_all", kdjIncludeAll ? "true" : "false");
+            const res = await fetch(`${API_BASE_URL}/api/tools/kdj-screen?${params.toString()}`);
+            if (!res.ok) throw new Error("kdj screen failed");
+            const data: KdjScreenResponse = await res.json();
+            const rows = Array.isArray(data?.data) ? data.data : [];
+            setKdjSummary(data);
+            setKdjResults(rows);
+            setKdjMsg(`扫描 ${data?.total ?? 0}，命中 ${data?.matched ?? 0}`);
+        } catch (err) {
+            console.error(err);
+            setKdjMsg("KDJ筛选失败");
+        } finally {
+            setKdjLoading(false);
+        }
+    };
+
+    const runRuleForKdjResults = async () => {
+        const symbols = kdjResults.filter(row => row.matched !== false).map(row => row.symbol).filter(Boolean);
+        if (symbols.length === 0) {
+            setKdjMsg("没有KDJ命中标的可执行规则");
+            return;
+        }
+        setKdjRuleLoading(true);
+        setKdjMsg("");
+        try {
+            const payload: Record<string, unknown> = {
+                engine: "rule",
+                universe: "symbols",
+                market: kdjMarket,
+                symbols,
+                limit: symbols.length,
+                include_pass: true,
+            };
+            const res = await fetch(`${API_BASE_URL}/api/screening/run`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+            if (!res.ok) throw new Error("start rule failed");
+            const data = await res.json();
+            const runId = data?.run_id;
+            setKdjMsg(runId ? `已对 ${symbols.length} 个KDJ命中标的启动Rule任务 (#${runId})` : `已对 ${symbols.length} 个KDJ命中标的启动Rule任务`);
+            loadRuns();
+            if (runId) {
+                setSelectedRun(runId);
+                loadSummary(runId);
+                loadResults(runId, actionFilter);
+            }
+        } catch (err) {
+            console.error(err);
+            setKdjMsg("启动Rule任务失败");
+        } finally {
+            setKdjRuleLoading(false);
         }
     };
 
@@ -476,6 +648,190 @@ export function ScreeningPage() {
                         </Button>
                         {runMsg && <span style={{ fontSize: "12px", color: "#666" }}>{runMsg}</span>}
                     </div>
+                </div>
+
+                <div style={{ background: "#fff", border: "1px solid #e6e8ee", borderRadius: "10px", padding: "12px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "center", marginBottom: "8px" }}>
+                        <div>
+                            <div style={{ fontWeight: 600, fontSize: "13px" }}>KDJ条件筛选</div>
+                            <div style={{ fontSize: "12px", color: "#777", marginTop: "3px" }}>
+                                读取技术指标表，缺失时用本地日K缓存计算；先做KDJ预筛，再对命中标的执行Rule。
+                            </div>
+                        </div>
+                        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                            <Button onPress={runKdjScreen} isDisabled={kdjLoading}>
+                                {kdjLoading ? "筛选中..." : "开始KDJ预筛"}
+                            </Button>
+                            <Button
+                                variant="secondary"
+                                onPress={runRuleForKdjResults}
+                                isDisabled={kdjRuleLoading || kdjResults.filter(row => row.matched !== false).length === 0}
+                            >
+                                {kdjRuleLoading ? "启动中..." : "对命中执行Rule"}
+                            </Button>
+                        </div>
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", marginBottom: "10px" }}>
+                        {[
+                            { id: "pullback", label: "回踩候选" },
+                            { id: "oversold", label: "超跌观察" },
+                            { id: "custom", label: "自定义" },
+                        ].map(item => {
+                            const active = kdjPreset === item.id;
+                            return (
+                                <button
+                                    key={item.id}
+                                    onClick={() => applyKdjPreset(item.id as KdjPresetId)}
+                                    style={{
+                                        border: active ? "1px solid #0f8a3a" : "1px solid #d7dce6",
+                                        background: active ? "#edf8f0" : "#f7f8fb",
+                                        color: active ? "#0f6d32" : "#445",
+                                        borderRadius: "999px",
+                                        padding: "4px 10px",
+                                        fontSize: "12px",
+                                        cursor: "pointer",
+                                    }}
+                                >
+                                    {item.label}
+                                </button>
+                            );
+                        })}
+                        <span style={{ fontSize: "12px", color: "#666" }}>{kdjPresetHint}</span>
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center" }}>
+                        <select value={kdjUniverse} onChange={(e) => setKdjUniverse(e.target.value)} style={{ padding: "6px 8px", fontSize: "12px" }}>
+                            <option value="watchlist">自选股</option>
+                            <option value="all">全市场</option>
+                        </select>
+                        <select value={kdjMarket} onChange={(e) => setKdjMarket(e.target.value)} style={{ padding: "6px 8px", fontSize: "12px" }}>
+                            <option value="ashare">A股</option>
+                            <option value="all">全部市场</option>
+                            <option value="us">美股</option>
+                            <option value="crypto">加密</option>
+                        </select>
+                        <input
+                            value={kdjDailyMin}
+                            onChange={(e) => {
+                                markKdjCustom();
+                                setKdjDailyMin(e.target.value);
+                            }}
+                            placeholder="日J最小"
+                            style={{ padding: "6px 8px", fontSize: "12px", width: "82px" }}
+                        />
+                        <input
+                            value={kdjDailyMax}
+                            onChange={(e) => {
+                                markKdjCustom();
+                                setKdjDailyMax(e.target.value);
+                            }}
+                            placeholder="日J最大"
+                            style={{ padding: "6px 8px", fontSize: "12px", width: "82px" }}
+                        />
+                        <input
+                            value={kdjWeeklyMin}
+                            onChange={(e) => {
+                                markKdjCustom();
+                                setKdjWeeklyMin(e.target.value);
+                            }}
+                            placeholder="周J最小"
+                            style={{ padding: "6px 8px", fontSize: "12px", width: "82px" }}
+                        />
+                        <input
+                            value={kdjWeeklyMax}
+                            onChange={(e) => {
+                                markKdjCustom();
+                                setKdjWeeklyMax(e.target.value);
+                            }}
+                            placeholder="周J最大"
+                            style={{ padding: "6px 8px", fontSize: "12px", width: "82px" }}
+                        />
+                        <select
+                            value={kdjMaWindow}
+                            onChange={(e) => {
+                                markKdjCustom();
+                                setKdjMaWindow(e.target.value);
+                            }}
+                            style={{ padding: "6px 8px", fontSize: "12px" }}
+                        >
+                            <option value="60">站上MA60</option>
+                            <option value="30">站上MA30</option>
+                            <option value="0">不看均线</option>
+                        </select>
+                        <select
+                            value={kdjScope}
+                            onChange={(e) => {
+                                markKdjCustom();
+                                setKdjScope(e.target.value);
+                            }}
+                            style={{ padding: "6px 8px", fontSize: "12px" }}
+                        >
+                            <option value="both">日J和周J都满足</option>
+                            <option value="daily">只看日J</option>
+                            <option value="weekly">只看周J</option>
+                            <option value="any">日J或周J满足</option>
+                        </select>
+                        <input
+                            value={kdjLimit}
+                            onChange={(e) => setKdjLimit(e.target.value)}
+                            placeholder="扫描数量，空=全部"
+                            style={{ padding: "6px 8px", fontSize: "12px", width: "90px" }}
+                        />
+                        <label style={{ fontSize: "12px", display: "flex", alignItems: "center", gap: "6px", color: "#555" }}>
+                            <input type="checkbox" checked={kdjRefreshMissing} onChange={(e) => setKdjRefreshMissing(e.target.checked)} />
+                            缺数据时拉取
+                        </label>
+                        <label style={{ fontSize: "12px", display: "flex", alignItems: "center", gap: "6px", color: "#555" }}>
+                            <input type="checkbox" checked={kdjIncludeAll} onChange={(e) => setKdjIncludeAll(e.target.checked)} />
+                            显示未命中原因
+                        </label>
+                        {kdjMsg && <span style={{ fontSize: "12px", color: "#666" }}>{kdjMsg}</span>}
+                    </div>
+                    <div style={{ fontSize: "11px", color: "#8a8f99", marginTop: "8px" }}>
+                        日J/周J留空表示该方向不设门槛；若四项都留空，会退回旧的单阈值兼容逻辑。
+                    </div>
+                    {(kdjResults.length > 0 || kdjSummary) && (
+                        <div style={{ marginTop: "10px", border: "1px solid #eef0f4", borderRadius: "8px", overflowX: "auto" }}>
+                            <div style={{ display: "grid", gridTemplateColumns: "180px 70px 90px 90px 90px 90px 90px 1fr", minWidth: "980px", padding: "8px 10px", background: "#f7f8fb", fontSize: "12px", color: "#666" }}>
+                                <div>Symbol</div>
+                                <div>命中</div>
+                                <div>日期</div>
+                                <div>收盘</div>
+                                <div>MA</div>
+                                <div>日J</div>
+                                <div>周J</div>
+                                <div>Reason</div>
+                            </div>
+                            {kdjResults.length === 0 && (
+                                <div style={{ padding: "10px", fontSize: "12px", color: "#777" }}>没有命中结果</div>
+                            )}
+                            {kdjResults.map(row => (
+                                <div
+                                    key={row.symbol}
+                                    style={{
+                                        display: "grid",
+                                        gridTemplateColumns: "180px 70px 90px 90px 90px 90px 90px 1fr",
+                                        minWidth: "980px",
+                                        padding: "8px 10px",
+                                        borderTop: "1px solid #f0f0f0",
+                                        fontSize: "12px",
+                                    }}
+                                >
+                                    <div>
+                                        <a href={buildSymbolLink(row.symbol)} target="_blank" rel="noreferrer" style={{ color: "#007acc", textDecoration: "none" }}>
+                                            {row.symbol}{row.name ? ` ${row.name}` : ""}
+                                        </a>
+                                    </div>
+                                    <div style={{ color: row.matched ? "#0f8a3a" : "#b45309" }}>{row.matched ? "YES" : "NO"}</div>
+                                    <div>{row.date || "--"}</div>
+                                    <div>{formatNum(row.close, 3)}</div>
+                                    <div>{row.ma_window ? `MA${row.ma_window} ${formatNum(row.ma, 3)}` : "--"}</div>
+                                    <div>{formatNum(row.daily_kdj?.j)}</div>
+                                    <div>{formatNum(row.weekly_kdj?.j)}</div>
+                                    <div style={{ color: "#555" }}>{row.reason || "--"}</div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
                 </div>
 
                 <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", gap: "12px" }}>
@@ -607,14 +963,17 @@ export function ScreeningPage() {
                                     : "--";
                                 const isExpanded = expandedSymbol === item.symbol;
                                 const indicatorEntries = indicatorSummary
-                                    ? Object.entries(indicatorSummary.values || {}).map(([id, data]: [string, any]) => ({
-                                        id,
-                                        status: data?.status || "unknown",
-                                        value: data?.value,
-                                        reason: data?.reason,
-                                        weight: data?.weight,
-                                        scoreContribution: data?.score_contribution,
-                                    }))
+                                    ? Object.entries(indicatorSummary.values || {}).map(([id, data]) => {
+                                        const entry = (asRecord(data) || {}) as IndicatorEntryRaw;
+                                        return {
+                                            id,
+                                            status: entry.status || "unknown",
+                                            value: entry.value,
+                                            reason: entry.reason,
+                                            weight: entry.weight,
+                                            scoreContribution: entry.score_contribution,
+                                        };
+                                    })
                                     : [];
                                 const filteredIndicators = indicatorEntries.filter((entry) => {
                                     const text = indicatorFilterText.trim().toLowerCase();

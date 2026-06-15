@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from pydantic import BaseModel
 from db import get_connection
+from cache import is_cn_index_symbol
+from symbols import CN_INDEX_SYMBOLS
 from us_indices import is_us_index_symbol, get_us_index_label, resolve_us_index_ticker
 
 WATCHLIST_FILE = Path(__file__).parent / "watchlist.json"
@@ -169,6 +171,11 @@ def _save_watchlist_db(items: List[Dict]) -> None:
 def _resolve_symbol_name_with_conn(conn, symbol: str, market: str) -> Optional[str]:
     if not symbol:
         return None
+    sym = symbol.upper()
+    if is_cn_index_symbol(sym):
+        for item in CN_INDEX_SYMBOLS:
+            if item["symbol"] == sym:
+                return item["name"]
     if market in ("ashare", "us") and is_us_index_symbol(symbol):
         ticker = resolve_us_index_ticker(symbol) or symbol
         return get_us_index_label(ticker) or symbol

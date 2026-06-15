@@ -87,6 +87,7 @@ type Props = {
     colorTheme?: 'light' | 'dark'
     navigate?: (path: string) => void
     symbol?: string
+    chartPrivacyHidden?: boolean
 }
 
 type State = {
@@ -1341,6 +1342,17 @@ class KlineViewContainer extends Component<Props, State> {
 
     render() {
         const apiStatus = this.state.apiStatus;
+        const chartPrivacyHidden = !!this.props.chartPrivacyHidden;
+        const renderChartMask = (height: number, compact?: boolean) => (
+            <div
+                className={`chart-privacy-mask ${compact ? 'compact' : ''}`}
+                style={{ width: this.width, height }}
+            >
+                <div className="chart-privacy-mask-inner">
+                    {compact ? '内容已隐藏' : '图表已隐藏'}
+                </div>
+            </div>
+        );
         let apiBannerMessage: string | undefined;
         if (apiStatus?.backoff_active && apiStatus.backoff_until) {
             const until = new Date(apiStatus.backoff_until);
@@ -1795,95 +1807,103 @@ class KlineViewContainer extends Component<Props, State> {
 
 
                         <div className="klineview" style={{ width: this.width, height: this.hKlineView, marginTop: this.hSpacing }}>
-                            <svg className="annotations"
-                                width={this.width}
-                                height={this.hKlineView}
-                                vectorEffect="non-scaling-stroke"
-                                style={{ zIndex: 1 }}
-                            >
-                                <KlineView
-                                    updateEvent={this.state.updateEvent}
-                                    updateDrawing={this.state.updateDrawing}
-                                    xc={this.xc}
-                                    tvar={this.kvar}
+                            {chartPrivacyHidden ? renderChartMask(this.hKlineView) : (
+                                <svg className="annotations"
                                     width={this.width}
                                     height={this.hKlineView}
-                                    x={0}
-                                    y={0}
-                                    id="kline"
-                                    name="kline"
-                                    overlayIndicators={this.state.overlayIndicators}
-                                    callbacksToContainer={this.callbacks}
-                                />
-                            </svg>
+                                    vectorEffect="non-scaling-stroke"
+                                    style={{ zIndex: 1 }}
+                                >
+                                    <KlineView
+                                        updateEvent={this.state.updateEvent}
+                                        updateDrawing={this.state.updateDrawing}
+                                        xc={this.xc}
+                                        tvar={this.kvar}
+                                        width={this.width}
+                                        height={this.hKlineView}
+                                        x={0}
+                                        y={0}
+                                        id="kline"
+                                        name="kline"
+                                        overlayIndicators={this.state.overlayIndicators}
+                                        callbacksToContainer={this.callbacks}
+                                    />
+                                </svg>
+                            )}
                         </div>
                         <div className="volumeview" style={{ width: this.width, height: this.hVolumeView, marginTop: this.hSpacing }}>
-                            <svg
-                                width={this.width}
-                                height={this.hVolumeView}
-                                vectorEffect="non-scaling-stroke"
-                            >
-                                <VolumeView
-                                    updateEvent={this.state.updateEvent}
-                                    xc={this.xc}
-                                    tvar={this.kvar}
+                            {chartPrivacyHidden ? renderChartMask(this.hVolumeView, true) : (
+                                <svg
                                     width={this.width}
                                     height={this.hVolumeView}
-                                    x={0}
-                                    y={0}
-                                    id="volume"
-                                    name="volume"
-                                />
-                            </svg>
+                                    vectorEffect="non-scaling-stroke"
+                                >
+                                    <VolumeView
+                                        updateEvent={this.state.updateEvent}
+                                        xc={this.xc}
+                                        tvar={this.kvar}
+                                        width={this.width}
+                                        height={this.hVolumeView}
+                                        x={0}
+                                        y={0}
+                                        id="volume"
+                                        name="volume"
+                                    />
+                                </svg>
+                            )}
                         </div>
                         {this.state.stackedIndicators && this.state.stackedIndicators.map((indicator, n) => {
                             return (
                                 <div className={this.#indicatorViewId(n)} style={{ width: this.width, height: this.hIndicatorView, marginTop: this.hSpacing }}
                                     key={this.#indicatorViewId(n)}
                                 >
-                                    <svg
-                                        width={this.width}
-                                        height={this.hIndicatorView}
-                                        vectorEffect="non-scaling-stroke"
-                                    >
-                                        <IndicatorView
-                                            updateEvent={this.state.updateEvent}
-                                            xc={this.xc}
+                                    {chartPrivacyHidden ? renderChartMask(this.hIndicatorView, true) : (
+                                        <svg
                                             width={this.width}
                                             height={this.hIndicatorView}
-                                            x={0}
-                                            y={0}
-                                            id={this.#indicatorViewId(n)}
-                                            name={this.#indicatorViewId(n)}
-                                            tvar={indicator.tvar}
-                                            mainIndicatorOutputs={indicator.outputs}
+                                            vectorEffect="non-scaling-stroke"
+                                        >
+                                            <IndicatorView
+                                                updateEvent={this.state.updateEvent}
+                                                xc={this.xc}
+                                                width={this.width}
+                                                height={this.hIndicatorView}
+                                                x={0}
+                                                y={0}
+                                                id={this.#indicatorViewId(n)}
+                                                name={this.#indicatorViewId(n)}
+                                                tvar={indicator.tvar}
+                                                mainIndicatorOutputs={indicator.outputs}
 
-                                            indicator={indicator}
-                                            indicatorLabels={this.state.stackedIndicatorLabels && this.state.stackedIndicatorLabels[n]}
-                                            referIndicatorLabels={this.state.referStackedIndicatorLabels && this.state.referStackedIndicatorLabels[n]}
-                                        />
-                                    </svg>
+                                                indicator={indicator}
+                                                indicatorLabels={this.state.stackedIndicatorLabels && this.state.stackedIndicatorLabels[n]}
+                                                referIndicatorLabels={this.state.referStackedIndicatorLabels && this.state.referStackedIndicatorLabels[n]}
+                                            />
+                                        </svg>
+                                    )}
                                 </div>
                             )
                         }
                         )}
                         <div className="axisx" style={{ width: this.width, height: this.hAxisx, marginTop: this.hSpacing }}>
-                            <svg
-                                width={this.width}
-                                height={this.hAxisx}
-                                vectorEffect="non-scaling-stroke"
-                                style={{ fontSize: '11px' }}
-                            >
-                                <AxisX
-                                    updateEvent={this.state.updateEvent}
-                                    xc={this.xc}
+                            {chartPrivacyHidden ? renderChartMask(this.hAxisx, true) : (
+                                <svg
                                     width={this.width}
                                     height={this.hAxisx}
-                                    x={0}
-                                    y={0}
-                                    id="axisx"
-                                />
-                            </svg>
+                                    vectorEffect="non-scaling-stroke"
+                                    style={{ fontSize: '11px' }}
+                                >
+                                    <AxisX
+                                        updateEvent={this.state.updateEvent}
+                                        xc={this.xc}
+                                        width={this.width}
+                                        height={this.hAxisx}
+                                        x={0}
+                                        y={0}
+                                        id="axisx"
+                                    />
+                                </svg>
+                            )}
                         </div>
                     </>)}
 

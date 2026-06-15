@@ -5,9 +5,22 @@ from data_sources import DataType
 from data_sources.router import fetch as router_fetch
 from us_indices import US_INDEX_SYMBOLS
 
+CN_INDEX_SYMBOLS = [
+    {"symbol": "000001.SH", "code": "000001", "name": "上证指数"},
+    {"symbol": "000016.SH", "code": "000016", "name": "上证50"},
+    {"symbol": "000300.SH", "code": "000300", "name": "沪深300"},
+    {"symbol": "000688.SH", "code": "000688", "name": "科创50"},
+    {"symbol": "000852.SH", "code": "000852", "name": "中证1000"},
+    {"symbol": "000905.SH", "code": "000905", "name": "中证500"},
+    {"symbol": "000985.SH", "code": "000985", "name": "中证全指"},
+    {"symbol": "399001.SZ", "code": "399001", "name": "深证成指"},
+    {"symbol": "399005.SZ", "code": "399005", "name": "中小100"},
+    {"symbol": "399006.SZ", "code": "399006", "name": "创业板指"},
+]
+
 
 def _append_builtin_symbols(df: pd.DataFrame) -> pd.DataFrame:
-    extra = pd.DataFrame(US_INDEX_SYMBOLS)
+    extra = pd.DataFrame(CN_INDEX_SYMBOLS + US_INDEX_SYMBOLS)
     if df is None or df.empty:
         return extra
     merged = pd.concat([df, extra], ignore_index=True)

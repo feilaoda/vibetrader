@@ -147,6 +147,43 @@ def _refresh_leader(conn, symbol: str, force_refresh: bool = False) -> Optional[
         return str(exc)
 
 
+def _should_refresh_market_index(conn, symbol: str, refresh_minutes: int) -> bool:
+    key = f"market_index_sync:{symbol}"
+    cached = _get_indicator_cache(conn, key)
+    if cached:
+        _, _, _, updated_at = cached
+        if _is_cache_fresh(updated_at, refresh_minutes):
+            return False
+    return True
+
+
+def _refresh_market_index(conn, symbol: str, refresh_minutes: int) -> None:
+    if not _should_refresh_market_index(conn, symbol, refresh_minutes):
+        return
+    key = f"market_index_sync:{symbol}"
+    try:
+        klines, source = get_klines_with_cache(
+            symbol,
+            period="daily",
+            limit=260,
+            force_refresh=False,
+            include_intraday=True,
+        )
+        last_date = None
+        if klines:
+            last = klines[-1]
+            last_date = last.get("date") or last.get("time")
+        payload = {
+            "symbol": symbol,
+            "last_date": last_date,
+            "source": source,
+        }
+        _set_indicator_cache(conn, key, payload, source or "daily_cache")
+    except Exception as exc:
+        _set_indicator_cache(conn, key, {}, "daily_cache", error=str(exc))
+        print(f"[IndustryScheduler] market index refresh failed for {symbol}: {exc}")
+
+
 def _collect_market_thermometer_specs(conn) -> Dict[str, Dict[str, Any]]:
     rows = conn.execute(
         "SELECT symbol FROM symbol_industry_settings WHERE enabled = TRUE"
@@ -211,21 +248,13 @@ def _refresh_market_thermometer(conn, spec: Dict[str, Any]) -> None:
     turnover_baseline = _safe_float(spec.get("turnover_baseline_trillion"), default=1.0)
     # Keep broad/style index daily cache warm so market thermometer date stays current.
     refreshed_indices = set()
+    index_refresh = max(1, int(os.getenv("INDUSTRY_MARKET_INDEX_REFRESH_MINUTES", str(refresh)) or refresh))
     for raw_idx in (broad, style):
         for idx in _resolve_market_index_candidates(raw_idx):
             if idx in refreshed_indices:
                 continue
             refreshed_indices.add(idx)
-            try:
-                get_klines_with_cache(
-                    idx,
-                    period="daily",
-                    limit=260,
-                    force_refresh=False,
-                    include_intraday=True,
-                )
-            except Exception as exc:
-                print(f"[IndustryScheduler] market index refresh failed for {idx}: {exc}")
+            _refresh_market_index(conn, idx, index_refresh)
     _fetch_indicator_with_cache(
         conn,
         key,

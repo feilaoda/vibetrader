@@ -14,7 +14,7 @@ if env_path.exists():
     load_dotenv(env_path)
 
 # LLM 配置 (Default / Fallback)
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "http://127.0.0.1:16321/codex")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-reasoner")
 try:
@@ -23,9 +23,9 @@ except Exception:
     LLM_MEMORY_PAIRS_LIMIT = 5
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", LLM_API_KEY)
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-OPENAI_CODEX_MODEL = os.getenv("OPENAI_CODEX_MODEL", "codex-mini-latest")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:16321/codex")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5.4")
+OPENAI_CODEX_MODEL = os.getenv("OPENAI_CODEX_MODEL", "gpt-5.4")
 # Web search config (optional for stock recommendations)
 WEB_SEARCH_PROVIDER = os.getenv("WEB_SEARCH_PROVIDER", "serper")
 WEB_SEARCH_API_KEY = os.getenv("WEB_SEARCH_API_KEY", "")
@@ -42,9 +42,10 @@ PROVIDERS = {
         "api_key": LLM_API_KEY,
         "base_url": LLM_BASE_URL,
     },
+
     "deepseek": {
         "api_key": os.getenv("DEEPSEEK_API_KEY", LLM_API_KEY),
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "http://127.0.0.1:16321/deepseek"),
     },
     "gemini": {
         "api_key": os.getenv("GEMINI_API_KEY", LLM_API_KEY),
@@ -63,14 +64,15 @@ PROVIDERS = {
 # 预设模型列表
 AVAILABLE_MODELS = [
     # {"id": "deepseek-chat", "name": "DeepSeek V3", "provider": "deepseek"},
+    {"id": "gpt-5.4", "name": "GPT-5.4", "provider": "openai"},
     {"id": "deepseek-reasoner", "name": "DeepSeek R1 (推理版)", "provider": "deepseek"},
-    
+
     # {"id": "gemini-2.0-flash-exp", "name": "Gemini 2.0 Flash", "provider": "gemini"},
     # {"id": "gemini-1.5-pro", "name": "Gemini 1.5 Pro", "provider": "gemini"},
     {"id": "gemini-3-pro-high", "name": "Gemini 3.0 Pro (高配)", "provider": "gemini"},
     # {"id": "gemini-3-flash", "name": "Gemini 3.0 Flash", "provider": "gemini"},
 
-    {"id": "claude-3-5-sonnet-20240620", "name": "Claude 3.5 Sonnet", "provider": "claude"},
+    # {"id": "claude-3-5-sonnet-20240620", "name": "Claude 3.5 Sonnet", "provider": "claude"},
 ]
 
 if OPENAI_CHAT_MODEL:

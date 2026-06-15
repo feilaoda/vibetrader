@@ -314,7 +314,15 @@ def _load_daily_cache_db(symbol: str, period: str) -> Optional[Dict]:
 def _save_daily_cache_db(symbol: str, period: str, data: Dict) -> bool:
     try:
         from db import save_daily_klines_cache
-        return bool(save_daily_klines_cache(symbol, period, data))
+        saved = bool(save_daily_klines_cache(symbol, period, data))
+        if saved and period == "daily":
+            try:
+                from db import refresh_technical_indicators
+
+                refresh_technical_indicators(symbol, data.get("klines") if isinstance(data, dict) else None)
+            except Exception as e:
+                print(f"[Cache][DB] Error refreshing indicators for {symbol}: {e}")
+        return saved
     except Exception as e:
         print(f"[Cache][DB] Error saving daily cache for {symbol}/{period}: {e}")
         return False

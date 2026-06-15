@@ -97,7 +97,7 @@ def _sync_symbols(symbols: List[str]) -> None:
 
 
 def _scheduler_loop() -> None:
-    interval = int(os.getenv("WATCHLIST_SYNC_INTERVAL_SECONDS", "300") or 300)
+    interval = int(os.getenv("WATCHLIST_SYNC_INTERVAL_SECONDS", "60") or 60)
     while True:
         try:
             now = _now_cn()
